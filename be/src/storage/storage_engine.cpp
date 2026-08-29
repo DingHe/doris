@@ -220,17 +220,19 @@ void CompactionSubmitRegistry::jsonfy_compaction_status(std::string* result) {
     root.Accept(writer);
     *result = std::string(str_buf.GetString());
 }
-
+// 检查传入的 EngineOptions 中是否包含至少一个数据存储路径（StorePath）。
 static Status _validate_options(const EngineOptions& options) {
     if (options.store_paths.empty()) {
         return Status::InternalError("store paths is empty");
     }
     return Status::OK();
 }
-
+// Apache Doris 存储引擎外部调用的主入口函数（作为 BaseStorageEngine 纯虚接口的重写实现）。
+// 采用门面模式（Facade）对外提供统一的启动接口，协调并触发存储引擎内部所有底层子系统的初始化与打开流程。
 Status StorageEngine::open() {
     RETURN_IF_ERROR(_validate_options(_options));
     LOG(INFO) << "starting backend using uid:" << _options.backend_uid.to_string();
+    // 调用真正承载核心初始化逻辑的私有成员函数 _open()
     RETURN_NOT_OK_STATUS_WITH_WARN(_open(), "open engine failed");
     LOG(INFO) << "success to init storage engine.";
     return Status::OK();
@@ -260,10 +262,10 @@ StorageEngine::~StorageEngine() {
     DEREGISTER_HOOK_METRIC(unused_rowsets_count);
     stop();
 }
-
+// 通过线程池并发调用各个 DataDir::load() 方法，并行加载当前 BE 挂载的所有数据目录（元数据、Tablet、Rowset 等），并在任意目录加载失败时进行状态捕获与短路退出。
 static Status load_data_dirs(const std::vector<DataDir*>& data_dirs) {
     std::unique_ptr<ThreadPool> pool;
-
+    // 优先读取配置项 config::load_data_dirs_threads。若未配置或为 0/负数，则按数据目录的数量（data_dirs.size()）按需创建等量的线程数，实现完全一对一的并发加载。
     int num_threads = config::load_data_dirs_threads;
     if (num_threads <= 0) {
         num_threads = cast_set<int>(data_dirs.size());
@@ -280,6 +282,8 @@ static Status load_data_dirs(const std::vector<DataDir*>& data_dirs) {
 
     for (auto* data_dir : data_dirs) {
         st = pool->submit_func([&, data_dir] {
+            // 短路机制（Fast-Fail Check）：在开始调用 data_dir->load() 前，先抢占 result_mtx 锁。
+            // 如果发现已有其他数据目录在加载过程中报错（!result.ok()），当前任务直接结束返回，不再浪费系统资源去加载后续目录。
             SCOPED_INIT_THREAD_CONTEXT();
             {
                 std::lock_guard lock(result_mtx);
@@ -307,49 +311,71 @@ static Status load_data_dirs(const std::vector<DataDir*>& data_dirs) {
     return result;
 }
 
+// 存储引擎真正执行核心组件初始化与物理数据加载的私有实现函数。
+// 它按照严格的依赖顺序，依次完成了存储目录挂载、集群一致性校验、环境检查、元数据与数据文件加载，
+// 以及写路径关键执行器（Flush/Delete Bitmap）的初始化。
 Status StorageEngine::_open() {
     // init store_map
+    // 解析并挂载配置中的所有存储路径（store_paths）
+    // 为每个合法的物理路径创建 DataDir 实例并存入 _store_map，同时标记损坏的磁盘路径。
+    // 若所有路径均不可用或初始化失败，则中断启动。
     RETURN_NOT_OK_STATUS_WITH_WARN(_init_store_map(), "_init_store_map failed");
 
     _effective_cluster_id = config::cluster_id;
+    // 校验各数据目录的 cluster_id 是否一致。
+    // 读取每个 DataDir 根目录下的 cluster_id 文件，确保其与当前配置的 _effective_cluster_id 匹配，防止错误地挂载属于其他 Doris 集群的物理数据。
     RETURN_NOT_OK_STATUS_WITH_WARN(_check_all_root_path_cluster_id(), "fail to check cluster id");
+    // 统计当前节点挂载的存储介质种类（如仅有 HDD、仅有 SSD，或同时存在两者）。
 
     _update_storage_medium_type_count();
-
+    // 操作系统文件描述符（FD/ulimit -n）上限检查。
+    // 确保系统的 FD 数量足以支持 Doris 高并发读写和大量 Segment 文件的打开，不达标则报警或拒绝启动。
     RETURN_NOT_OK_STATUS_WITH_WARN(_check_file_descriptor_number(), "check fd number failed");
-
+    // 并发加载所有物理数据目录中的历史元数据与分片数据。
+    // 获取所有有效的 DataDir 指针，扫描并加载各个磁盘下的 Tablet Header（Meta）和 Rowset，恢复内存中的 TabletManager 结构。
     auto dirs = get_stores();
     RETURN_IF_ERROR(load_data_dirs(dirs));
-
+    // 更新存储引擎记录的物理可用磁盘总数。
     _disk_num = cast_set<int>(dirs.size());
+    // 初始化内存表刷盘（MemTable Flush）执行器。
+    // 根据磁盘数量 _disk_num 创建专属的 Flush 线程池，实现按磁盘隔离的写屏障刷盘，防止单块磁盘 IO 堵塞影响全局。
     _memtable_flush_executor = std::make_unique<MemTableFlushExecutor>();
     _memtable_flush_executor->init(_disk_num);
-
+    // 初始化通用 Delete Bitmap 计算执行器。
+    // 针对主键模型（Merge-on-Write），创建名为 TabletCalcDeleteBitmapThreadPool 的线程池，用于后台 Compaction 或异步发布版本时计算删除位图。
     _calc_delete_bitmap_executor = std::make_unique<CalcDeleteBitmapExecutor>();
     _calc_delete_bitmap_executor->init("TabletCalcDeleteBitmapThreadPool",
                                        config::calc_delete_bitmap_max_thread);
-
+    // 初始化导入专属的 Delete Bitmap 计算执行器。
+    // 创建 LoadCalcDeleteBitmapThreadPool 线程池，用于在数据导入（Load/Commit）高优先级路径上快速计算 Delete Bitmap。若未配置线程数（<=0），则默认使用 CPU 核心数的一半（至少 1 个线程）以保证导入性能。
     _calc_delete_bitmap_executor_for_load = std::make_unique<CalcDeleteBitmapExecutor>();
     _calc_delete_bitmap_executor_for_load->init(
             "LoadCalcDeleteBitmapThreadPool",
             config::calc_delete_bitmap_for_load_max_thread > 0
                     ? config::calc_delete_bitmap_for_load_max_thread
                     : std::max(1, CpuInfo::num_cores() / 2));
-
+    // 解析并设定默认的 Rowset 存储格式。
+    // 读取配置并解析为 BETA_ROWSET（V2 格式）存储枚举。
     _parse_default_rowset_type();
 
     return Status::OK();
 }
-
+// 存储引擎在启动阶段用于并发挂载与初始化所有配置的数据存储路径（DataDir）的核心私有函数。
+// 利用多线程并发完成物理磁盘的挂载与校验，确保所有指定的根路径均能正常工作，并初始化节点上的历史导入记录器。
 Status StorageEngine::_init_store_map() {
+    // 定义多线程管理容器以及收集错误信息的线程安全结构。
+    // 由于节点可能挂载多块 SSD/HDD 磁盘，采用并发初始化可以显著缩短 BE 启动时间。
     std::vector<std::thread> threads;
     std::mutex error_msg_lock;
     std::string error_msg;
     for (auto& path : _options.store_paths) {
+        // 为每个配置路径创建一个 DataDir 独占指针实例，传入路径地址、容量上限和存储介质（如 HDD/SSD）。
         auto store = std::make_unique<DataDir>(*this, path.path, path.capacity_bytes,
                                                path.storage_medium);
+        // 为每一个 DataDir 派生一个独立的 C++ 线程进行异步初始化。
         threads.emplace_back([store = store.get(), &error_msg_lock, &error_msg]() {
             SCOPED_INIT_THREAD_CONTEXT();
+            // 执行磁盘物理检测，包括检查目录读写权限、创建必要子目录（如 data/, trash/, snapshot/）、读取/生成 cluster_id 和 storage_uuid 等。
             auto st = store->init();
             if (!st.ok()) {
                 {
@@ -360,6 +386,8 @@ Status StorageEngine::_init_store_map() {
                              << ", path=" << store->path();
             }
         });
+        // 在主线程中，将创建的 DataDir 智能指针转移所有权（std::move），
+        // 存入存储引擎的成员变量 _store_map（路径名到 DataDir 的映射表）进行统一管理。
         _store_map.emplace(store->path(), std::move(store));
     }
     for (auto& thread : threads) {
@@ -370,23 +398,27 @@ Status StorageEngine::_init_store_map() {
     if (!error_msg.empty()) {
         return Status::InternalError("init path failed, error={}", error_msg);
     }
-
+    // 初始化 Stream Load 历史导入记录器（StreamLoadRecorder）
     RETURN_NOT_OK_STATUS_WITH_WARN(init_stream_load_recorder(_options.store_paths[0].path),
                                    "init StreamLoadRecorder failed");
 
     return Status::OK();
 }
-
+// 于统计并更新当前节点上所有“可用物理磁盘”所包含的存储介质类型（Storage Medium Type）数量的私有成员函数
+// 存储介质通常指 HDD（机械硬盘） 或 SSD（固态硬盘/高速存储）（定义于 Thrift 结构体 TStorageMedium::type）。
 void StorageEngine::_update_storage_medium_type_count() {
     set<TStorageMedium::type> available_storage_medium_types;
 
     std::lock_guard<std::mutex> l(_store_lock);
+    // 遍历所有挂载的 DataDir 实例。
     for (auto& it : _store_map) {
+        // 只关注当前健康且处于可用状态（没有发生物理 IO 错误、被主动卸载或被隔离）的磁盘。
         if (it.second->is_used()) {
+            // 插入介质类型：通过 it.second->storage_medium() 获取该磁盘的存储类型（如 HDD 或 SSD）并放入 set 中。
             available_storage_medium_types.insert(it.second->storage_medium());
         }
     }
-
+    // 计算去重后的介质种类数量（0、1 或 2），经类型安全转换后更新全局状态变量 _available_storage_medium_type_count。
     _available_storage_medium_type_count =
             cast_set<uint32_t>(available_storage_medium_types.size());
 }
@@ -412,7 +444,8 @@ Status StorageEngine::_judge_and_update_effective_cluster_id(int32_t cluster_id)
 
     return Status::OK();
 }
-
+// 用于获取当前节点所挂载的所有数据目录（DataDir）指针列表的公有成员函数。
+// 为存储引擎的上层逻辑（如数据加载、Tablet 调度、磁盘均衡、垃圾回收等）提供了安全的磁盘目录快照访问接口。
 std::vector<DataDir*> StorageEngine::get_stores(bool include_unused) {
     std::vector<DataDir*> stores;
     stores.reserve(_store_map.size());
@@ -429,6 +462,7 @@ std::vector<DataDir*> StorageEngine::get_stores(bool include_unused) {
             }
         }
     }
+    // 返回保存了裸指针 DataDir* 的 vector。
     return stores;
 }
 
@@ -504,14 +538,19 @@ void StorageEngine::_start_disk_stat_monitor() {
 }
 
 // TODO(lingbin): Should be in EnvPosix?
+// BE 存储引擎（StorageEngine）在启动初期调用的操作系统文件描述符限制（ulimit -n / File Descriptor Limit）校验逻辑。
+// 作为海量分布式 OLAP 数据库，BE 在并发查询、Segment 文件打开、RocksDB 句柄管理以及网络 RPC 通信时会消耗大量的文件句柄。
+// 该函数旨在防止因系统句柄配额设置过小导致 BE 运行中途触发 Too many open files 崩溃。
 Status StorageEngine::_check_file_descriptor_number() {
     struct rlimit l;
+    // 通过 Linux C 标准系统调用 getrlimit(RLIMIT_NOFILE, &l) 读取当前进程的软限制（l.rlim_cur）。
     int ret = getrlimit(RLIMIT_NOFILE, &l);
     if (ret != 0) {
         LOG(WARNING) << "call getrlimit() failed. errno=" << strerror(errno)
                      << ", use default configuration instead.";
         return Status::OK();
     }
+    // 环境变量跳过开关检查 (SKIP_CHECK_ULIMIT)
     if (getenv("SKIP_CHECK_ULIMIT") == nullptr) {
         LOG(INFO) << "will check 'ulimit' value.";
     } else if (std::string(getenv("SKIP_CHECK_ULIMIT")) == "true") {
@@ -522,6 +561,7 @@ Status StorageEngine::_check_file_descriptor_number() {
         LOG(INFO) << "the SKIP_CHECK_ULIMIT env value is " << getenv("SKIP_CHECK_ULIMIT")
                   << ", will check ulimit value.";
     }
+    // 将获取到的当前进程软限制 l.rlim_cur 与 Doris 配置项 config::min_file_descriptor_number（默认通常为 65536 或更高）进行对比。
     if (l.rlim_cur < config::min_file_descriptor_number) {
         LOG(ERROR) << "File descriptor number is less than " << config::min_file_descriptor_number
                    << ". Please use (ulimit -n) to set a value equal or greater than "
@@ -532,16 +572,21 @@ Status StorageEngine::_check_file_descriptor_number() {
     }
     return Status::OK();
 }
-
+// 校验当前 BE 节点挂载的所有数据路径（DataDir）中的 cluster_id 是否一致，并在必要时将有效的主 cluster_id 自动补充刷入那些丢失或尚未写入 cluster_id 的存储路径中。
 Status StorageEngine::_check_all_root_path_cluster_id() {
     int32_t cluster_id = -1;
+    // 阶段 1：遍历并校验所有存储目录的 cluster_id
     for (auto& it : _store_map) {
         int32_t tmp_cluster_id = it.second->cluster_id();
         if (it.second->cluster_id_incomplete()) {
+        // 判断该磁盘目录下的 cluster_id 文件是否存在或合法。
+        // 如果缺失/不完整，将全局标志位 _is_all_cluster_id_exist 设置为 false。
             _is_all_cluster_id_exist = false;
+        // 一致性匹配：后续目录的 tmp_cluster_id 如果与基准 cluster_id 相同，继续遍历。
         } else if (tmp_cluster_id == cluster_id) {
             // both have right cluster id, do nothing
         } else if (cluster_id == -1) {
+            // 当遇到第一个有效的 tmp_cluster_id 时，赋值给局部变量 cluster_id 作为基准值。
             cluster_id = tmp_cluster_id;
         } else {
             RETURN_NOT_OK_STATUS_WITH_WARN(
@@ -552,6 +597,8 @@ Status StorageEngine::_check_all_root_path_cluster_id() {
     }
 
     // judge and get effective cluster id
+    // 阶段 2：判定并更新有效 Cluster ID
+    // 进一步结合 BE 内存配置或心跳交互状态，决策并确认当前节点最终生效的 _effective_cluster_id（若节点全新启动，可能会根据情况初始化；若已有集群信息，则校验并锁定该 ID）。
     RETURN_IF_ERROR(_judge_and_update_effective_cluster_id(cluster_id));
 
     // write cluster id into cluster_id_path if get effective cluster id success
@@ -1238,11 +1285,18 @@ Status StorageEngine::_do_sweep(const std::string& scan_root, const time_t& loca
 }
 
 // invalid rowset type config will return ALPHA_ROWSET for system to run smoothly
+// 用于解析并设置默认 Rowset 存储格式类型（Rowset Type）的私有初始化函数。
+// Rowset 是数据存储的基本逻辑单元。该函数读取配置文件 be.conf 中的 default_rowset_type 项，并将其转换为引擎内部的枚举值 RowsetTypePB。
 void StorageEngine::_parse_default_rowset_type() {
+    // 读取 be.conf 中的配置字符串 default_rowset_type。
+    // 将配置值统一转换为大写（如将 "beta" 转换为 "BETA"），实现配置项的大小写不敏感容错。
     std::string default_rowset_type_config = config::default_rowset_type;
     boost::to_upper(default_rowset_type_config);
+    // BETA 格式（默认主流格式）：
+    // 解析为 BETA_ROWSET。这是目前 Apache Doris 唯一的标准行存/列存底层 Segment V2 格式，支持 Segment 级索引、字典编码、向量化读取等。
     if (default_rowset_type_config == "BETA") {
         _default_rowset_type = BETA_ROWSET;
+    // ALPHA 格式（已废弃格式）：
     } else if (default_rowset_type_config == "ALPHA") {
         _default_rowset_type = ALPHA_ROWSET;
         LOG(WARNING) << "default_rowset_type in be.conf should be set to beta, alpha is not "

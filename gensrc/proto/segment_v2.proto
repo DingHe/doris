@@ -185,29 +185,40 @@ message VariantStatisticsPB {
     // True when this variant column contains nested-group encoded data.
     optional bool has_nested_group = 4 [default = false];
 } 
-
+// 用于描述单列物理存储元数据的核心 Protocol Buffer 结构
+// 在 Segment V2 架构中，每个列（Column）的数据和索引都是独立存储的。
+// ColumnMetaPB 记录了该列的 Schema 信息、编码/压缩格式、数据 Block 统计、索引指针以及对复杂数据类型（Array, Struct, Map, Variant, AggState 等）的扩展支持。
 message ColumnMetaPB {
     // column id in table schema
+    // 在当前 Table Schema 中的列序号/ ID。
     optional uint32 column_id = 1;
     // unique column id
     optional uint32 unique_id = 2;
     // this field is FieldType's value
+    // 列的具体物理数据类型枚举值（对应 FieldType，如 INT, VARCHAR, DECIMAL 等）。
     optional int32 type = 3;
     // var length for string type
+    // 定长类型的字节长度，或字符串等变长类型的最大长度。
     optional int32 length = 4;
+    // 该列数据 Page 使用的编码算法（如 PLAIN, BIT_SHUFFLE, RLE, DICT_ENCODING 等）。
     optional EncodingTypePB encoding = 5;
     // compress type for column
+    // 该列专用的压缩算法（如 LZ4F, ZSTD, SNAPPY）。
     optional CompressionTypePB compression = 6;
     // if this column can be nullable
+    // 标识该列是否允许存储 NULL 值。
     optional bool is_nullable = 7;
     // metadata about all the column indexes
+    // 包含该列绑定的所有二级索引元数据（如 ZoneMap 索引、BloomFilter 索引、OrdinalIndex 顺序索引、Bitmap 索引等的位置指针及统计信息）。
     repeated ColumnIndexMetaPB indexes = 8;
     // pointer to dictionary page when using DICT_ENCODING
+    // 当使用字典编码（DICT_ENCODING）时，指向存储全局字典的 Dictionary Page 的物理位置（offset 与 length）
     optional PagePointerPB dict_page = 9;
 
     repeated ColumnMetaPB children_columns = 10;
 
     // required by array/struct/map reader to create child reader.
+    // 该列包含的数据总行数（对于嵌套类型，子列的行数可能与父列不同）。
     optional uint64 num_rows = 11;
     repeated string children_column_names = 12;
     
@@ -215,21 +226,29 @@ message ColumnMetaPB {
     optional ColumnPathInfo column_path_info = 13;
 
     // Extra type info to be compatible with tabet schema
+    // 列的默认值序列化字节
     optional bytes default_value = 14; // ColumnMessage.default_value ?
+    // 用于 DECIMAL 或 DATETIME 类型的精度（总位数）。
     optional int32 precision = 15; // ColumnMessage.precision
+    // 用于 DECIMAL 或 DATETIME 类型的标度/小数位数（Scale）。
     optional int32 frac = 16; // ColumnMessag
 
     repeated ColumnMetaPB sparse_columns = 17; // deprecated
-
+    // 聚合状态返回结果是否允许为 NULL
     optional bool result_is_nullable = 18; // used on agg_state type
+    // 绑定的自定义聚合函数名称（如 max_by, group_concat 等）。
     optional string function_name = 19; // used on agg_state type
+    // 序列化/反序列化该聚合状态时所使用的 BE 执行引擎版本号（确保跨版本升级兼容）。
     optional int32 be_exec_version = 20; // used on agg_state type
     optional VariantStatisticsPB variant_statistics = 21; // only used in variant type
     optional int32 variant_max_subcolumns_count = 22 [default = 0];
+    // 该列中非 NULL 值的总个数。
     optional uint64 none_null_size = 23 [default = 0];
-
+    // 该列压缩后的物理磁盘数据字节大小。
     optional uint64 compressed_data_bytes = 24;
+    // 该列解压后的物理字节大小。
     optional uint64 uncompressed_data_bytes = 25;
+    // 该列原始未打包数据大小（用于精确计算评估）。
     optional uint64 raw_data_bytes = 26;
     optional bool variant_enable_doc_mode = 27 [default = false];
 }
@@ -244,10 +263,17 @@ message ColumnMetaEntryPB {
     optional uint32 length = 2;
 }
 
+// 用于记录 主键索引（Primary Key Index）元数据 的 Protocol Buffer 结构
 message PrimaryKeyIndexMetaPB {
     // primary key index
+    // 主键 B-Tree / Index Page 索引结构的元数据
+    // 主键在 Segment 中通常以 B-Tree 或多级 Index Page 的形式构建（基于 IndexedColumn 实现）。该字段记录了主键索引列的存储格式、压缩方式、编码类型以及索引顶级根节点 Page 的物理位置指针（Offset & Length）。
+    // 应用场景：在根据主键进行范围查找或点查时，引擎通过该字段找到主键索引的 Root Page，沿着 B-Tree 快速二分定位到具体主键所在的 Data Page 和 行号（Row ID）
     optional IndexedColumnMetaPB primary_key_index = 1;
     // bloom filter index
+    // 主键专用的布隆过滤器（Bloom Filter）索引元数据
+    // 记录了基于当前 Segment 内所有主键构建的 Bloom Filter 的 Page 指针及哈希配置。
+    // 应用场景：在导入新数据或进行 Upsert/Delete 去重计算时，系统需要判断某个主键是否在此 Segment 中存在。通过先查询 Bloom Filter，可以以极低的内存和 IO 开销瞬间排除掉 99% 不包含该主键的 Segment，极大提升了点查和写时合并的性能。
     optional ColumnIndexMetaPB bloom_filter_index = 2;
 
     optional bytes min_key = 3;
@@ -264,52 +290,79 @@ enum SegmentFooterVersionPB {
 
 message SegmentFooterPB {
     // file version; see SegmentFooterVersionPB for the semantic meaning of values.
+    // Segment 文件物理格式的版本号（默认为 1），用于版本演化时的向前/向后兼容性处理。
     optional uint32 version = 1 [default = 1];
+    // （v1 传统布局）直接内嵌存储每个列的 ColumnMetaPB（包含列的类型、编码、ZoneMap 统计信息、Page 指针等）。
     repeated ColumnMetaPB columns = 2; // tablet schema
+    // 当前 Segment 文件中包含的总数据行数。
     optional uint32 num_rows = 3; // number of values
+    // 该 Segment 中所有列的索引（Index Pages）占用的物理磁盘字节数。
     optional uint64 index_footprint = 4; // total index footprint of all columns
+    // 该 Segment 中所有列的压缩后数据（Data Pages）占用的物理磁盘字节数
     optional uint64 data_footprint = 5; // total data footprint of all columns
+    // 该 Segment 中所有数据在未压缩状态下的原始数据字节数（常用于评估压缩率和精确内存/容量计算）
     optional uint64 raw_data_footprint = 6; // raw data footprint
-
+    // 数据 Block 默认使用的压缩算法（默认使用 LZ4F，可选 SNAPPY, ZSTD 等）。
     optional CompressionTypePB compress_type = 7 [default = LZ4F]; // default compression type for file columns
+    // 以 Key-Value 键值对形式保留的 Segment 文件扩展元数据，用于支持后续功能扩展和自定义统计标示。
     repeated MetadataPairPB file_meta_datas = 8; // meta data of file
 
     // Short key index's page
+    // 短拼键/前缀索引（Short Key Index） 在物理文件中的页指针（包含在文件中的 offset 和 length）。查询时基于此页建立二分查找索引。
     optional PagePointerPB short_key_index_page = 9;
 
     // Primary key index meta
+    // 主键索引元数据（主要用于 Unique 模型）。记录了主键 B-Tree 索引的顶级 Index Page 位置以及主键的 min/max 值。
     optional PrimaryKeyIndexMetaPB primary_key_index_meta = 10;
 
     // Externalized ColumnMetaPB layout (optional; presence indicates v2 meta layout available)
     // Start offset of the contiguous per-column ColumnMetaPB region (absolute file offset).
+    // （v2 外部化布局）连续存储所有列 ColumnMetaPB 的物理起始偏移量（Absolute File Offset）。
     optional uint64 col_meta_region_start = 11;
     // Per-column external meta entries, in col_id order. Each entry contains the top-level
     // unique id and the serialized length (in bytes) of its ColumnMetaPB in the external
     // Column Meta Region.
+    // v2 外部化布局）按 column_id 顺序排列的索引条目列表。每个条目包含列的 unique_id 以及其 ColumnMetaPB 在外部物理区域中的字节长度。
     repeated ColumnMetaEntryPB column_meta_entries = 12;
 }
 
+// 描述 B-Tree 树形索引元数据 的 Protocol Buffer 结构
+// 在 Doris 的 IndexedColumn（如主键索引、短拼键索引等）中，数据或索引项是以 B-Tree 结构组织的。BTreeMetaPB 记录了整棵 B-Tree 索引树的入口（根节点），是沿着索引树向下检索（B-Tree Lookup）的起点。
 message BTreeMetaPB {
   // required: pointer to either root index page or sole data page based on is_root_data_page
+  // B-Tree 根节点（Root Page）在物理 Segment 文件中的页指针（包含 offset 偏移量与 size 页面大小）。
   optional PagePointerPB root_page = 1;
   // required: true if we only have one data page, in which case root points to that page directly
+  // 标识当前根节点指针 root_page 是否直接指向一个数据页（Data Page），而不是索引页（Index Page）。
   optional bool is_root_data_page = 2;
 }
 
+// 描述 通用索引列（Indexed Column）元数据 的 Protocol Buffer 结构 IndexedColumnMetaPB
+// IndexedColumn 是一种通用的一维有序索引列数据结构，常用于构建主键索引（Primary Key Index）、前缀索引（Short Key Index） 以及倒排索引的字典/倒排表等。IndexedColumnMetaPB 记录了该索引列本身的编码方式、数据量大小以及其底层的 B-Tree 索引树根节点结构。
+// 用户数据列（Data Column）：你在 CREATE TABLE 时指定的列（如 age, name, create_time）。它们的数据存放在 Segment 的 Data Pages 区域，元数据由 ColumnMetaPB 描述。
+// IndexedColumn（内部索引列）：Doris 存储引擎为了加速检索而额外生成的辅助列。它专门用来存“索引键（Index Key）”或“字典/倒排数据”。
 message IndexedColumnMetaPB {
     // required: FieldType value
+    // 索引列中存储的数据类型（对应 FieldType 枚举，如 VARCHAR, INT, BINARY 等）。
     optional int32 data_type = 1;
     // required: encoding for this column
+    // 索引列数据 Page 所采用的编码算法（如 PLAIN, PREFIX_ENCODING 前缀压缩编码等）。
+    // 主键或短拼键通常具有高度前缀相似性，采用如 PREFIX_ENCODING 可以极大压缩索引体积。
     optional EncodingTypePB encoding = 2;
     // required: total number of values in this column
     optional int64 num_values = 3;
     // present iff this column has ordinal index
+    // 按物理序号/行号（Ordinal）索引的 B-Tree 元数据。
+    // 记录了基于逻辑序号（0, 1, 2...）定位索引键（Key）的 B-Tree 根节点 Page 物理位置指针及树的高度。
     optional BTreeMetaPB ordinal_index_meta = 4;
     // present iff this column contains sorted values and has value index
+    // 按键值（Value / Key）有序查找的 B-Tree 元数据。
+    // 记录了基于实际键值（如主键字符串 "user_10086"）进行二分/树形查找的 B-Tree 根节点 Page 物理位置指针及树的高度。
     optional BTreeMetaPB value_index_meta = 5;
     // compression type for data and index page
     optional CompressionTypePB compression = 6 [default=NO_COMPRESSION];
     // index size
+    // 该 IndexedColumn 索引列在物理文件中占用的总物理字节大小（包含所有数据页与索引页）。
     optional uint64 size = 7;
 }
 
@@ -333,12 +386,26 @@ message NestedOffsetsIndexPB {
     optional IndexedColumnMetaPB block_cumulative_offsets = 4;
 }
 
+// 记录单列物理索引元数据的核心 Protocol Buffer 结构
 message ColumnIndexMetaPB {
+    // 索引的类型枚举标识（如 ORDINAL_INDEX, ZONE_MAP_INDEX, BLOOM_FILTER_INDEX 等）
     optional ColumnIndexTypePB type = 1;
+    // 行号索引（Ordinal Index）元数据。
+    // 构建数据 Block 的逻辑行号（Row ID / Ordinal）到物理 Page 偏移量（Offset）的映射关系。
+    // 这是 Segment 中最基础、最重要的索引。任何其他索引（如 ZoneMap、倒排索引）在筛选出目标 Row ID 后，都需要通过 ordinal_index 快速定位到数据具体存在于哪个 Data Page 中。
     optional OrdinalIndexPB ordinal_index = 7;
+    // ZoneMap 索引（粗粒度范围索引）元数据。
+    // 记录了当前列各个 Data Page 或整个 Segment 的最小值（Min）、最大值（Max）、是否有 Null 值等统计数据。
     optional ZoneMapIndexPB zone_map_index = 8;
+    
+    // 位图索引（Bitmap Index）元数据 (已废弃)
+    // 早期用于基数较低的列进行等值快速过滤，目前已被功能更强大的倒排索引（Inverted Index）框架全面替代。
     optional BitmapIndexPB bitmap_index = 9; // deprecated
+    // 布隆过滤器索引（Bloom Filter Index）元数据
+    // 记录了基于当前列数据构建的布隆过滤器的算法配置（如 Hash 函数个数、Bit 长度）以及 Bloom Filter Page 的文件位置。
     optional BloomFilterIndexPB bloom_filter_index = 10;
+    // 嵌套偏移量索引（Nested Offsets Index）元数据
+    // 专为复杂数据类型（如 Array, Map 等变长嵌套类型）设计，记录了子元素在物理数组中的偏移量索引（Offsets Page）。
     optional NestedOffsetsIndexPB nested_offsets_index = 11;
 }
 

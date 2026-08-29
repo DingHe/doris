@@ -201,22 +201,36 @@ io::IOContext create_index_io_context(const io::IOContext* source, OlapReaderSta
     return io_ctx;
 }
 } // namespace
-
+// 主要职责是创建并打开一个 Segment 句柄，初始化其关键元数据，并在打开失败时触发错误上报机制。
+// io::FileSystemSPtr fs  文件系统句柄的智能指针（std::shared_ptr<io::FileSystem>）。
+// 抽象了底层的存储访问接口（如本地 POSIX 文件系统、S3、HDFS 或对象存储），Segment 将通过它创建底层的 FileReader。
+// const std::string& path  Segment 文件在文件系统中的路径。指定要打开的 .dat 物理文件的具体位置，同时也是派生倒排索引文件（.idx）路径的基础。
+// int64_t tablet_id  该 Segment 归属的 Tablet（数据分片）ID。 用于标识上下文，在远端缓存读取（Peer Read）和发生 IO 错误时的 Tablet 状态上报中起到关键作用。
+// uint32_t segment_id Segment 文件在所属 Rowset 内部的唯一递增编号（如 0, 1, 2...）。
+// RowsetId rowset_id Segment 归属的 Rowset（数据批次）ID。与其组成全局或 Rowset 级别的唯一标识，用于生成缓存键（如 file_cache_key）。
+// std::shared_ptr<Segment>* output 出参指针（指向 std::shared_ptr<Segment> 的指针）。如果打开成功，创建好的 Segment 实例智能指针将被写入到此指针指向的变量中。
+// InvertedIndexFileInfo idx_file_info (默认值 {})  倒排索引文件信息。包含倒排索引文件的额外元数据（如独立索引文件还是合并索引文件、索引格式版本等）。
 Status Segment::open(io::FileSystemSPtr fs, const std::string& path, int64_t tablet_id,
                      uint32_t segment_id, RowsetId rowset_id, TabletSchemaSPtr tablet_schema,
                      const io::FileReaderOptions& reader_options, std::shared_ptr<Segment>* output,
                      InvertedIndexFileInfo idx_file_info, OlapReaderStatistics* stats,
                      const io::IOContext* source_io_ctx) {
     // Ensure tablet_id is available in reader_options for CachedRemoteFileReader peer read.
+    // 补全读取选项，注入 tablet_id
+    // 原因：在存算分离或远程存储架构下（例如使用 CachedRemoteFileReader），
+    // 节点间做对等读取（Peer Read）或者操作远程文件缓存时，底层的 IO 模块需要通过 tablet_id 来定位资源和做路由调度。
     io::FileReaderOptions opts_with_tablet = reader_options;
     opts_with_tablet.tablet_id = tablet_id;
 
     auto s = _open(fs, path, segment_id, rowset_id, tablet_schema, opts_with_tablet, output,
                    idx_file_info, stats, source_io_ctx);
+    // 打开成功后，为 Segment 实例赋值 tablet_id
     if (s.ok() && output && *output) {
         (*output)->_tablet_id = tablet_id;
     }
     if (!s.ok()) {
+        // 判断当前是否为存算一体（本地存储）模式。
+        // 在存算分离（Cloud Mode）下，节点错误由云端元服务（Meta Service）托管，因此存算一体模式才需要在 BE 本地处理 Tablet 损坏逻辑。
         if (!config::is_cloud_mode()) {
             auto res = ExecEnv::get_tablet(tablet_id);
             TabletSharedPtr tablet =
@@ -229,36 +243,46 @@ Status Segment::open(io::FileSystemSPtr fs, const std::string& path, int64_t tab
 
     return s;
 }
-
+// 该函数是打开 Segment 文件的核心实现，主要负责物理文件打开、Segment 实例构建、解析 Footer 元数据，并在启用文件缓存（File Cache）且遇到数据损坏（CORRUPTION）时，执行三级重试（Three-tier retry）机制。
 Status Segment::_open(io::FileSystemSPtr fs, const std::string& path, uint32_t segment_id,
                       RowsetId rowset_id, TabletSchemaSPtr tablet_schema,
                       const io::FileReaderOptions& reader_options, std::shared_ptr<Segment>* output,
                       InvertedIndexFileInfo idx_file_info, OlapReaderStatistics* stats,
                       const io::IOContext* source_io_ctx) {
     io::FileReaderSPtr file_reader;
+    // 尝试首次打开文件与创建对象
     auto st = fs->open_file(path, &file_reader, &reader_options);
     TEST_INJECTION_POINT_CALLBACK("Segment::open:corruption", &st);
+    // 构造 Segment 实例，将 tablet_schema 所有权转移给实例。
     std::shared_ptr<Segment> segment(
             new Segment(segment_id, rowset_id, std::move(tablet_schema), idx_file_info));
+    // 记录 Segment 的物理文件路径到成员变量 _seg_path。
     segment->_seg_path = path;
+    // 若底层文件打开成功（st 为 OK）：
     if (st) {
+        // 将 fs 和 file_reader 赋值/移动给 segment 实例
         segment->_fs = fs;
         segment->_file_reader = std::move(file_reader);
+        // 解析 Segment 文件尾部的 Footer 元数据（SegmentFooterPB）并初始化列信息
         st = segment->_open(stats, source_io_ctx);
     }
 
     // Three-tier retry for CORRUPTION errors when file cache is enabled.
     // This handles CORRUPTION from both open_file() and _parse_footer() (via _open()).
+    // 发生文件损坏错误（可能是本地 Block File Cache 损坏，也可能是网络传输异常）
+    // 且启用了文件块缓存 (FILE_BLOCK_CACHE) 时，触发此重试逻辑
     if (st.is<ErrorCode::CORRUPTION>() &&
         reader_options.cache_type == io::FileCachePolicy::FILE_BLOCK_CACHE) {
         // Tier 1: Clear file cache and retry with cache support (re-downloads from remote).
         LOG(WARNING) << "bad segment file may be read from file cache, try to read remote source "
                         "file directly, file path: "
                      << path << " cache_key: " << file_cache_key_str(path);
+        // 怀疑是本地 Cache 损坏
+        // 根据路径获取 file_key 和缓存管理对象 file_cache，从本地缓存中彻底强制移除该文件的缓存块。
         auto file_key = file_cache_key_from_path(path);
         auto* file_cache = io::FileCacheFactory::instance()->get_by_path(file_key);
         file_cache->remove_if_cached(file_key);
-
+        // 再次调用 open_file 和实例 _open 解析 Footer。由于缓存已清空，系统会尝试从远端重新下载数据。
         st = fs->open_file(path, &file_reader, &reader_options);
         if (st) {
             segment->_fs = fs;
@@ -266,6 +290,8 @@ Status Segment::_open(io::FileSystemSPtr fs, const std::string& path, uint32_t s
             st = segment->_open(stats, source_io_ctx);
         }
         TEST_INJECTION_POINT_CALLBACK("Segment::open:corruption1", &st);
+        // 针对二次损坏的测试注入点。
+        // 直接绕过 Cache（NO_CACHE），直连远端存储
         if (st.is<ErrorCode::CORRUPTION>()) { // corrupt again
             // Tier 2: Bypass cache entirely and read directly from remote storage.
             LOG(WARNING) << "failed to try to read remote source file again with cache support,"
@@ -280,6 +306,7 @@ Status Segment::_open(io::FileSystemSPtr fs, const std::string& path, uint32_t s
             segment->_fs = fs;
             segment->_file_reader = std::move(file_reader);
             st = segment->_open(stats, source_io_ctx);
+            // 确认远端源文件自身已被损坏
             if (!st.ok()) {
                 // Tier 3: Remote source itself is corrupt.
                 LOG(WARNING) << "failed to try to read remote source file directly,"
@@ -293,14 +320,15 @@ Status Segment::_open(io::FileSystemSPtr fs, const std::string& path, uint32_t s
     *output = std::move(segment);
     return Status::OK();
 }
-
+// Segment 类的构造函数实现
+// 该构造函数为私有构造函数（private），通过初始化列表（Initializer List）完成了 Segment 内存对象最基础成员变量的赋值与所有权转移
 Segment::Segment(uint32_t segment_id, RowsetId rowset_id, TabletSchemaSPtr tablet_schema,
                  InvertedIndexFileInfo idx_file_info)
-        : _segment_id(segment_id),
-          _meta_mem_usage(0),
-          _rowset_id(rowset_id),
-          _tablet_schema(std::move(tablet_schema)),
-          _idx_file_info(std::move(idx_file_info)) {}
+        : _segment_id(segment_id), // Segment 在其归属的 Rowset 内部的唯一递增 ID（如 0, 1, 2）。
+          _meta_mem_usage(0),    // 初始化 Segment 占用的元数据内存字节数 _meta_mem_usage 为 0。
+          _rowset_id(rowset_id), // Segment 所属的 Rowset（数据批次）ID。
+          _tablet_schema(std::move(tablet_schema)), // 指向表结构元数据（TabletSchema）的智能指针（std::shared_ptr<TabletSchema>）。
+          _idx_file_info(std::move(idx_file_info)) {} // 倒排索引（Inverted Index）文件的元数据结构体。
 
 Segment::~Segment() {
     g_segment_estimate_mem_bytes << -_tracked_meta_mem_usage;
@@ -323,37 +351,51 @@ void Segment::update_metadata_size() {
     g_segment_estimate_mem_bytes << _meta_mem_usage - _tracked_meta_mem_usage;
     _tracked_meta_mem_usage = _meta_mem_usage;
 }
-
+// 在底层物理文件（FileReader）已经打开后调用的。
+// 核心职责是：解析 Segment 文件尾部的 Footer 元数据、初始化关键索引指针与行数，并估算当前 Segment 对象在内存中所占用的元数据内存大小。
+// OlapReaderStatistics* stats OLAP 读取统计信息指标指针。
 Status Segment::_open(OlapReaderStatistics* stats, const io::IOContext* source_io_ctx) {
+    // 声明一个指向 SegmentFooterPB（Protocol Buffer 格式的 Segment 结尾元数据）的智能指针。
     std::shared_ptr<SegmentFooterPB> footer_pb_shared;
+    // 获取 Footer。内部会优先从缓存（StoragePageCache）查找
     RETURN_IF_ERROR(_get_segment_footer(footer_pb_shared, stats, source_io_ctx));
-
+    // 检查 Footer 中是否包含主键索引元数据（has_primary_key_index_meta）。
+    // 如果是 Unique 主键模型表，则在堆上分配一个新的 PrimaryKeyIndexMetaPB 对象并转移给 _pk_index_meta 管理；否则置为 nullptr。
     _pk_index_meta.reset(
             footer_pb_shared->has_primary_key_index_meta()
                     ? new PrimaryKeyIndexMetaPB(footer_pb_shared->primary_key_index_meta())
                     : nullptr);
     // delete_bitmap_calculator_test.cpp
     // DCHECK(footer.has_short_key_index_page());
+    // 从 Footer 中提取前缀/短拼键索引（Short Key Index）所在的磁盘 Page 指针信息（偏移量与长度），保存到成员变量 _sk_index_page。
     _sk_index_page = footer_pb_shared->short_key_index_page();
+    // 从 Footer 中读取当前 Segment 文件包含的总行数，记录到 _num_rows 成员变量中。
     _num_rows = footer_pb_shared->num_rows();
 
     // An estimated memory usage of a segment
     // Footer is seperated to StoragePageCache so we don't need to add it to _meta_mem_usage
     // _meta_mem_usage += footer_pb_shared->ByteSizeLong();
+    // 动态估算 Segment 元数据内存占用（Memory Estimation）
+    // 由于 footer_pb_shared 被独立放入了 StoragePageCache 统一管理，因此这里不重入计算 Footer PB 本身。
+    // 如果存在主键索引元数据 _pk_index_meta，将该 PB 对象的字节大小累加到 _meta_mem_usage 中。
     if (_pk_index_meta != nullptr) {
         _meta_mem_usage += _pk_index_meta->ByteSizeLong();
     }
-
+    // 加上 Segment C++ 对象本身的结构体内存开销（sizeof(*this)）。
     _meta_mem_usage += sizeof(*this);
+    // 估算预加载/缓存列读取器（ColumnReader）的内存开销。
     _meta_mem_usage += std::min(static_cast<int>(_tablet_schema->num_columns()),
                                 config::max_segment_partial_column_cache_size) *
                        config::estimated_mem_per_column_reader;
 
     // 1024 comes from SegmentWriterOptions
+    // 预估短拼键索引（Short Key Index）在内存中的开销。写 Segment 时默认每 1024 行划分为一个 Short Key Block
     _meta_mem_usage += (_num_rows + 1023) / 1024 * (36 + 4);
     // 0.01 comes from PrimaryKeyIndexBuilder::init
+    // 预估主键布隆过滤器（Bloom Filter）的内存开销。
+    // 使用公式在误判率（FPR）为 0.01（1%）和行数为 _num_rows 的条件下计算最佳比特数（Bit Num），除以 8 换算为字节数（Byte）并累加。
     _meta_mem_usage += BloomFilter::optimal_bit_num(_num_rows, 0.01) / 8;
-
+    // 更新内存计数并返回
     update_metadata_size();
 
     return Status::OK();
@@ -590,26 +632,32 @@ Status Segment::_write_error_file(size_t file_size, size_t offset, size_t bytes_
     }
     return Status::OK(); // already exists
 };
-
+// 该函数是 Doris 物理解析 Segment 文件末尾元数据的核心实现。
+// 从底层文件（S3 / HDFS / 本地存储）中读取字节，经过 Magic Number 校验、CRC32C 校验和比对 以及 Protobuf 反序列化，最终构建出 SegmentFooterPB 对象。
+// 如果中途发现任何物理损坏，会生成 Dump 错误文件以供排查并抛出 Corruption 状态，触发上一层（Segment::open）的三级重试机制。
 Status Segment::_parse_footer(std::shared_ptr<SegmentFooterPB>& footer, OlapReaderStatistics* stats,
                               const io::IOContext* source_io_ctx) {
     // Footer := SegmentFooterPB, FooterPBSize(4), FooterPBChecksum(4), MagicNumber(4)
+    // 获取文件总长度 file_size。如果连 12 字节都不到，说明文件物理损坏或未写完，直接返回 Status::Corruption。
     auto file_size = _file_reader->size();
     if (file_size < 12) {
         return Status::Corruption("Bad segment file {}: file size {} < 12, cache_key: {}",
                                   _file_reader->path().native(), file_size,
                                   file_cache_key_str(_file_reader->path().native()));
     }
-
+    // 声明 12 字节的固定缓冲区 fixed_buf；基于 source_io_ctx 和 stats 创建针对索引/元数据读取的 io_ctx（指定 IO 类型为 Index Page）。
     uint8_t fixed_buf[12];
     size_t bytes_read = 0;
     auto io_ctx = create_index_io_context(source_io_ctx, stats);
     TEST_SYNC_POINT_CALLBACK("Segment::_parse_footer::io_ctx", &io_ctx);
+    // 从文件末尾倒数 12 字节处（file_size - 12）精准读取 12 字节数据。如果读取失败直接返回；调试断言确保读取字节数为 12。
     RETURN_IF_ERROR(
             _file_reader->read_at(file_size - 12, Slice(fixed_buf, 12), &bytes_read, &io_ctx));
     DCHECK_EQ(bytes_read, 12);
     TEST_SYNC_POINT_CALLBACK("Segment::parse_footer:magic_number_corruption", fixed_buf);
     TEST_INJECTION_POINT_CALLBACK("Segment::parse_footer:magic_number_corruption_inj", fixed_buf);
+    // Magic Number 标识魔数校验
+    // 对比最后 4 字节（fixed_buf + 8）与系统定义的魔数 k_segment_magic（通常为 "DOR1" 或类似字符）是否一致。
     if (memcmp(fixed_buf + 8, k_segment_magic, k_segment_magic_length) != 0) {
         Status st =
                 _write_error_file(file_size, file_size - 12, bytes_read, (char*)fixed_buf, io_ctx);
@@ -623,7 +671,9 @@ Status Segment::_parse_footer(std::shared_ptr<SegmentFooterPB>& footer, OlapRead
     }
 
     // read footer PB
+    // 使用小端序解码前 4 字节，得到 SegmentFooterPB 的物理字节长度 footer_length。
     uint32_t footer_length = decode_fixed32_le(fixed_buf);
+    // 合法性检查。整个文件的大小必须大于 12 + footer_length。如果校验失败，转储错误文件并抛出 Corruption。
     if (file_size < 12 + footer_length) {
         Status st =
                 _write_error_file(file_size, file_size - 12, bytes_read, (char*)fixed_buf, io_ctx);
@@ -642,7 +692,10 @@ Status Segment::_parse_footer(std::shared_ptr<SegmentFooterPB>& footer, OlapRead
     DCHECK_EQ(bytes_read, footer_length);
 
     // validate footer PB's checksum
+    // 校验和（CRC32C Checksum）比对
+    // 从小端序解码 fixed_buf + 4 位置的 4 字节，作为写入时记录的预期校验和 expect_checksum。
     uint32_t expect_checksum = decode_fixed32_le(fixed_buf + 4);
+    // 利用 crc32c::Crc32c 算法实时计算刚读取的 footer_buf 内容的实际 CRC 校验和 actual_checksum。
     uint32_t actual_checksum = crc32c::Crc32c(footer_buf.data(), footer_buf.size());
     if (actual_checksum != expect_checksum) {
         Status st = _write_error_file(file_size, file_size - 12 - footer_length, bytes_read,
@@ -658,7 +711,9 @@ Status Segment::_parse_footer(std::shared_ptr<SegmentFooterPB>& footer, OlapRead
     }
 
     // deserialize footer PB
+    // Protobuf 反序列化与向后兼容补全
     footer = std::make_shared<SegmentFooterPB>();
+    // 调用 Protobuf 自带的 ParseFromString 方法反序列化二进制数据。若格式不合规解析失败，记录错误日志并返回 Corruption。
     if (!footer->ParseFromString(footer_buf)) {
         Status st = _write_error_file(file_size, file_size - 12 - footer_length, bytes_read,
                                       footer_buf.data(), io_ctx);
@@ -674,6 +729,9 @@ Status Segment::_parse_footer(std::shared_ptr<SegmentFooterPB>& footer, OlapRead
     // Segments written before #26572 do not persist decimal precision/frac in
     // ColumnMetaPB, so recover the logical p/s from TabletSchema before
     // ColumnReader builds DataTypeDecimal.
+    // 历史兼容性处理
+    // 在 Doris #26572 号 PR 之前的版本写入的 Segment 文件中，ColumnMetaPB 未能持久化存放 Decimal 类型的 precision（精度）和 frac/scale（小数位数）。
+    // 调用 fill_footer_missing_decimal_precision 函数从内存中的 _tablet_schema 获取精度配置并补齐到 footer 中，避免后续 ColumnReader 构建 Decimal 数据类型时崩溃。
     fill_footer_missing_decimal_precision(_tablet_schema, footer.get());
 
     VLOG_DEBUG << fmt::format("Loading segment footer from {} finished",
@@ -1304,23 +1362,28 @@ Status Segment::seek_and_read_by_rowid(const TabletSchema& schema, SlotDescripto
     }
     return Status::OK();
 }
-
+// 该方法是 Segment 文件打开与初始化过程中的关键性能节点。
+// 核心职责是：获取 Segment 的 Footer 元数据（SegmentFooterPB），并通过“弱引用内存缓存 + 全局 PageCache 二级缓存”的双重缓存机制，极大避免重复的磁盘/网络 IO 与反序列化开销。
+// std::shared_ptr<SegmentFooterPB>& footer_pb  出参引用（std::shared_ptr<SegmentFooterPB>）。若获取成功，解析出的 SegmentFooterPB 实例将被赋给该变量返回给调用方。
+// OlapReaderStatistics* stats OLAP 读取统计指标收集器指针（如读磁盘字节数、IO 次数、耗时等）。
 Status Segment::_get_segment_footer(std::shared_ptr<SegmentFooterPB>& footer_pb,
                                     OlapReaderStatistics* stats,
                                     const io::IOContext* source_io_ctx) {
+    // _footer_pb 是 Segment 类内部声明的 std::weak_ptr<SegmentFooterPB>。尝试将弱引用提升（lock()）为强引用的 shared_ptr。
     std::shared_ptr<SegmentFooterPB> footer_pb_shared = _footer_pb.lock();
+    // 若提升成功（footer_pb_shared != nullptr），说明该 Segment 实例此前已经解析过 Footer，且其生命周期尚未结束。直接命中内存极速返回，0 次磁盘 IO，0 次 Cache 查找开销。
     if (footer_pb_shared != nullptr) {
         footer_pb = footer_pb_shared;
         return Status::OK();
     }
-
+    // 日志打点与获取全局 PageCache 句柄
     VLOG_DEBUG << fmt::format("Segment footer of {}:{}:{} is missing, try to load it",
                               _file_reader->path().native(), _file_reader->size(),
                               _file_reader->size() - 12);
 
     StoragePageCache* segment_footer_cache = ExecEnv::GetInstance()->get_storage_page_cache();
     DCHECK(segment_footer_cache != nullptr);
-
+    // 根据 Segment 文件路径及文件修改时间等信息，生成全局唯一的缓存键 cache_key。
     auto cache_key = get_segment_footer_cache_key();
 
     PageCacheHandle cache_handle;
@@ -1330,8 +1393,12 @@ Status Segment::_get_segment_footer(std::shared_ptr<SegmentFooterPB>& footer_pb,
     // - Footer is metadata (small, parsed with indexes), not data page payload.
     // - Using PageTypePB::INDEX_PAGE keeps it under the same eviction policy/shards
     //   as other index/metadata pages and avoids competing with DATA_PAGE budget.
+    // 第二级缓存：查找/填充全局 StoragePageCache
+    // 归类为 INDEX_PAGE 可以让它与普通的索引 Page 共享淘汰策略与内存分片（Shards），避免与体积庞大的数据页（DATA_PAGE）竞争内存 Cache 预算而频繁被淘汰。
     if (!segment_footer_cache->lookup(cache_key, &cache_handle,
                                       segment_v2::PageTypePB::INDEX_PAGE)) {
+        // Cache 未命中
+        // 从物理文件中读取结尾字节，并反序列化生成 footer_pb_shared 对象（内部有 IO 操作）。如果解析失败，直接通过 RETURN_IF_ERROR 宏返回错误。
         RETURN_IF_ERROR(_parse_footer(footer_pb_shared, stats, source_io_ctx));
         segment_footer_cache->insert(cache_key, footer_pb_shared, footer_pb_shared->ByteSizeLong(),
                                      &cache_handle, segment_v2::PageTypePB::INDEX_PAGE);
@@ -1340,6 +1407,7 @@ Status Segment::_get_segment_footer(std::shared_ptr<SegmentFooterPB>& footer_pb,
                                   _file_reader->path().native(), _file_reader->size(),
                                   _file_reader->size() - 12);
     }
+    // 导出对象并更新一级缓存
     footer_pb_shared = cache_handle.get<std::shared_ptr<SegmentFooterPB>>();
     _footer_pb = footer_pb_shared;
     footer_pb = footer_pb_shared;

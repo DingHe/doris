@@ -144,19 +144,29 @@ DataDir::~DataDir() {
     DorisMetrics::instance()->metric_registry()->deregister_entity(_data_dir_metric_entity);
     delete _meta;
 }
-
+// DataDir 实例的入口初始化函数
+// 负责验证物理磁盘路径的真实存在性、更新磁盘空间容量、校验并写入 cluster_id、创建物理子目录与 Shard 分片结构，并启动该磁盘绑定的 RocksDB 元数据实例（OlapMeta）。
 Status DataDir::init(bool init_meta) {
     bool exists = false;
+    // 磁盘路径存在性检查（Fail-Fast）。
+    // 通过全局本地文件系统接口检查配置的根路径 _path（如 /data1/doris）是否存在。
+    // 若物理路径不存在（如磁盘未挂载、目录被误删），则立刻返回 IOError 阻断启动，防止向未挂载的目录盲目写入。
     RETURN_IF_ERROR(io::global_local_filesystem()->exists(_path, &exists));
     if (!exists) {
         RETURN_NOT_OK_STATUS_WITH_WARN(Status::IOError("opendir failed, path={}", _path),
                                        "check file exist failed");
     }
-
+    // 获取并更新物理磁盘的初始容量。
+    // 调用 statfs 系统调用获取该路径当前的实际总空间（_disk_capacity_bytes）与剩余可用空间（_available_bytes），为后续选盘和预留校验打下基础。
     RETURN_NOT_OK_STATUS_WITH_WARN(update_capacity(), "update_capacity failed");
+    // 校验与持久化集群标识（cluster_id）。
     RETURN_NOT_OK_STATUS_WITH_WARN(_init_cluster_id(), "_init_cluster_id failed");
+    // 建存储引擎所需的物理子目录与 1024 个 Shard 分片目录。
+    // 检查并创建数据根目录下的关键物理子目录结构（data/, trash/, snapshot/ 等），同时预先创建 data/0/ 到 data/1023/ 的物理分片文件夹。
     RETURN_NOT_OK_STATUS_WITH_WARN(_init_capacity_and_create_shards(),
                                    "_init_capacity_and_create_shards failed");
+    // 选择性初始化本地元数据引擎（OlapMeta）。
+    // 若 init_meta 参数为 true（默认值），则调用 _init_meta() 打开该磁盘专属的 RocksDB 实例。在某些特定场景（如简单的工具类任务或测试）下可传入 false 跳过元数据数据库的装载。
     if (init_meta) {
         RETURN_NOT_OK_STATUS_WITH_WARN(_init_meta(), "_init_meta failed");
     }
@@ -168,25 +178,34 @@ Status DataDir::init(bool init_meta) {
 void DataDir::stop_bg_worker() {
     _stop_bg_worker = true;
 }
-
+// 主要作用是在节点启动或重新挂载磁盘时，从磁盘根目录下读取持久化的 cluster_id 文件，以确保物理数据目录的合法性与一致性。
 Status DataDir::_init_cluster_id() {
     auto cluster_id_path = fmt::format("{}/{}", _path, CLUSTER_ID_PREFIX);
+    // 尝试从 cluster_id_path 指定的文件中读取并解析出保存的 cluster_id 整数值，结果写入成员变量 _cluster_id 中。
     RETURN_IF_ERROR(read_cluster_id(cluster_id_path, &_cluster_id));
+    // 如果读取文件发生 IO 异常或格式不符合预期，RETURN_IF_ERROR 会立刻终止执行并返回对应的错误状态。
+    // 如果该文件尚未建立（例如这是一个全新的数据目录），read_cluster_id 通常会将 _cluster_id 赋值为 -1 并返回
     if (_cluster_id == -1) {
         _cluster_id_incomplete = true;
     }
     return Status::OK();
 }
-
+// 用于初始化物理磁盘容量信息并预先创建物理数据子目录与 1024 个 Shard 分片目录的私有初始化函数。
+// 核心作用是构建 Doris 存储引擎在物理磁盘上的底层目录层次结构，确保后续新建 Tablet 或写入 Rowset 时对应的物理路径已经准备就绪。
 Status DataDir::_init_capacity_and_create_shards() {
+    // 通过 Doris 本地文件系统抽象接口获取当前物理根路径 _path 的总容量（_disk_capacity_bytes）与剩余可用容量（_available_bytes）。
     RETURN_IF_ERROR(io::global_local_filesystem()->get_space_info(_path, &_disk_capacity_bytes,
                                                                   &_available_bytes));
+    // 检查并创建顶层数据目录 data/（即 {_path}/data）。
+    // 拼接物理路径 data_path。若该路径不存在（如全新挂载的磁盘目录），则递归创建 data/ 目录；若已存在则直接跳过创建。
     auto data_path = fmt::format("{}/{}", _path, DATA_PREFIX);
     bool exists = false;
     RETURN_IF_ERROR(io::global_local_filesystem()->exists(data_path, &exists));
     if (!exists) {
         RETURN_IF_ERROR(io::global_local_filesystem()->create_directory(data_path));
     }
+    // 预先循环创建 0 到 1023 共 MAX_SHARD_NUM（1024）个 Shard 分片子目录（即 {_path}/data/0 到 {_path}/data/1023）。
+    // 目录打散（Avoid Single Directory Limits）：避免将成千上万个 Tablet 数据目录直接丢在同一级目录下导致 Linux 文件系统（如 Ext4/XFS）目录项检索效率下降或 inode 节点瓶颈。
     for (int i = 0; i < MAX_SHARD_NUM; ++i) {
         auto shard_path = fmt::format("{}/{}", data_path, i);
         RETURN_IF_ERROR(io::global_local_filesystem()->exists(shard_path, &exists));
@@ -198,18 +217,24 @@ Status DataDir::_init_capacity_and_create_shards() {
     return Status::OK();
 }
 
+// 核心作用是为当前物理磁盘建立专用的 RocksDB 实例，用以持久化管理该磁盘上所有 Tablet 的元数据（TabletMeta）与 Header 信息。
 Status DataDir::_init_meta() {
     // init path hash
+    // 计算当前数据目录的全局唯一 Hash 标识（_path_hash）并记录日志
     _path_hash = hash_of_path(BackendOptions::get_localhost(), _path);
     LOG(INFO) << "path: " << _path << ", hash: " << _path_hash;
 
     // init meta
+    // 在堆上动态分配 OlapMeta 实例。
     _meta = new (std::nothrow) OlapMeta(_path);
     if (_meta == nullptr) {
         RETURN_NOT_OK_STATUS_WITH_WARN(
                 Status::MemoryAllocFailed("allocate memory for OlapMeta failed"),
                 "new OlapMeta failed");
     }
+    // 打开并装载基于 RocksDB 的元数据引擎。
+    // 调用 _meta->init() 会在磁盘根路径下创建/打开内部 RocksDB 数据库（存放在 {_path}/meta 目录下）。
+    // 如果因为磁盘损坏、文件锁冲突或 RocksDB SST 文件损坏导致打开失败，函数将捕获异常并向上抛出 Status::IOError，避免带病启动。
     Status res = _meta->init();
     if (!res.ok()) {
         RETURN_NOT_OK_STATUS_WITH_WARN(Status::IOError("open rocksdb failed, path={}", _path),
@@ -345,6 +370,13 @@ Status DataDir::_check_incompatible_old_format_tablet() {
 }
 
 // TODO(ygl): deal with rowsets and tablets when load failed
+// 负责在 BE 启动或挂载数据目录时，从该数据目录对应的 RocksDB（_meta，即 OlapMeta）中全量恢复 Tablet、Rowset、Delete Bitmap 以及异步 Publish 任务等元数据并加载到内存中
+// 兼容性检查：检查并拒绝旧版本的元数据格式。
+//加载 RowsetMeta：从 RocksDB 扫描并反序列化所有 RowsetMeta，处理历史谓词兼容性（Delete Predicate v1 -> v2）并纠正模式 Schema。
+//加载 Tablet Header：从 RocksDB 扫描并创建 Tablet 实例并注册至 TabletManager。
+//加载 Pending Publish 任务：恢复未完成的异步 Commit/Publish 任务并投递回引擎引擎队列。
+//恢复 Rowset 与 Transaction 关系：根据 Rowset 状态（COMMITTED 或 VISIBLE）分别将其挂载到事务管理器 TxnManager 或直接添加到 Tablet 中，同时支持 Row Binlog 关联。
+//恢复 Delete Bitmap：从 RocksDB 扫描并反序列化主键模型（Unique Key with MoW）的 DeleteBitmap 加载至 TabletMeta 内存结构中。
 Status DataDir::load() {
     LOG(INFO) << "start to load tablets from " << _path;
 
@@ -961,10 +993,13 @@ void DataDir::perform_path_gc() {
 
     LOG(INFO) << "gc data dir path: " << _path << " finished";
 }
-
+// 负责实时刷新物理磁盘空间容量并同步更新运维监控指标（Metrics）的核心私有/公有成员函数。
+// 通过底层文件系统接口获取磁盘的真实物理容量与剩余可用空间，计算当前磁盘空间使用率，并将这些指标暴露给 Prometheus 等监控系统。
 Status DataDir::update_capacity() {
+    // 通过 Doris 的全局本地文件系统抽象层（底层通常基于 statfs 或 statvfs 系统调用）获取指定物理路径 _path 的存储空间信息。
     RETURN_IF_ERROR(io::global_local_filesystem()->get_space_info(_path, &_disk_capacity_bytes,
                                                                   &_available_bytes));
+    // 将最新的物理总容量和剩余可用容量更新至当前的 Prometheus Gauge 监控指标中。
     disks_total_capacity->set_value(_disk_capacity_bytes);
     disks_avail_capacity->set_value(_available_bytes);
     LOG(INFO) << "path: " << _path << " total capacity: " << _disk_capacity_bytes
