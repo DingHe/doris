@@ -26,32 +26,43 @@ namespace doris::segment_v2 {
 IndexStorageFormat::IndexStorageFormat(IndexFileWriter* index_file_writer)
         : _index_file_writer(index_file_writer) {}
 
+// 规定倒排索引子文件在最终合成的复合文件（Compound File）中的存储物理顺序。
 void IndexStorageFormat::sort_files(std::vector<FileInfo>& file_infos) {
+    // 根据文件名后缀/特征计算文件的写入优先级（Priority）
     auto file_priority = [](const std::string& filename) {
+        // 遍历 InvertedIndexDescriptor::index_file_info_map（映射表，维护了各类 CLucene 子文件后缀对应的优先级序号，数值越小优先级越高）。
         for (const auto& entry : InvertedIndexDescriptor::index_file_info_map) {
+            // 如果 filename 中包含某个已知后缀（例如 .tis, .tii, .frq, .prx 等），则返回对应的优先级整数。
             if (filename.find(entry.first) != std::string::npos) {
                 return entry.second;
             }
         }
+        // 若未匹配到任何预定义类型，则返回 std::numeric_limits<int32_t>::max()（即最大整数，优先级最低，排在最后）。
         return std::numeric_limits<int32_t>::max(); // Other files
     };
-
+    // 比较函数按照 双重排序规则（二级排序） 进行：
     std::sort(file_infos.begin(), file_infos.end(), [&](const FileInfo& a, const FileInfo& b) {
         int32_t priority_a = file_priority(a.filename);
         int32_t priority_b = file_priority(b.filename);
+        // 第一优先级：文件类型优先级 (priority)
         if (priority_a != priority_b) {
             return priority_a < priority_b;
         }
+        // 第二优先级：文件大小 (filesize)
         return a.filesize < b.filesize;
     });
 }
-
+// 负责提取、过滤并按规则排序倒排索引目录内子文件的核心方法。
 std::vector<FileInfo> IndexStorageFormat::prepare_sorted_files(
         lucene::store::Directory* directory) {
+    // 获取文件列表：调用 CLucene 的 Directory::list() 接口，读取当前索引目录中保存的所有子文件文件名，装入 files 容器中。
     std::vector<std::string> files;
     directory->list(&files);
 
     // Remove write.lock file
+    // CLucene 在写入索引时会产生写锁文件（通常为 write.lock），防止多线程/多进程并发写入破坏文件。
+    // 该锁文件只在写阶段有效，不需要打包合并到最终的索引复合文件（Compound File）中。
+    // 此处使用标准的 C++ std::remove 配合容器 erase 方法，将锁文件从待处理列表中彻底剔除。
     files.erase(std::remove(files.begin(), files.end(), DorisFSDirectory::WRITE_LOCK_FILE),
                 files.end());
 

@@ -50,6 +50,14 @@ class PrimaryKeyIndexMetaPB;
 // Index is stored in multiple pages to leverage the IndexedColumnWriter.
 //
 // NOTE: for now, it's only used when unique key merge-on-write property enabled.
+// PrimaryKeyIndexBuilder 以及同文件下的 PrimaryKeyIndexReader 是 Apache Doris Backend (BE) 中专门针对 Unique Key 模型且开启了 Merge-on-Write (MoW) 属性的数据表所设计的主键索引构建器与读取器。
+// 在 Doris 的 Unique Key 模型下，开启 Merge-on-Write 机制能够将以往 Merge-on-Read 模式下在读取时合并多版本数据的巨大开销，转嫁到数据写入（MemTable Flush）和 Compaction 阶段。其核心依赖于一个极速的主键查重与定位索引。
+// PrimaryKeyIndexBuilder（构建器）：
+// 设计理念参考了类似 RocksDB 的 Partitioned Index（分片索引）。在 Segment 文件写入（Flush）时，它会同时构建两层结构：
+// B+ 树树状稀疏索引 (IndexedColumnWriter)：支持对有序主键进行 $O(\log N)$ 的二分快速定位与 Page 级别定位。
+// 主键布隆过滤器 (BloomFilterIndexWriter)：快速布尔判定主键是否存在，避免无效的磁盘 I/O。
+// PrimaryKeyIndexReader（读取器）：
+// 在点查（Point Lookup）或写时去重校验（Delete Bitmap 构建）时，反序列化该主键索引与布隆过滤器，实现毫秒级的主键寻找与去重过滤。
 class PrimaryKeyIndexBuilder {
 public:
     PrimaryKeyIndexBuilder(io::FileWriter* file_writer, size_t seq_col_length, size_t rowid_length)

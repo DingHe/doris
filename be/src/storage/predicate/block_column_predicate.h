@@ -50,32 +50,49 @@ class InvertedIndexIterator;
 // in the future
 // TODO: support do predicate on Bitmap and ZoneMap, So we can use index of column to do predicate on
 // page and segment
+// 块级列谓词（Block Column Predicate）的抽象基类
+// 核心作用是为复合逻辑谓词（如 AND、OR 条件）以及单列谓词（ColumnPredicate）提供统一的块级评估与索引剪枝抽象。
+// 统一向量化过滤接口：定义在数据块（MutableColumns / Block）上进行逐行过滤或选择操作（Selected Vector）的虚接口，支持向量化引擎的过滤求值。
+// 多级索引剪枝（Indexing Pruning）：抽象出 ZoneMap 粗粒度范围过滤、BloomFilter 布隆过滤器过滤、字典编码（Dict）匹配以及倒排索引（Inverted Index）评估的统一接口。
+// 支持复合谓词树：派生出 AndBlockColumnPredicate 与 OrBlockColumnPredicate，使得简单谓词可以按逻辑树形结构嵌套（如 (A AND B) OR C），并将逻辑运算隐式吸收到索引剪枝与向量化求值过程中。
 class BlockColumnPredicate {
 public:
     BlockColumnPredicate() = default;
     virtual ~BlockColumnPredicate() = default;
-
+    // 参数：column_id_set - 用于接收所有关联 Column ID 的集合引用。
+    // 递归收集当前谓词及其所有子谓词中涉及到的所有列的唯一 ID（ColumnId）。存储层利用此接口知道哪些列参与了谓词计算，从而决定是否加载对应列的物理数据或索引。
     virtual void get_all_column_ids(std::set<ColumnId>& column_id_set) const = 0;
-
+    // predicate_set - 用于接收单列谓词指针的集合引用。
+    // 提取并展开当前谓词树中包含的所有底层底层单列谓词（ColumnPredicate）。主要用于下推优化时获取最原子层的过滤算子。
     virtual void get_all_column_predicate(
             std::set<std::shared_ptr<const ColumnPredicate>>& predicate_set) const = 0;
-
+    // 数据块（Block）向量化求值方法
+    // block - 待评估的向量化列数据数组（Block 中的列集合）。
+    // sel - 选择向量数组（Selection Vector），存储当前通过过滤条件的物理行号索引。
+    // selected_size - 输入的合法行号数量。
+    // 返回值：通过当前谓词计算后剩余的合法行号数量。
+    // 作用：基于 Selection Vector 的过滤求值。对输入的 sel 数组原地筛选，剔除不满足当前谓词的行，并将保留下来的行号原地收缩存放，返回新的数量。默认实现不做筛选，直接返回原大小。
     virtual uint16_t evaluate(MutableColumns& block, uint16_t* sel, uint16_t selected_size) const {
         return selected_size;
     }
+    // 针对选定行进行 与（AND） 逻辑运算。计算结果将以flags[i] = flags[i] && result 的方式写回 flags 数组。
     virtual void evaluate_and(MutableColumns& block, uint16_t* sel, uint16_t selected_size,
                               bool* flags) const {}
+    // 针对选定行进行 或（OR） 逻辑运算。计算结果将以 flags[i] = flags[i] || result 的方式写回 flags 数组。
     virtual void evaluate_or(MutableColumns& block, uint16_t* sel, uint16_t selected_size,
                              bool* flags) const {}
-
+    // 全量向量化求值接口。直接对 Block 中的前 size 行做谓词判断，并将布尔结果（true/false）直接填充到 flags 数组中。
     virtual void evaluate_vec(MutableColumns& block, uint16_t size, bool* flags) const {}
-
+    // 若当前谓词支持使用 ZoneMap/Statistics 进行剪枝过滤返回 true；否则返回 false。
+    // 作用：用于判断该谓词能力是否具备 ZoneMap 裁切属性（默认返回 true）。部分复杂谓词（如正则表达式或函数调用）可能不支持 ZoneMap，会覆盖此接口返回 false。
     virtual bool support_zonemap() const { return true; }
-
+    // 参数：zone_map - 当前 Segment/Page 的 ZoneMap 统计信息（包含 Max/Min 值、HasNull 等）。
+    // 返回值：true 表示可能包含满足条件的数据（无法裁剪，需要继续读取）；false 表示绝对不包含满足条件的数据（安全跳过该数据块）。
     virtual bool evaluate_and(const segment_v2::ZoneMap& zone_map) const {
         throw Exception(Status::FatalError("should not reach here"));
     }
-
+    // 参数：statistic - Parquet 文件的列统计信息（Min/Max/NullCount）。
+    // 作用：针对外表 Parquet 格式的列统计信息（ColumnStat）做谓词剪枝评估。基类默认抛出 FatalError 异常。
     virtual bool evaluate_and(ParquetPredicate::ColumnStat* statistic) const {
         throw Exception(Status::FatalError("should not reach here"));
     }
@@ -87,22 +104,26 @@ public:
      * parsed, `CachedPageIndexStat` is used to avoid repeatedly parsing the page index information
      * of the same column.
      */
+    // 作用：针对 Parquet 的 Page Index 做细粒度页级剪枝，并将需要读取的行号追加记录到 row_ranges 中。使用缓存统计对象避开重复解析相同的 Page Index。基类默认抛出 FatalError 异常。
     virtual bool evaluate_and(ParquetPredicate::CachedPageIndexStat* statistic,
                               RowRanges* row_ranges) const {
         throw Exception(Status::FatalError("should not reach here"));
     }
-
+    // 参数：bf - 针对当前数据块构建的 BloomFilter（布隆过滤器）指针。
     virtual bool evaluate_and(const segment_v2::BloomFilter* bf) const {
         throw Exception(Status::FatalError("should not reach here"));
     }
-
+    // dict_words - 当前 Page/Segment 字符串字典的词条数组。
+    // dict_num - 字典中词条的总数量。
     virtual bool evaluate_and(const StringRef* dict_words, const size_t dict_num) const {
         throw Exception(Status::FatalError("should not reach here"));
     }
-
+    // 参数：ngram - 是否为 N-Gram 类型的 BloomFilter。
+    // 作用：用于判断某些谓词类型（如 LIKE '%abc%'）是否满足使用（或 N-Gram 扩展的）BloomFilter 索引剪枝的先决条件。
     virtual bool can_do_bloom_filter(bool ngram) const { return false; }
 
     //evaluate predicate on inverted
+    // 利用倒排索引（Inverted Index）快速查找匹配的行号。基类默认返回 INVERTED_INDEX_NOT_IMPLEMENTED 错误，由支持倒排索引的派生类重写实现。
     virtual Status evaluate(const std::string& column_name, InvertedIndexIterator* iterator,
                             uint32_t num_rows, roaring::Roaring* bitmap) const {
         return Status::Error<ErrorCode::INVERTED_INDEX_NOT_IMPLEMENTED>(

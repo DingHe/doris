@@ -48,17 +48,23 @@ Status NGramBloomFilter::init(const char* buf, size_t size, HashStrategyPB strat
 
     return Status::OK();
 }
-
+// 并没有进行 N-Gram 切片，而是采用了经典的 Double Hashing（双重哈希）二次探测算法将整段 data 的哈希值打入位图中。
 void NGramBloomFilter::add_bytes(const char* data, size_t len) {
+    // 1. 使用种子 0 计算字符串的第一个 64 位 CityHash 值
     size_t hash1 = util_hash::CityHash64WithSeed(data, len, 0);
+    // 2. 使用固定种子 SEED_GEN 计算字符串的第二个 64 位 CityHash 值
     size_t hash2 = util_hash::CityHash64WithSeed(data, len, SEED_GEN);
-
+    // 3. 循环计算 HASH_FUNCTIONS (常量为 2) 个独立的 Bit 位点
     for (size_t i = 0; i < HASH_FUNCTIONS; ++i) {
+        // 利用二次探针公式生成全局 Bit 索引 pos
+        // 使用了 Kirsch-Mitzenmacher 优化算法（二次探针生成法），仅通过两次哈希函数计算（hash1 和 hash2），就可以模拟出无限个独立的哈希位置：
+        // i * i 二次项探针，引入非线性变化，进一步破坏周期性。
         size_t pos = (hash1 + i * hash2 + i * i) % (8 * _size);
         filter[pos / (8 * sizeof(UnderType))] |= (1ULL << (pos % (8 * sizeof(UnderType))));
     }
 }
-
+// 实现文本模糊查询（如 LIKE '%pattern%'）过滤裁剪的最核心裁剪逻辑。
+// 执行集合包含关系的快速位图校验（Subset Verification via Bitwise AND）。
 bool NGramBloomFilter::contains(const BloomFilter& bf_) const {
     const auto& bf = static_cast<const NGramBloomFilter&>(bf_);
     for (size_t i = 0; i < words; ++i) {

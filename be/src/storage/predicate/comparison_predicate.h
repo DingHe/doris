@@ -31,22 +31,39 @@
 #include "storage/predicate/column_predicate.h"
 
 namespace doris {
+// ComparisonPredicateBase 是基于矢量化执行引擎（Vectorized Engine）实现的通用二元比较谓词模板基类（用于处理 col op value 形式的 SQL 过滤条件，如 a > 10、b = 'hello' 等）
+// 通过 C++ 模板参数编译期特化支持了绝大部分数据类型和比较操作符，在存储层（Segment/Page 过滤）、索引层（ZoneMap、BloomFilter、倒排索引、Parquet PageIndex）以及执行层（Vectorized Execution）扮演着极其关键的角色
+// 统一标量比较操作：通过模板参数 PrimitiveType Type（数据类型，如 INT, VARCHAR, DATE 等）和 PredicateType PT（谓词类型，如 EQ, NE, LT, LE, GT, GE），统一实现具体的比较逻辑。
+// 多层级谓词下推与下剪枝（Pruning）：
+// ZoneMap 过滤：利用数据块的 [min_value, max_value] 快速判断当前 Data Page / Segment 是否可以整体跳过。
+// Bloom Filter 过滤：针对 EQ 谓词提取数值或 Byte 序列进行哈希碰撞测试，跳过肯定不存在的数据块。
+// 倒排索引（Inverted Index）求值：将谓词转换为倒排索引查询（如 LESS_THAN_QUERY），计算出匹配的 Bitmap。
+// Parquet 格式下推：支持 Parquet 文件的 Statistics、PageIndex 和 Block Split Bloom Filter 过滤。
+// 低基数字典编码优化（Low Cardinality Optimization）：对 String 类型的字典编码列（ColumnDictI32），直接将谓词值转换为字典 Code（dict_code），后续的数据比较退化为简单的整数 Code 比较，并使用并发 Hash Map 缓存该 Code，大幅提升字符串比较性能。
+// 向量化评估（Vectorized Evaluation）：提供基于内存连续 Column 数组的批量评估函数（如 evaluate_vec），充分利用 CPU SIMD 矢量化指令。
 template <PrimitiveType Type, PredicateType PT>
 class ComparisonPredicateBase final : public ColumnPredicate {
 public:
     ENABLE_FACTORY_CREATOR(ComparisonPredicateBase);
     using T = typename PrimitiveTypeTraits<Type>::CppType;
+    //  常规构造函数。初始化列 ID、列名、数据类型 Type、是否取反标志 opposite，并将传入的通用 Field 对象转换为内部强类型的 _value。
     ComparisonPredicateBase(uint32_t column_id, std::string col_name, const Field& value,
                             bool opposite = false)
             : ColumnPredicate(column_id, col_name, Type, opposite),
               _value(value.template get<Type>()) {}
+    // 拷贝构造函数（带有重新指定 col_id 的能力）。用于为新的列 ID 复制一份谓词实例，同时复制 _value。
     ComparisonPredicateBase(const ComparisonPredicateBase<Type, PT>& other, uint32_t col_id)
             : ColumnPredicate(other, col_id), _value(other._value) {}
+
     ComparisonPredicateBase(const ComparisonPredicateBase<Type, PT>& other) = delete;
+	// 深拷贝当前谓词对象
+	// 在 Pipeline 并行执行或表达式重构时使用。
+	// 这里带有 DCHECK(_segment_id_to_cached_code.empty()) 校验，确保克隆前缓存映射为空，避免跨上下文共享字典 Code 导致并发冲突或错乱
     std::shared_ptr<ColumnPredicate> clone(uint32_t col_id) const override {
         DCHECK(_segment_id_to_cached_code.empty());
         return ComparisonPredicateBase<Type, PT>::create_shared(*this, col_id);
     }
+
     std::string debug_string() const override {
         fmt::memory_buffer debug_string_buffer;
         fmt::format_to(debug_string_buffer, "ComparisonPredicateBase({})",
@@ -54,23 +71,27 @@ public:
         return fmt::to_string(debug_string_buffer);
     }
 
+    // 返回当前谓词的具体类型枚举 PredicateType（即模板参数 PT，如 EQ, LT 等）。
     PredicateType type() const override { return PT; }
-
+    // 负责在存储层利用倒排索引（Inverted Index）快速对列谓词进行评估，通过按位图（Roaring Bitmap）计算跳过不符合条件的数据行。
     Status evaluate(const IndexFieldNameAndTypePair& name_with_type, IndexIterator* iterator,
                     uint32_t num_rows, roaring::Roaring* bitmap) const override {
+        // 第一阶段：校验倒排索引 Reader 可用性
         if (iterator == nullptr) {
             return Status::Error<ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED>(
                     "Inverted index evaluate skipped, no inverted index reader can not support "
                     "comparison predicate");
         }
-
+        // 类型支持校验：判断底层 Index Reader 是否支持 STRING_TYPE 索引或 BKD 树索引（数值/日期等范围查询索引）。
+        // 若均不支持，则返回 INVERTED_INDEX_EVALUATE_SKIPPED 错误码，执行引擎会退化为扫描解压数据页进行逐行评估。
         if (iterator->get_reader(segment_v2::InvertedIndexReaderType::STRING_TYPE) == nullptr &&
             iterator->get_reader(segment_v2::InvertedIndexReaderType::BKD) == nullptr) {
             return Status::Error<ErrorCode::INVERTED_INDEX_EVALUATE_SKIPPED>(
                     "Inverted index evaluate skipped, no inverted index reader can not support "
                     "comparison predicate");
         }
-
+        // 第二阶段：谓词类型（PredicateType）到查询类型转换
+        // 根据编译期模板参数 PT，将 SQL 比较谓词映射为倒排索引引擎可识别的 InvertedIndexQueryType：
         InvertedIndexQueryType query_type = InvertedIndexQueryType::UNKNOWN_QUERY;
         switch (PT) {
         case PredicateType::EQ:
@@ -94,7 +115,9 @@ public:
         default:
             return Status::InvalidArgument("invalid comparison predicate type {}", PT);
         }
-
+        // 第三阶段：构造参数并查询索引
+        // 打包参数：构造 InvertedIndexParam 结构体，包括列名、列类型、
+        // 强类型的查询右值 _value（包装为 Field）、查询类型以及存放结果的 std::make_shared<roaring::Roaring>()。
         InvertedIndexParam param;
         param.column_name = name_with_type.first;
         param.column_type = name_with_type.second;
@@ -102,23 +125,32 @@ public:
         param.query_type = query_type;
         param.num_rows = num_rows;
         param.roaring = std::make_shared<roaring::Roaring>();
+        // 读索引：调用 iterator->read_from_index(...) 检索倒排索引/BKD 树。执行完毕后，匹配谓词条件的行号位图会写入 param.roaring 中。
         RETURN_IF_ERROR(iterator->read_from_index(segment_v2::IndexParam {&param}));
 
         // mask out null_bitmap, since NULL cmp VALUE will produce NULL
         //  and be treated as false in WHERE
         // keep it after query, since query will try to read null_bitmap and put it to cache
+        // 第四阶段：NULL 值屏蔽（Mask Out NULLs）
+        // SQL 语义保障：SQL 规范中 NULL <cmp> VALUE 的结果为 UNKNOWN（在 WHERE 子句中视同 false）。
         if (iterator->has_null()) {
             InvertedIndexQueryCacheHandle null_bitmap_cache_handle;
+            // 若列中存在 NULL 值（iterator->has_null() 为 true），读取该 Segment 的 null_bitmap（带 Cache 机制）。
             RETURN_IF_ERROR(iterator->read_null_bitmap(&null_bitmap_cache_handle));
             std::shared_ptr<roaring::Roaring> null_bitmap = null_bitmap_cache_handle.get_bitmap();
+            // 将传入的候选位图 bitmap 减去 null_bitmap（*bitmap -= *null_bitmap），剔除所有包含 NULL 的行。
             if (null_bitmap) {
                 *bitmap -= *null_bitmap;
             }
         }
-
+        // 第五阶段：位图集合运算与输出
+        // PredicateType::NE（不等于）：
+        // 采用取反求交集的思想：*bitmap -= *param.roaring（从传入的候选行号集中扣除等于 _value 的行号）。
         if constexpr (PT == PredicateType::NE) {
             *bitmap -= *param.roaring;
         } else {
+        // 其他谓词（EQ, LT, LE, GT, GE）：
+        // 直接求交集：*bitmap &= *param.roaring（仅保留满足条件的行号）。
             *bitmap &= *param.roaring;
         }
 
@@ -685,7 +717,10 @@ private:
 
         return code;
     }
-
+    // 并发安全的哈希映射
+    // 作用：针对低基数字典列（Low Cardinality）的字典编码缓存。
+    // Key 为 Segment 的唯一标识（std::pair<RowsetId, uint32_t>），Value 为当前 _value 在该 Segment 字典中对应的字典编码 dict_code。
+    // mutable 使得该属性可以在 const 成员函数中被修改更新。
     mutable phmap::parallel_flat_hash_map<
             std::pair<RowsetId, uint32_t>, int32_t,
             phmap::priv::hash_default_hash<std::pair<RowsetId, uint32_t>>,
@@ -693,6 +728,8 @@ private:
             std::allocator<std::pair<const std::pair<RowsetId, uint32_t>, int32_t>>, 4,
             std::shared_mutex>
             _segment_id_to_cached_code;
+    // 类型：T（通过 PrimitiveTypeTraits<Type>::CppType 推导得到的 C++ 原生类型，如 int32_t、StringRef 等）
+    // 作用：存储该比较谓词右值的具体数值（即 SQL 中的常量值，如 a > 50 中的 50）。在构造函数中通过 value.template get<Type>() 解析提取。
     T _value;
 };
 } //namespace doris

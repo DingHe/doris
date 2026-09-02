@@ -47,6 +47,15 @@ class OrdinalIndexPB;
 // and file pointer for each data page.
 // But if there is only one data page, there is no need for index page. So we store
 // the file pointer to that data page directly in index meta (OrdinalIndexPB).
+// 负责 行号/逻辑序号索引（Ordinal Index，也叫行号二级索引） 的构建、解析与物理 Data Page 定位组件。
+// 在 Doris 中，Segment 内的数据是按列存储且划分为多个 Data Page 的。
+// OrdinalIndex 的作用就是记录 “每一个 Data Page 包含的第一行数据的逻辑行号（Ordinal）” 以及 “该 Data Page 在 Segment 文件中的物理偏移与大小（PagePointer）”，实现根据逻辑行号到 Data Page 的 $O(\log N)$ 快速定位。
+// 逻辑行号到物理 Data Page 的映射桥梁：
+// 在按位图（Bitmap / Roaring Bitmap）或按条件过滤（如 ZoneMap、BloomFilter、倒排索引剪枝）筛选出目标 Row ID（Ordinal）后，引擎必须知道包含这些 Row ID 的具体 Data Page 位于磁盘文件的什么位置。
+// OrdinalIndex 就是这个“行号到磁盘 Page”的对照表。
+// 极简单页优化（Single Data Page Optimization）：
+// 如果某一列的数据非常少，整个 Segment 只需要一个 Data Page 就能装下，那么 Doris 不会浪费空间去额外构建和写入一个 Index Page，而是直接把这唯一一个 Data Page 的 PagePointer 写入 Column Meta (Protobuf) 中。
+// 只有在 Data Page 数量大于 1 时，才会真正使用 IndexPageBuilder 编码一个索引页。
 class OrdinalIndexWriter {
 public:
     OrdinalIndexWriter() : _page_builder(new IndexPageBuilder(0, true)) {}

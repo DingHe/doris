@@ -421,20 +421,33 @@ bool Segment::is_tso_placeholder_col(int cid, const Schema& schema,
     // tso_col_idx() is -1 for non-binlog schemas, so this returns false there.
     return cid == schema.tso_col_idx();
 }
-
+// 该方法是 Segment 级别数据读取与过滤的总控制入口。
+// 核心价值在于：在真正物理初始化 SegmentIterator 并读取数据之前，尽可能在 Segment 级别通过 ZoneMap 索引和表达式索引执行“极速裁剪（Pruning）”
+// 若整块数据不符合条件则直接返回 EmptySegmentIterator，从而彻底跳过该 Segment 文件的物理 IO。
+// SchemaSPtr schema： 读取模式指针（包含当前查询需要提取的列及其数据类型信息）。
+// std::unique_ptr<RowwiseIterator>* iter： 按行迭代器接口的出参指针。
+// 函数执行成功后，用于接收实例化的迭代器。可能返回 SegmentIterator（常规数据读取）、EmptySegmentIterator（全裁切空读取）或 SegmentStatsIterator（仅统计信息读取）。
 Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_options,
                              std::unique_ptr<RowwiseIterator>* iter) {
+	// 1. 初始化执行版本与元数据
+    // 判断如果存在 runtime_state，将当前BE的执行版本号记录到成员变量 _be_exec_version 中，保证版本兼容逻辑。
     if (read_options.runtime_state != nullptr) {
         _be_exec_version = read_options.runtime_state->be_exec_version();
     }
+    // 确保当前 Segment 各列的元数据（ColumnMetaPB）已加载并缓存。如果加载失败则直接返回错误。
     RETURN_IF_ERROR(_create_column_meta_once(read_options.stats, &read_options.io_ctx));
-
+    // 将监控指标中的总 Segment 数加 1，用于分析统计。
     read_options.stats->total_segment_number++;
     // trying to prune the current segment by segment-level zone map
+	// 2. Segment 级别 ZoneMap 裁剪（核心优化 1）
+	// 负责在 Segment 级别利用 ZoneMap（Min/Max 索引） 对当前 Segment 进行物理裁剪（Segment-Level Pruning）。
+	// 遍历下推的列谓词集合
+	// read_options.col_id_to_predicates：存储了列 ID（column_id）与对应查询谓词（如 WHERE age > 18）的映射关系。
     for (const auto& entry : read_options.col_id_to_predicates) {
         int32_t column_id = entry.first;
         // schema change
         if (_tablet_schema->num_columns() <= column_id) {
+		// Schema Change 兼容：如果 column_id 超出了当前 Segment 对应的 _tablet_schema 列总数（发生在加列/改列的 Schema Change 期间），说明当前 Segment 还不包含此列，跳过处理。
             continue;
         }
         const TabletColumn& col = read_options.tablet_schema->column(column_id);
@@ -443,7 +456,12 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
         // (replaced with the rowset's real commit_tso at read time). Its on-disk zonemap [0,0]
         // must not drive segment-level pruning, so build a ConstantColumnReader carrying the real
         // commit_tso to prune against the real value instead.
-        std::optional<Field> const_value;
+		// 单版本 Segment（Single-version Segment） 指的是 仅包含某一个特定数据版本（Version）的 Segment 物理文件
+		// 新建/导入的 Segment：当用户向 Doris 写入一批数据时，刷写到磁盘上的 Segment 文件只对应当前这一次导入事务。这个 Segment 里的所有数据行都共享同一个版本号，这就是单版本 Segment（例如，version.first == version.second）。
+		// 背景：在开启 Binlog 或 MoW（Merge-on-Write 模式）用于增量同步/订阅的场景下，每一行数据都需要记录其提交的时间戳（Commit TSO）。
+		// 背景解释（TSO 占位符）：在 Doris 的 Binlog/单版本 Segment 中，__DORIS_COMMIT_TSO_COL__（提交时间戳列）在磁盘上物理存储的是 0 占位符，
+		// 物理存储优化：在单版本 Segment 中，由于文件里的所有数据行 TSO 均完全相同（都等于本次导入事务的 TSO），为了节省磁盘空间和写 IO，Doris 不会在磁盘物理 Data Page 中为每一行重复写入完整的 TSO 数据，而是只写入 0 作为物理占位符。
+		// 读取时替换：当读取单版本 Segment 时，Doris 会直接从 Rowset 的元数据（Meta）中获取该版本的真实 commit_tso，然后在内存中用真实值动态替换磁盘上的 0。
         if (read_options.version.first == read_options.version.second &&
             column_id == schema->commit_tso_col_idx() && read_options.commit_tso.end_tso() != -1) {
             const_value = Field::create_field<TYPE_BIGINT>(read_options.commit_tso.end_tso());
@@ -451,12 +469,14 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
         Status st = get_column_reader(col, &reader, read_options.stats, &read_options.io_ctx,
                                       std::move(const_value));
         // not found in this segment, skip
+		// 检查 ZoneMap：如果列在 Segment 中不存在（NOT_FOUND），直接跳过。
         if (st.is<ErrorCode::NOT_FOUND>()) {
             continue;
         }
         RETURN_IF_ERROR(st);
         // should be OK
         DCHECK(reader != nullptr);
+		// 没有生成 ZoneMap 索引（!has_zone_map()），直接跳过
         if (!reader->has_zone_map()) {
             continue;
         }
@@ -466,26 +486,33 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
         // evaluate_and() returns false iff no value in [min, max] can satisfy the predicates,
         // i.e. commit_tso fails them and the whole segment can be pruned. Predicates that don't
         // support zonemap return true (conservative: not pruned, row-level eval handles them).
+		// 3. 分支一：Binlog TSO 占位列的 ZoneMap 评估
         if (read_options.col_id_to_predicates.contains(column_id) &&
             is_tso_placeholder_col(column_id, *schema, read_options)) {
             const Int64 commit_tso =
                     read_options.commit_tso.end_tso() == -1 ? 0 : read_options.commit_tso.end_tso();
             ZoneMap zone_map;
+			// 手动在内存中构建一个虚拟的 ZoneMap（min_value = max_value = commit_tso）
             zone_map.min_value = Field::create_field<TYPE_BIGINT>(commit_tso);
             zone_map.max_value = Field::create_field<TYPE_BIGINT>(commit_tso);
             zone_map.has_not_null = true;
+			// 将该虚拟 ZoneMap 带入查询谓词求解：
             if (!entry.second->evaluate_and(zone_map)) {
                 // any condition not satisfied, return.
+				// 评估失败（false）：说明该 Segment 的真实 TSO 无法满足查询条件，整个 Segment 被成功裁剪！
                 *iter = std::make_unique<EmptySegmentIterator>(*schema);
                 read_options.stats->filtered_segment_number++;
                 return Status::OK();
             }
             continue;
         }
+		// 4. 分支二：普通列的物理 ZoneMap 比对与 Segment 极速裁切
         if (read_options.col_id_to_predicates.contains(column_id) &&
+			// 检查当前列类型是否可以安全下推 ZoneMap（比如处理 Variant 复杂类型推导时的类型转换安全问题）
             can_apply_predicate_safely(column_id, *schema,
                                        read_options.target_cast_type_for_variants, read_options)) {
             bool matched = true;
+			// 最核心的物理 ZoneMap 校验。将磁盘上该列物理存储的 [Min, Max] 区间与查询谓词求交集。
             RETURN_IF_ERROR(reader->match_condition(entry.second.get(), &matched));
             if (!matched) {
                 // any condition not satisfied, return.
@@ -499,14 +526,18 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
 
     // Segment-level expr-zonemap runs before SegmentIterator can rebind storage expressions to
     // the reader schema. Only apply it when scan tuple slot ordinals already match this schema.
+	// 检查 Session/RuntimeState 中是否启用了表达式 ZoneMap 过滤功能，且下推的表达式列表不为空。
     if (expr_zonemap::is_expr_zonemap_filter_enabled(read_options.runtime_state) &&
         !read_options.common_expr_ctxs_push_down.empty()) {
         ZoneMapEvalContext ctx;
+		// 为当前 Segment 提取或计算表达式所需的 ZoneMap 上下文 ZoneMapEvalContext（从磁盘提取各关联列的 Min/Max 值）
         RETURN_IF_ERROR(build_segment_zonemap_context(
                 this, *schema, read_options, read_options.common_expr_ctxs_push_down, &ctx));
+		// 执行表达式求值逻辑。例如将 date_col 的 [2023-01-01, 2023-12-31] 代入 YEAR(date_col)，得出表达式计算后的 ZoneMap 范围为 [2023, 2023]，再与 = 2024 比对。
         const auto result =
                 VExprContext::evaluate_zonemap_filter(read_options.common_expr_ctxs_push_down, ctx);
         ctx.stats.accumulate_to(read_options.stats);
+		// 评估得出当前 Segment 中的所有数据行都不满足该表达式。
         if (result == ZoneMapFilterResult::kNoMatch) {
             *iter = std::make_unique<EmptySegmentIterator>(*schema);
             read_options.stats->filtered_segment_number++;
@@ -514,39 +545,54 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
             return Status::OK();
         }
     }
-
+	// 物理加载 Segment 索引（Load Index）
+	// 物理读取并解析 Segment 文件末尾的索引 Footer 结构，在内存中加载 Ordinal Index（行号索引）、Short Key Index（前缀索引/主键索引） 以及 Bitmap Index / Inverted Index 句柄。
     {
         SCOPED_RAW_TIMER(&read_options.stats->segment_load_index_timer_ns);
         RETURN_IF_ERROR(load_index(read_options.stats, &read_options.io_ctx));
     }
-
+	// 选取与实例化迭代器（Iterator Selection）
+	// 没有 Delete 条件谓词（num_of_column_predicate() == 0），保证无版本失效/删除数据干扰。
+	// 开启了聚合下推优化（push_down_agg_type_opt != NONE）。
+	// 聚合类型不是单纯依赖倒排索引计数的 COUNT_ON_INDEX。
+	// 作用：常用于 SELECT COUNT(*) / MIN(col) / MAX(col) FROM tbl 这类不需要查明细数据的查询。直接读取 Segment Footer 或 Column Page 的统计元数据并构造结果集返回，完全不读具体的数据 Block。
     if (read_options.delete_condition_predicates->num_of_column_predicate() == 0 &&
         read_options.push_down_agg_type_opt != TPushAggOp::NONE &&
         read_options.push_down_agg_type_opt != TPushAggOp::COUNT_ON_INDEX) {
         iter->reset(new_vstatistics_iterator(this->shared_from_this(), *schema));
     } else {
+	// 常规向量化数据迭代器
+	// 作用：标准数据提取迭代器，后续将负责物理 Page 寻址、数据解压、向量化 Block 构建以及按行谓词过滤。
         *iter = std::make_unique<SegmentIterator>(this->shared_from_this(), schema);
     }
 
     // TODO: Valid the opt not only in ReaderType::READER_QUERY
+	// 目前该优化仅应用于普通 SQL 查询（READER_QUERY）。像 Compaction、Schema Change 等后台任务暂不触发。
     if (read_options.io_ctx.reader_type == ReaderType::READER_QUERY &&
         !read_options.column_predicates.empty()) {
+		// 复制一份原始的列谓词列表，用于保存剪枝剔除后的新谓词集。
         auto pruned_predicates = read_options.column_predicates;
         auto pruned = false;
+		// 遍历当前 Segment 中已加载的所有列读取器（ColumnReader）。
         for (auto& it : _column_reader_cache->get_available_readers(false)) {
             const auto uid = it.first;
             const auto column_id = read_options.tablet_schema->field_index(uid);
             bool tmp_pruned = false;
+			// 将当前列的 ZoneMap 范围与 pruned_predicates 进行匹配。
             RETURN_IF_ERROR(it.second->prune_predicates_by_zone_map(pruned_predicates, column_id,
                                                                     &tmp_pruned));
             pruned |= tmp_pruned;
         }
-
+		// 剪枝后的上下文重构（如果发生了剪枝）
         if (pruned) {
             auto options_with_pruned_predicates = read_options;
+			// 创建新的 ReadOptions，替换为剪枝后的新谓词列表。
             options_with_pruned_predicates.column_predicates = pruned_predicates;
             //because column_predicates is changed, we need to rebuild col_id_to_predicates so that inverted index will not go through it.
+			// 因为谓词被裁剪掉了（不再需要过滤），必须同步清空并重新构建 col_id_to_predicates 映射。
             options_with_pruned_predicates.col_id_to_predicates.clear();
+			// 标记“无需读取的列（No-Need-Read Path）”
+			// 遍历原始谓词集：找出那些谓词在剪枝后完全消失的列。
             for (auto pred : options_with_pruned_predicates.column_predicates) {
                 if (!options_with_pruned_predicates.col_id_to_predicates.contains(
                             pred->column_id())) {
@@ -566,9 +612,11 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
                     options_with_pruned_predicates.zonemap_always_true_pred_cols.insert(pred_cid);
                 }
             }
+
             return iter->get()->init(options_with_pruned_predicates);
         }
     }
+    // 如果没有发生任何谓词剪枝（pruned == false），则直接使用原始的 read_options 调用 iter->init(...) 初始化迭代器并返回。
     return iter->get()->init(read_options);
 }
 

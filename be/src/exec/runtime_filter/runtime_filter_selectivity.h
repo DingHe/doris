@@ -28,7 +28,11 @@ namespace doris {
 // Considering that the selectivity of runtime filters may change with data variations
 // A dynamic selectivity tracking mechanism is needed
 // Note: this is not a thread-safe class
-
+// 在分布式查询执行过程中，Runtime Filter（如 IN / BloomFilter 条件）能显著减少存储层需要读取和计算的数据量。
+// 然而，如果 BloomFilter 等过滤器的选择率极低（即过滤掉的行数很少，或者过滤率低于设定阈值），持续对每行数据执行谓词计算反而会浪费大量的 CPU 资源。
+// 周期性采样评估：按照设定的采样频率（_sampling_frequency）收集一个周期内的输入行数和过滤行数。
+// 计算选择率（过滤率）：评估当前 Runtime Filter 的实际过滤效果。
+// 动态跳过（钝化/Disable）：如果在一个评估周期内，输入的行数达到了最小统计门槛（min_judge_input_rows），且过滤率（filter_rows / input_rows）低于设置的阈值（ignore_threshold），则将过滤器置为 always_true 状态。
 class RuntimeFilterSelectivity {
 public:
     RuntimeFilterSelectivity() = default;

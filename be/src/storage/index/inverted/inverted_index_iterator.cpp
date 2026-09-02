@@ -30,31 +30,40 @@ namespace doris::segment_v2 {
 
 InvertedIndexIterator::InvertedIndexIterator() = default;
 
+// 负责标准化（规范化）分词器名称/标识 Key 的静态辅助方法。
+// 调用底层的 normalize_analyzer_key(analyzer_key)，通常会将输入的字符串转为全小写形式（例如 "CHINESE" $\rightarrow$ "chinese"，"Standard" $\rightarrow$ "standard"）。
+// 目的：消除用户 SQL 查询或建表 Schema 声明时因大小写不一致带来的匹配失败风险。
+// 区分“自动选择模式”与“精准匹配模式”：
+// 空字符串 ""（Auto-select Mode）：表示用户在 SQL 谓词中没有显式指定具体的分词器。此时 InvertedIndexIterator 会触发默认的自适应路由规则，根据数据类型（如字符串、数值）和查询类型（如等于、范围、全文匹配）自动寻找最优的 Reader（如优先选择 STRING_TYPE 或默认的 FULLTEXT）。
+// 非空字符串（Exact Match Mode）：表示用户在 SQL 中通过类似 MATCH_ANY / MATCH_ALL 明确指定了特定的分词器 Key（例如 "unicode" 或 "ik_smart"）。此时 InvertedIndexIterator 会开启严格模式，去匹配绑定了该特定 analyzer_key 的 Reader；如果找不到匹配的 Reader，系统会优雅退化（返回 BYPASS）并回退到原始数据扫描，而不是错用其他不兼容的分词索引。
 std::string InvertedIndexIterator::ensure_normalized_key(const std::string& analyzer_key) {
     // Simple normalization: lowercase, empty stays empty.
     // Empty means "user did not specify" (auto-select mode).
     // Non-empty means "user specified this analyzer" (exact match mode).
     return normalize_analyzer_key(analyzer_key);
 }
-
+// 注册倒排索引 Reader 并构建 $O(1)$ 查找索引的核心方法。
 void InvertedIndexIterator::add_reader(InvertedIndexReaderType type,
                                        const InvertedIndexReaderPtr& reader) {
     // build_analyzer_key_from_properties already returns a normalized key,
     // no need for additional normalization.
+    // 从 reader 的索引配置属性（get_index_properties()，如分词器类型、停用词表、字符过滤器等参数）中提取配置。
     std::string analyzer_key = build_analyzer_key_from_properties(reader->get_index_properties());
 
     VLOG_DEBUG << "InvertedIndexIterator add_reader: type=" << static_cast<int>(type)
                << ", analyzer_key=" << analyzer_key;
-
+    // 计算当前 Reader 即将存入数组的索引位置 entry_index
     const size_t entry_index = _reader_entries.size();
+    // 构造 ReaderEntry 结构体，通过 std::move 减少 analyzer_key 的字符串拷贝开销，并压入 _reader_entries 向量末尾。
     _reader_entries.push_back(
             ReaderEntry {.type = type, .analyzer_key = std::move(analyzer_key), .reader = reader});
 
     // Update index for O(1) lookup
     _key_to_entries[_reader_entries.back().analyzer_key].push_back(entry_index);
 }
-
+// 负责从参数校验、最佳 Reader 路由、BKD 索引过滤率评估（Skip 策略）、到最终执行倒排索引查询并收集 Profile 统计信息的完整生命周期。
 Status InvertedIndexIterator::read_from_index(const IndexParam& param) {
+    // 第一阶段：参数校验与 Debug 注入
     const auto* i_param_ptr = std::get_if<InvertedIndexParam*>(&param);
     if (i_param_ptr == nullptr) {
         return Status::Error<ErrorCode::INDEX_INVALID_PARAMETERS>(
@@ -71,15 +80,20 @@ Status InvertedIndexIterator::read_from_index(const IndexParam& param) {
     // analyzer_name from analyzer_ctx: what user specified in USING ANALYZER clause.
     // Empty means "user did not specify" (BE auto-selects index).
     // Non-empty means "user specified this analyzer" (BE exact matches).
+    // 第二阶段：智能 Reader 选盘（路由）
+    // 分词器名称提取：从上下文 analyzer_ctx 中获取用户在 SQL USING ANALYZER 子句中显式指定的分词器名字（为空则表示自动匹配）。
     const std::string& analyzer_name =
             (i_param->analyzer_ctx != nullptr) ? i_param->analyzer_ctx->analyzer_name : "";
+    // 根据数据类型、谓词类型与分词器，寻找最合适的 Reader（如 BKD Reader 或 CLucene Reader）。
     auto reader =
             DORIS_TRY(select_best_reader(i_param->column_type, i_param->query_type, analyzer_name));
     if (UNLIKELY(reader == nullptr)) {
         return Status::Error<ErrorCode::INVERTED_INDEX_CLUCENE_ERROR>(
                 "inverted index reader is null");
     }
+    // 第三阶段：BKD 索引过滤率测试与 Bypass 策略（高选择率优化）
     auto* runtime_state = _context->runtime_state;
+    // 高命中率优化机制：如果选择的是 BKD 数值索引 且允许尝试（!skip_try）：
     if (!i_param->skip_try && reader->type() == InvertedIndexReaderType::BKD) {
         if (runtime_state != nullptr &&
             runtime_state->query_options().inverted_index_skip_threshold > 0 &&
@@ -87,9 +101,11 @@ Status InvertedIndexIterator::read_from_index(const IndexParam& param) {
             auto query_bkd_limit_percent =
                     runtime_state->query_options().inverted_index_skip_threshold;
             size_t hit_count = 0;
+            // 先通过 try_read_from_inverted_index 预查询计算匹配的行数 hit_count。
             RETURN_IF_ERROR(try_read_from_inverted_index(reader, i_param->column_name,
                                                          i_param->query_value, i_param->query_type,
                                                          &hit_count));
+            // 若命中行数占比超过设置的阈值 inverted_index_skip_threshold（例如 80%）：说明该条件过滤效果极差（低选择性），直接返回 INVERTED_INDEX_BYPASS 放弃使用倒排索引。
             if (hit_count > i_param->num_rows * query_bkd_limit_percent / 100) {
                 return Status::Error<ErrorCode::INVERTED_INDEX_BYPASS>(
                         "hit count: {}, bkd inverted reached limit {}% , segment num "
@@ -100,11 +116,13 @@ Status InvertedIndexIterator::read_from_index(const IndexParam& param) {
     }
 
     // Note: analyzer_ctx is now passed via i_param->analyzer_ctx
+    // 第四阶段：索引执行与 Profile 监控
+    // 真正查询下推：将查询请求交由选中的 reader->query(...) 评估，结果追加存储到位图 i_param->roaring 中。
     auto execute_query = [&]() {
         return reader->query(_context, i_param->column_name, i_param->query_value,
                              i_param->query_type, i_param->roaring, i_param->analyzer_ctx);
     };
-
+    // Profile 统计采集：如果开启了 Profile（enable_profile），利用计时器 SCOPED_RAW_TIMER 记录索引耗时 exec_time，统计命中行数 hit_rows = roaring->cardinality()，并追加至全局统计指标中。
     if (runtime_state != nullptr && runtime_state->query_options().enable_profile) {
         InvertedIndexQueryStatistics query_stats;
         {

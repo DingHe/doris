@@ -49,6 +49,13 @@ namespace doris {
 // 1. If this can leverage binary page to save key and offset data
 // 2. Extending this to save in a BTree like struct, which can index full key
 //    more than short key
+// 负责 前缀索引（Short Key Index，又称短键索引/稀疏索引） 的构建、解析与二分检索的核心组件。
+// 在 Doris 的 Segment V2 物理存储格式中，数据行是按固定粒度（默认每 1024 行）切分为一个 Block 的。为了避免全表扫描，Doris 为每个 Block 的第一行数据提取前缀主键（Short Key，最大 36 字节），构建稀疏索引
+// ShortKeyIndexBuilder（构建器）：在数据 Flush 写盘时，按顺序收集各个 Block 的 Short Key，并将其序列化编码为一个独立的 Index Page（包含 Key 字节流与 VInt 偏移量数组）。
+// hortKeyIndexIterator（迭代器）：符合 C++ STL random_access_iterator_tag（随机访问迭代器）规范的适配器，使得 STL 容器算法（如 std::lower_bound）可以无缝作用于短键索引上。
+// ShortKeyIndexDecoder（解析器/查询器）：在数据读取/点查/范围查询时，反序列化 Index Page，并在短键列表中执行 $O(\log N)$ 的二分查找，快速定位目标数据所在的 Block 物理序号（Ordinal）。
+
+// 用于在 Segment 写入阶段编码生成短键索引页。
 class ShortKeyIndexBuilder {
 public:
     ShortKeyIndexBuilder(uint32_t segment_id, uint32_t num_rows_per_block)
