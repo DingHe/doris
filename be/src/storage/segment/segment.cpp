@@ -409,16 +409,21 @@ Status Segment::_open_index_file_reader() {
             _tablet_schema->get_inverted_index_storage_format(), _idx_file_info, _tablet_id);
     return Status::OK();
 }
-
+// 用于判断当前读取的列是否为 Binlog 特殊处理逻辑中的 TSO（Transaction Timestamp / 时间戳）占位符列（Placeholder Column） 的私有辅助函数。
+// 通常出现在 MoW (Merge-on-Write) Unique Key 数据模型 配合 Binlog 功能 进行增量同步或变更数据捕获 (CDC) 的数据读取链路中。
 bool Segment::is_tso_placeholder_col(int cid, const Schema& schema,
                                      const StorageReadOptions& read_options) const {
+	//  1. 判定版本范围：必须是单一版本的读取，非跨版本 Range 扫描
     if (read_options.version.first != read_options.version.second) {
         return false;
     }
+	// 2. 判定读取模式：必须明确开启了 Row Binlog 读取开关
     if (!read_options.read_row_binlog) {
         return false;
     }
     // tso_col_idx() is -1 for non-binlog schemas, so this returns false there.
+	// 3. 判定列索引：当前列物理 Index (cid) 是否正好是 Schema 定义的 TSO 索引列
+	// （如果不是 Binlog 相关的 Schema，tso_col_idx() 会返回 -1，此时比较直接成立并返回 false）
     return cid == schema.tso_col_idx();
 }
 // 该方法是 Segment 级别数据读取与过滤的总控制入口。
@@ -822,9 +827,16 @@ Status Segment::load_pk_index_and_bf(OlapReaderStatistics* index_load_stats,
     });
     return Status::OK();
 }
-
+// 主要作用是加载并解析当前 Segment 文件的排序索引（Index Page），以便后续在数据读取时可以通过二分查找（Binary Search）快速定位到数据所在的行号（Row ID）
+// 根据数据模型的不同，它支持加载两种索引：
+//主键索引（Primary Key Index）：用于 Unique Key 模型（如 Merge-on-Write 机制）。
+//前缀索引/短键索引（Short Key Index）：用于 Duplicate Key、Aggregate Key 或 Unique Key (Merge-on-Read) 模型。
 Status Segment::load_index(OlapReaderStatistics* stats, const io::IOContext* source_io_ctx) {
+    // Segment 对象可能会被上层的多个查询线程并发读取。
+    //通过 call 闭包，保证整个 Segment 的索引加载与解析逻辑只会被执行一次。第一个到达的线程去读取磁盘并解析索引，其他并发线程会被阻塞直至加载完成并共享结果。
     return _load_index_once.call([this, stats, source_io_ctx] {
+        // 分支一：主键索引加载（针对 MoW 模型的 Unique Key 表）
+        // 在 Doris 的 Unique Key 模型（尤其是写时合并 Merge-on-Write）中，使用单独的 PrimaryKeyIndex（通常包含 B-tree 或 SSTable 样式的物理主键索引）来加速点查和主键去重。
         if (_tablet_schema->keys_type() == UNIQUE_KEYS && _pk_index_meta != nullptr) {
             _pk_index_reader = std::make_unique<PrimaryKeyIndexReader>();
             RETURN_IF_ERROR(_pk_index_reader->parse_index(_file_reader, *_pk_index_meta, stats,
@@ -832,14 +844,20 @@ Status Segment::load_index(OlapReaderStatistics* stats, const io::IOContext* sou
             // _meta_mem_usage += _pk_index_reader->get_memory_size();
             return Status::OK();
         } else {
+            // 分支二：前缀索引（Short Key Index）读取准备
             // read and parse short key index page
             OlapReaderStatistics tmp_stats;
             OlapReaderStatistics* stats_ptr = stats != nullptr ? stats : &tmp_stats;
             auto page_io_ctx = create_index_io_context(source_io_ctx, stats_ptr);
+            // 配置 Page 读取选项 PageReadOptions：
             PageReadOptions opts(page_io_ctx);
+            // 允许使用 Doris 的 Storage Page Cache，如果索引页在内存缓存中，则直接读取缓存以减少磁盘 I/O。
             opts.use_page_cache = true;
+            // 指定读取的 Page 类型为索引页。
             opts.type = INDEX_PAGE;
+            // 指定物理文件的读取句柄。
             opts.file_reader = _file_reader.get();
+            // 传入短键索引页在物理 Segment 文件中的起始偏移量和大小（_sk_index_page）。
             opts.page_pointer = PagePointer(_sk_index_page);
             // short key index page uses NO_COMPRESSION for now
             opts.codec = nullptr;
@@ -847,12 +865,14 @@ Status Segment::load_index(OlapReaderStatistics* stats, const io::IOContext* sou
 
             Slice body;
             PageFooterPB footer;
+            // 从磁盘/Cache 读取并解压短键索引页
             RETURN_IF_ERROR(
                     PageIO::read_and_decompress_page(opts, &_sk_index_handle, &body, &footer));
             DCHECK_EQ(footer.type(), SHORT_KEY_PAGE);
             DCHECK(footer.has_short_key_page_footer());
 
             // _meta_mem_usage += body.get_size();
+            // 解码并构建短键索引解析器
             _sk_index_decoder = std::make_unique<ShortKeyIndexDecoder>();
             return _sk_index_decoder->parse(body, footer.short_key_page_footer());
         }
@@ -919,23 +939,33 @@ DataTypePtr Segment::get_data_type_of(const TabletColumn& column,
                                                             _column_reader_cache.get()));
     return type;
 }
-
+// 用于 延迟初始化 Segment 列元数据（Column Meta） 的核心私有方法
+// 保证在整个 Segment 的生命周期内，只对底层文件（Segment Footer）发起一次解析，安全且延迟地创建出当前 Segment 所有列的元数据结构（ColumnMetaPB）。
 Status Segment::_create_column_meta_once(OlapReaderStatistics* stats,
                                          const io::IOContext* source_io_ctx) {
+	//  1. 性能指标统计（RAII 计时器）
     SCOPED_RAW_TIMER(&stats->segment_create_column_readers_timer_ns);
+	// 2. 保证线程安全的“仅执行一次”机制
     return _create_column_meta_once_call.call([this, stats, source_io_ctx] {
+		// 3. 读取并解析 Segment 文件的 Footer（尾部元数据）
         std::shared_ptr<SegmentFooterPB> footer_pb_shared;
         RETURN_IF_ERROR(_get_segment_footer(footer_pb_shared, stats, source_io_ctx));
+		// 4. 根据 Footer 内部的数据，构造各列的 Column Meta
         return _create_column_meta(*footer_pb_shared, stats, source_io_ctx);
     });
 }
-
+// 核心职责是：在解析 Segment Footer 后，初始化列元数据访问器（ColumnMetaAccessor）、预缓存各列数据大小（用于自适应 Batch Size 预测）以及建立列读取器缓存句柄（ColumnReaderCache）。
 Status Segment::_create_column_meta(const SegmentFooterPB& footer, OlapReaderStatistics* stats,
                                     const io::IOContext* source_io_ctx) {
     // Initialize column meta accessor which internally maintains uid -> column_ordinal mapping.
+	// 构建列元数据访问工具。
+	// Doris 中 Segment 的列元数据在物理 Footer 中是按 Column Ordinal（列在 Segment 物理文件中的序号） 存储的，但上层（Schema/Tablet）通常使用 Column Unique ID (UID) 来标识列。
     _column_meta_accessor = std::make_unique<ColumnMetaAccessor>();
+	// 内部会遍历 Footer 中的所有 ColumnMetaPB，在内存建立并维护 Column Unique ID -> Column Ordinal 的映射表（例如处理嵌套列、Array/Map/Struct 等复杂类型以及 Schema Change 发生后的列物理序号映射）
     RETURN_IF_ERROR(_column_meta_accessor->init(footer, _file_reader));
-
+	// 预缓存原始列字节大小（用于自适应 Batch Size）
+	// 背景与目的：在开启 enable_adaptive_batch_size 优化时，向量化执行引擎会根据列的平均变长字段宽度（如 VARCHAR）动态调整每次 next_batch() 读取的行数，
+	// 避免因为单行数据过大（如大文本）导致内存暴涨，或者单行极小导致 Batch 太小而无法发挥 SIMD 优势。
     if (config::enable_adaptive_batch_size) {
         // Cache raw_data_bytes per column uid for adaptive batch size prediction.
         // This runs under call_once, so no thread-safety concerns.
@@ -954,9 +984,10 @@ Status Segment::_create_column_meta(const SegmentFooterPB& footer, OlapReaderSta
                          << st.to_string();
         }
     }
-
+	// 创建 ColumnReaderCache 延迟加载缓存
     _column_reader_cache = std::make_unique<ColumnReaderCache>(
             _column_meta_accessor.get(), _tablet_schema, _file_reader, _num_rows,
+			// Lambda 回调的作用：传入了一个捕获 this 的 Lambda 表达式，用于给 ColumnReaderCache 在后续真正遇到需要创建某个未加载列的 ColumnReader 时，有能力随时重新/安全地获取 SegmentFooterPB。
             [this](std::shared_ptr<SegmentFooterPB>& footer_pb, OlapReaderStatistics* stats,
                    const io::IOContext* io_ctx) {
                 return _get_segment_footer(footer_pb, stats, io_ctx);
@@ -1079,18 +1110,22 @@ Status Segment::new_column_iterator(const TabletColumn& tablet_column,
     }
     return Status::OK();
 }
-
+// Segment 类对外提供的获取特定列读取器（ColumnReader）的核心入口方法
 Status Segment::get_column_reader(int32_t col_uid, std::shared_ptr<ColumnReader>* column_reader,
                                   OlapReaderStatistics* stats, const io::IOContext* source_io_ctx,
                                   std::optional<Field> const_value) {
+	// 1. 确保列元数据（Column Meta）已初始化（仅初始化一次）
     RETURN_IF_ERROR(_create_column_meta_once(stats, source_io_ctx));
+	// 2. 统计 Timer（将本方法的执行耗时累加到系统 Profile 指标中）
     SCOPED_RAW_TIMER(&stats->segment_create_column_readers_timer_ns);
     // The column is not in this segment, return nullptr
+	// 3. 校验列是否存在于当前的 Tablet Schema 中（Schema 变更/加减列的安全性处理）
     if (!_tablet_schema->has_column_unique_id(col_uid)) {
         *column_reader = nullptr;
         return Status::Error<ErrorCode::NOT_FOUND, false>("column not found in segment, col_uid={}",
                                                           col_uid);
     }
+	// 4. 从缓存容器 (ColumnReaderCache) 中获取或延迟创建 ColumnReader
     return _column_reader_cache->get_column_reader(col_uid, column_reader, stats, source_io_ctx,
                                                    std::move(const_value));
 }

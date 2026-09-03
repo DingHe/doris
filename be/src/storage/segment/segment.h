@@ -204,19 +204,24 @@ public:
                                                       const StorageReadOptions& read_options);
 
     // If column in segment is the same type in schema, then it is safe to apply predicate.
-    // 判断是否可以安全地将谓词下推（Predicate Pushdown）到该列。特别是针对 Variant 类型，需校验磁盘上的存储类型与目标 Cast 类型是否一致，防止类型转换不一致导致的下推计算错误。
+    // 用于判断 谓词下推（Predicate Pushdown）是否可以安全应用到特定 Segment 数据列 的核心校验函数
+    // 要用于解决 Doris 动态半结构化类型（Variant / JSON 类型）在发生 Schema 演进、类型推导或自动类型转换（CAST）时，谓词下推可能导致计算结果不一致或运行时 Crash 的安全隐患。
     bool can_apply_predicate_safely(
             int cid, const Schema& schema,
             const std::map<std::string, DataTypePtr>& target_cast_type_for_variants,
             const StorageReadOptions& read_options) {
+        //  1. 获取当前列在 Tablet Schema 中的元数据
         const TabletColumn* col = schema.column(cid);
         DCHECK(col != nullptr) << "Column not found in schema for cid=" << cid;
+        // 2. 获取该列在物理存储层（Storage Level）实际的数据类型
         DataTypePtr storage_column_type = get_data_type_of(*col, read_options);
+        // 3. 过滤非 Variant 列 / 默认列逻辑
         if (storage_column_type == nullptr || col->type() != FieldType::OLAP_FIELD_TYPE_VARIANT ||
             !target_cast_type_for_variants.contains(col->name())) {
             // Default column iterator or not variant column
             return true;
         }
+        // 4. 严格校验 Variant 列的存储类型与查询预期 Castle 类型是否一致
         if (storage_column_type->equals(*target_cast_type_for_variants.at(col->name()))) {
             return true;
         } else {
