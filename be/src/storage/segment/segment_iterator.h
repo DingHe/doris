@@ -109,13 +109,22 @@ struct ColumnPredicateInfo {
     std::string query_op;
     int32_t column_id;
 };
-
+// SegmentIterator 是 Apache Doris BE（Backend）存储层 segment_v2 架构中最核心的物理数据读取迭代器（继承自 RowwiseIterator）。
+// 如果说 LazyInitSegmentIterator 负责“何时加载 Segment”，那么 SegmentIterator 则是真正直接与底层物理磁盘文件、多维索引（ZoneMap、BloomFilter、倒排索引、ANN向量索引）以及向量化执行引擎打交道的核心工作者。
+// SegmentIterator 负责将物理 Segment 文件中的列式数据转化为上层计算引擎可直接使用的向量化数据块（Block）。它的核心作用与设计亮点包括：
+// 多级索引过滤（Index Pruning）：在真正读取行数据之前，依次应用的主键索引（Short Key / Primary Key）、ZoneMap / BloomFilter 索引、倒排索引（Inverted Index）、ANN 向量索引等进行行号（RowID）级别的范围裁剪，生成最终需要读取的 Roaring Bitmap。
+// 延迟物化读取（Lazy Materialization）：为了避免读取被过滤掉的无效列数据，将列分为“谓词过滤列”和“非谓词/普通数据列”。优先只读取过滤列，在计算并剔除不符合条件的行后，仅针对筛选通过的真实 RowID 批量读取剩余列。
+// 向量化表达式与谓词评估：集成了单列 ColumnPredicate 的向量化求值、短路求值（Short-circuit Evaluation）以及复杂通用表达式（VExprContext）的过滤下推。
+// 适应性与高性能优化：支持自适应 Block 大小预测（Adaptive Block Size Predictor）、倒排索引降级机制、Variant 稀疏列缓存、虚拟列物化以及基于条件的缓存过滤（Condition Cache）。
 class SegmentIterator : public RowwiseIterator {
 public:
+	// 构造函数，绑定 Segment 句柄与 Schema，初始化基础状态。
     SegmentIterator(std::shared_ptr<Segment> segment, SchemaSPtr schema);
     ~SegmentIterator() override;
-
+	// 初始化所有物理列的 ColumnIterator 和索引 IndexIterator
     [[nodiscard]] Status init_iterators();
+	// 迭代器重型初始化总入口。
+    // 触发索引剪枝、生成 _row_bitmap、构建列计算依赖及延迟物化计划。
     [[nodiscard]] Status init(const StorageReadOptions& opts) override;
     [[nodiscard]] Status next_batch(Block* block) override;
 
@@ -344,69 +353,97 @@ private:
 
     class BitmapRangeIterator;
     class BackwardBitmapRangeIterator;
-
+    // 当前迭代器绑定的物理 Segment 实例指针，用于访问该 Segment 的 Footer、列 Header 等元数据
     std::shared_ptr<Segment> _segment;
     // read schema from scanner
+    // 上层 Scanner 要求的读取 Schema，决定输出 Block 的列定义与顺序。
     SchemaSPtr _schema;
     // storage type schema related to _schema, since column in segment may be different with type in _schema
+    // 存储层列名与类型映射对，解决 Segment 内物理类型与 Schema 类型可能不一致的问题。
     std::vector<IndexFieldNameAndTypePair> _storage_name_and_type;
     // vector idx -> column iterarator
+    // 列迭代器数组。下标对应 Schema 内部 Column ID，每个元素负责特定列（Data Page）的解压、 Seek 和读块。
     std::vector<std::unique_ptr<ColumnIterator>> _column_iterators;
+    // 倒排/二级索引迭代器数组，用于执行基于索引的谓词查询。
     std::vector<std::unique_ptr<IndexIterator>> _index_iterators;
     // after init(), `_row_bitmap` contains all rowid to scan
+    // 核心行号位图。初始化时默认包含 Segment 的所有 RowID，经过各种索引剪枝后，仅保留符合条件待读取的 RowID。
     roaring::Roaring _row_bitmap;
     // an iterator for `_row_bitmap` that can be used to extract row range to scan
+    // _row_bitmap 的范围迭代器，用于逐段提取连续的 RowID 区间（Ranges）传给列迭代器批量 Seek。
     std::unique_ptr<BitmapRangeIterator> _range_iter;
     // the next rowid to read
+    // 当前扫描到的 Segment 内物理行号指针。
     rowid_t _cur_rowid;
     // members related to lazy materialization read
     // --------------------------------------------
     // whether lazy materialization read should be used.
+    // 是否开启延迟物化读取（当查询包含过滤谓词且选择率较低时自动开启）。
     bool _lazy_materialization_read;
     // columns to read after predicate evaluation and remaining expr execute
+    // 在谓词评估完成后，才对留存行进行补读的普通数据列集合。
     std::vector<ColumnId> _non_predicate_columns;
+    // 复杂通用表达式（Common Expr）所依赖的列集合。
     std::set<ColumnId> _common_expr_columns;
     // remember the rowids we've read for the current row block.
     // could be a local variable of next_batch(), kept here to reuse vector memory
+    // 记录当前 Block 中读出的所有行对应的物理 RowID 数组（用于延迟物化第二阶段补读数据列）。
     std::vector<rowid_t> _block_rowids;
+    // 标记本次读取是否需要触发向量化求值、短路求值或通用表达式求值。
     bool _is_need_vec_eval = false;
     bool _is_need_short_eval = false;
     bool _is_need_expr_eval = false;
-
+    // 支持延迟裁剪读取的复杂/嵌套列集合。
     std::set<ColumnId> _support_lazy_read_pruned_columns;
+    // 是否开启嵌套结构列（如 Array/Map/Struct）的子列裁剪。
     bool _enable_prune_nested_column = false;
 
     // fields for vectorization execution
+    // 执行批量向量化谓词评估的列 Column ID。
     std::vector<ColumnId>
             _vec_pred_column_ids; // keep columnId of columns for vectorized predicate evaluation
+    // 执行短路求值（高选择性/低成本）谓词的列 Column ID。
     std::vector<ColumnId>
             _short_cir_pred_column_ids; // keep columnId of columns for short circuit predicate evaluation
+    // 标记特定 Column ID 是否属于谓词列。
     std::vector<bool> _is_pred_column; // columns hold _init segmentIter
+    // 记录物理列在当前查询中是否真正需要读磁盘数据（还是仅需补默认值/常量）。
     std::map<uint32_t, bool> _need_read_data_indices;
+    // 标记特定列是否参与通用表达式计算。
     std::vector<bool> _is_common_expr_column;
+    // 暂存当前 Batch 读出的列数据缓冲区。
     MutableColumns _current_return_columns;
+    // 需进行向量化预评估的列谓词集合。
     std::vector<std::shared_ptr<ColumnPredicate>> _pre_eval_block_predicate;
+    // 需进行短路求值评估的列谓词集合。
     std::vector<std::shared_ptr<ColumnPredicate>> _short_cir_eval_predicate;
+    // 存储针对累积删除条件（Delete Sign/Predicate）涉及的范围和 BloomFilter 索引列 ID。
     std::vector<uint32_t> _delete_range_column_ids;
     std::vector<uint32_t> _delete_bloom_filter_column_ids;
     // when lazy materialization is enabled, segmentIter need to read data at least twice
     // first, read predicate columns by various index
     // second, read non-predicate columns
     // so we need a field to stand for columns first time to read
+    // 需要首先读取以评估过滤条件的 Column ID 集合。
     std::vector<ColumnId> _predicate_column_ids;
+    // 复杂表达式依赖列的数组形式。
     std::vector<ColumnId> _common_expr_column_ids;
     // Block slot indexes to filter after common expr evaluation. This is not
     // tablet column ids because Block::filter_block_internal filters by block
     // position.
+    // 经过通用表达式求值后，最终需要实施逻辑过滤（Filter Block）的 Block 位置槽位（Slot Indexes）。
     std::vector<ColumnId> _columns_to_filter;
+    // 记录哪些列已经完成了字典码/类型转换。
     std::vector<bool> _converted_column_ids;
 
     // the actual init process is delayed to the first call to next_batch()
+    // 标记 SegmentIterator 内部是否已完成延迟初始化及物理初始化。
     bool _lazy_inited;
     bool _inited;
-
+    // 上层下推的查询配置，包含谓词、RuntimeFilter、KeyRange、Cache 配置等。
     StorageReadOptions _opts;
     // Adaptive batch size predictor; null when the feature is disabled.
+    // 自适应 Block 大小预测器，动态预测单次批读取的数据量大小，平衡 Cache 局部性与内存占用。
     std::unique_ptr<AdaptiveBlockSizePredictor> _block_size_predictor;
     // Build the AdaptiveBlockSizePredictor for this segment based on segment footer
     // metadata for the projected output columns. Returns nullptr if the feature is
@@ -414,43 +451,57 @@ private:
     std::unique_ptr<AdaptiveBlockSizePredictor> _make_block_size_predictor() const;
     // Snapshot of _opts.block_row_max at init time; used as the hard upper bound so that
     // dynamic adjustments never exceed the capacity of pre-allocated buffers.
+    // 初始化时设定的单次 Batch 最大行数上限。
     uint32_t _initial_block_row_max = 0;
     // make a copy of `_opts.column_predicates` in order to make local changes
+    // 局部下推的列谓词副本。
     std::vector<std::shared_ptr<ColumnPredicate>> _col_predicates;
+    // 下推到存储层执行的完整通用表达式上下文数组。
     VExprContextSPtrs _common_expr_ctxs_push_down;
+    // 显式禁止使用倒排/二级索引裁剪的谓词列集合。
     std::set<ColumnId> _not_apply_index_pred;
 
     // row schema of the key to seek
     // only used in `_get_row_ranges_by_keys`
+    // 用于主键/短主键 Seek 查找的 Key Schema。
     std::unique_ptr<Schema> _seek_schema;
     // used to binary search the rowid for a given key
     // only used in `_get_row_ranges_by_keys`
+    // 用于存放主键二分查找时 Seek 数据的临时数据块。
     MutableColumns _seek_block;
-
+    // 底层文件的读取句柄。
     io::FileReaderSPtr _file_reader;
 
     // used for compaction, record selectd rowids of current batch
+    // 当前 Batch 过滤后最终保留的行数
     uint16_t _selected_size;
+    // 当前 Batch 筛选保留的行在 Block 内部的索引下标选择器数组（Selector Array）。
     std::vector<uint16_t> _sel_rowid_idx;
 
     // Rows already produced by this iterator. Used together with
     // _opts.read_limit to compute the remaining per-batch budget.
+    // 当前 Iterator 已向上层返回的总行数（结合 _opts.read_limit 评估 LIMIT 提前熔断）。
     size_t _rows_returned = 0;
-
+    // 存放当前 Iterator 生命周期内临时对象的内存池。
     std::unique_ptr<ObjectPool> _pool;
 
     // used to collect filter information.
+    // 收集谓词过滤信息的容器。
     std::vector<std::shared_ptr<ColumnPredicate>> _filter_info_id;
+    // 是否需要记录并导出当前 Block 对应的 RowLocation（主键模型更新或 Compaction 使用）。
     bool _record_rowids = false;
+    // 当前数据所在的 Tablet ID。
     int64_t _tablet_id = 0;
+    // 标记最终写出到 Block 的列 ID 集合
     std::set<int32_t> _output_columns;
-
+    // 谓词评估过程中产生的临时布尔过滤数组（Filter Selection Flag Array）。
     std::vector<uint8_t> _ret_flags;
 
     /*
     * column and column_predicates on it.
     * a boolean value to indicate whether the column has been read by the index.
     */
+	// 记录指定 Column ID 上挂接的 ColumnPredicate 是否已由倒排/二级索引执行完毕，避免重复评估。
     std::unordered_map<ColumnId, std::unordered_map<std::shared_ptr<ColumnPredicate>, bool>>
             _column_predicate_index_exec_status;
 
@@ -458,6 +509,7 @@ private:
     * column and common expr on it.
     * a boolean value to indicate whether the column has been read by the index.
     */
+	// 记录复杂表达式在对应列上是否已经利用倒排索引完成裁剪。
     std::unordered_map<ColumnId, std::unordered_map<const VExpr*, bool>>
             _common_expr_index_exec_status;
 
@@ -465,21 +517,22 @@ private:
     * common expr context to slotref map
     * slot ref map is used to get slot ref expr by using column id.
     */
+	// 通用表达式上下文与其引用的列 SlotRef 之间的映射表。
     std::unordered_map<VExprContext*, std::unordered_map<ColumnId, VExpr*>>
             _common_expr_to_slotref_map;
-
+	// 向量相似度或相关性打分运行时状态。
     ScoreRuntimeSPtr _score_runtime;
-
+	// ANN 向量 TopN 索引查询运行时对象。
     std::shared_ptr<segment_v2::AnnTopNRuntime> _ann_topn_runtime;
-
+	// 存储虚拟列（如 Variant 动态扩展列或函数生成的虚列）的计算表达式。
     // cid to virtual column expr
     std::map<ColumnId, VExprContextSPtr> _virtual_column_exprs;
-
+	// 倒排索引查询全生命周期的上下文与缓存句柄。
     IndexQueryContextPtr _index_query_context;
-
+	// 针对 JSON / Variant 类型中稀疏路径列（Sparse Columns）的二进制缓存。
     // key is column uid, value is the sparse column cache
     std::unordered_map<int32_t, PathToBinaryColumnCacheUPtr> _variant_sparse_column_cache;
-
+	// 条件结果缓存状态与位图，避免重复求值相同的过滤条件。
     bool _find_condition_cache = false;
     std::shared_ptr<std::vector<bool>> _condition_cache;
     static constexpr int CONDITION_CACHE_OFFSET = 2048;

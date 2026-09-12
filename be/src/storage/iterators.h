@@ -228,6 +228,10 @@ struct CompactionSampleInfo {
     int64_t null_count = 0; // Number of NULL cells in this column group
 };
 
+// 用于将一个数据块 Block 与该数据块对应的连续行等值标记数组（same_bit）绑定在一起。
+// 相交/连续相等标记的绑定（Same Bit Tracking）：在聚合（Aggregation）、排序去重（Distinct）、窗口函数（Window Functions）或 Join 算子的计算过程中，往往需要判断当前行与前一行（或组内前一行）是否相等。
+// same_bit 数组（即 std::vector<bool>）中的第 $i$ 个元素为 true 时，通常代表 block 中的第 $i$ 行与第 $i-1$ 行在指定的 Key 上是连续相等的。
+// 轻量包装与视图（Zero-Copy View）：该结构体不持有 Block 和 same_bit 的所有权，仅分别保存指针与引用（引用传参/非拷贝），因此对象的创建与销毁极其轻量（无内存分配开销），常用于在算子的处理函数间传递带有“分组/等值状态”的数据块视图。
 struct BlockWithSameBit {
     Block* block;
     std::vector<bool>& same_bit;
@@ -237,6 +241,17 @@ struct BlockWithSameBit {
 
 class RowwiseIterator;
 using RowwiseIteratorUPtr = std::unique_ptr<RowwiseIterator>;
+// RowwiseIterator 是存储层最为核心、底层的数据迭代器抽象基类（Abstract Base Class）。
+// RowwiseIterator 是 Doris 存储引擎中按行/按批次吐数据（Row-wise / Batch-wise Emitting）的最高层接口抽象。
+// 虽然 Doris 物理存储是列存（Columnar Storage），但是在数据扫描、过滤、归并和向执行引擎交付数据时，需要将列存数据转换为逻辑上的“行”或“Block”粒度进行流式迭代处理。RowwiseIterator 充当了所有底层扫描迭代器的统一规范，其核心作用包括：
+// 统一存储层数据流抽象：
+// 不论数据来自于单文件（SegmentIterator）、多文件排序归并（VMergeIterator）、多文件并集拼接（VUnionIterator），还是内存中的 Delta 行集，上层组件（如 BetaRowsetReader 或 TabletReader）都只需通过 RowwiseIterator 接口消费数据。
+// 多形态数据批次提取：
+// 向上层暴露向量化 Block、BlockView、BlockWithSameBit 以及单行引用 IteratorRowRef 的拉取接口，支持批量读取与逐行（Row-by-Row）读取的切换。
+// 复合迭代器树形嵌套构筑：
+// 采用组合模式（Composite Pattern）。高级迭代器（如 VMergeIterator）内部可以嵌套多个子 RowwiseIterator，从而构建起复杂的“Segment 扫描 -> 多路归并/拼接 -> 行级过滤 -> 批量输出”的数据处理管道（Pipeline）。
+// 状态追踪与物理定位：
+// 承载数据 Schema 契约、Segment/Data ID 标识（用于排序 Tie-Breaker 决胜）、物理 RowLocation 定位以及合并行数/Profile 统计等能力。
 class RowwiseIterator {
 public:
     RowwiseIterator() = default;
@@ -247,11 +262,12 @@ public:
     // Input options may contain scan range in which this scan.
     // Return Status::OK() if init successfully,
     // Return other error otherwise
+    // 根据传入的存储读取选项 opts（包含 PageCache 设置、IO 上下文、倒排索引、行号范围 RowRanges 等）初始化当前迭代器，使其做好读取准备。
     virtual Status init(const StorageReadOptions& opts) {
         return Status::InternalError("to be implemented, current class: " +
                                      demangle(typeid(*this).name()));
     }
-
+    // 专门用于 Compaction 采样 或数据抽样场景。除了传入 StorageReadOptions 外，还传入 CompactionSampleInfo 指针用于收集和记录压缩过程中的采样元数据。
     virtual Status init(const StorageReadOptions& opts, CompactionSampleInfo* sample_info) {
         return Status::InternalError("should not reach here, current class: " +
                                      demangle(typeid(*this).name()));
@@ -261,32 +277,35 @@ public:
     // into input batch with Status::OK() returned
     // If there is no data to read, will return Status::EndOfFile.
     // If other error happens, other error code will be returned.
+    // 向量化引擎最核心的数据提取接口。从底层存储加载下一批数据并填充到向量化列存块 Block 中：
     virtual Status next_batch(Block* block) {
         return Status::InternalError("should not reach here, current class: " +
                                      demangle(typeid(*this).name()));
     }
-
+    // 重载接口。提取下一批数据并填充到带有相同位标记的数据块 BlockWithSameBit 中。通常用于在特定谓词过滤或合并计算时，利用 Bit 标志优化相同值行的处理逻辑。
     virtual Status next_batch(BlockWithSameBit* block_with_same_bit) {
         return Status::InternalError("should not reach here, current class: " +
                                      demangle(typeid(*this).name()));
     }
-
+    // 重载接口。提取下一批数据并填充到 BlockView 视图结构中，提供轻量级、不发生真实数据深拷贝的数据访问视图。
     virtual Status next_batch(BlockView* block_view) {
         return Status::InternalError("should not reach here, current class: " +
                                      demangle(typeid(*this).name()));
     }
-
+    // 单行提取接口。将下一行数据的引用/指针填充到 IteratorRowRef 结构中。常用于排序归并迭代器（如 VMergeIterator）内部的优先队列（堆）比较，以决定哪一行的 Key 较小从而先输出。
     virtual Status next_row(IteratorRowRef* ref) {
         return Status::InternalError("should not reach here, current class: " +
                                      demangle(typeid(*this).name()));
     }
+    // 专用于 Unique Key 模型 的单行提取接口。在 Unique Key 表合并不同版本的数据时，处理多版本 Key 的覆盖逻辑并填充单行引用。
     virtual Status unique_key_next_row(IteratorRowRef* ref) {
         return Status::InternalError("should not reach here, current class: " +
                                      demangle(typeid(*this).name()));
     }
-
+    // 标识当前迭代器本身是否为一个“归并排序迭代器”（如 VMergeIterator）。
     virtual bool is_merge_iterator() const { return false; }
-
+    // 获取上一次 next_batch 提取出来的这一批次 Block 中，每一行数据对应的物理磁盘位置 RowLocation（包含 Segment ID 和 Row ID）。
+	// 主要用于点查更新、Unique Key 模式下 Merge-on-Write 查找/标记 DeleteBitmap 以及物理行定位。
     virtual Status current_block_row_locations(std::vector<RowLocation>* block_row_locations) {
         return Status::InternalError("should not reach here, current class: " +
                                      demangle(typeid(*this).name()));
@@ -297,13 +316,17 @@ public:
 
     // Return the data id such as segment id, used for keep the insert order when do
     // merge sort in priority queue
+    // 返回当前迭代器的数据源唯一标识 ID（通常是 Segment ID 或 Rowset ID 的映射）。
+    // 当在多路归并排序（Merge Sort）的优先队列中遇到两个行的 Key 完全相同时，使用 data_id() 作为平局决胜器（Tie-Breaker），优先输出写入顺序更靠前（data_id 较小）或更靠后的数据。
     virtual uint64_t data_id() const { return 0; }
-
+    // 将当前迭代器（及其子迭代器）内部收集到的执行耗时、磁盘 IO 统计、解压耗时、PageCache 命中率等指标，更新/附加到上层查询的 RuntimeProfile 对象中。
     virtual void update_profile(RuntimeProfile* profile) {}
     // return rows merged count by iterator
+    // 返回在当前迭代器读取迭代过程中，因为 Key 聚合（Aggregate Model）或版本覆盖（Unique/Sequence Model）而被剔除/合并掉的行数总和。
     virtual uint64_t merged_rows() const { return 0; }
 
     // return if it's an empty iterator
+    // 判断当前迭代器是否为空迭代器（即内部没有任何符合条件的数据，例如经过 ZoneMap / 倒排索引裁减后发现 0 行命中）。
     virtual bool empty() const { return false; }
 };
 

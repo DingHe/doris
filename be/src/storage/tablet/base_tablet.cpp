@@ -204,10 +204,19 @@ uint32_t BaseTablet::get_real_compaction_score_unlocked() const {
         return score + it.second->get_compaction_score();
     });
 }
-
+// 在 OLAP 引擎的读取路径（Read Path）中，一个 Tablet 内部由多个不同版本的 Rowset（数据变更集）组成。
+// 当执行 SQL 查询或 Compaction 时，必须根据查询的版本范围（Version）抓取所有有效且符合一致性视图的 Rowset，并把它们转换为物理迭代器 RowsetReader。
+// capture_rs_readers() 的职责正是：基于给定的 Version 范围，从 Tablet 内部锁保护的 Rowset 集合中，准确捕获并构建出一组对应的 RowsetReader。
+// Apache Doris / StarRocks 存储引擎在执行查询或数据合并（Compaction）时，构建数据读取通道的核心底层函数。
+// 接收由版本路径选择算法（Version Path Matrix）算出的 version_path，在无锁或上层已加锁的前提下，将对应的版本转换为物理读取器 RowsetReader 并打包到 rs_splits 中。
+// MVCC 读写不互斥：通过 _stale_rs_version_map 机制，保证正在执行的 Read 事务不会因为并发的 Compaction 写操作而断开连接或读到脏数据。
 Status BaseTablet::capture_rs_readers_unlocked(const Versions& version_path,
                                                std::vector<RowSetSplits>* rs_splits) const {
     DCHECK(rs_splits != nullptr && rs_splits->empty());
+    // 版本降级查找机制（Active Map -> Stale Map）
+    // _rs_version_map（活跃集合）：存储当前 Tablet 最新、最直接的 Rowset 集合。
+    // _stale_rs_version_map（旧版本/过期集合）：当发生 Compaction（如合并了版本 [2-2] 和 [3-3] 为 [2-3]）时，旧的 [2-2] 和 [3-3] 的 Rowset 不会立刻被物理删除，而是会被移动到 _stale_rs_version_map 中保留一段时间（等待未完成的长查询结束）。
+    // 容错与一致性：如果一个查询在发起时锁定的 Version Path 包含了刚被 Compaction 替代掉的旧 Rowset，代码会自动降级去 _stale_rs_version_map 中继续查找。只有当两边都找不到该 Version 时，才宣告版本断层，抛出 CAPTURE_ROWSET_READER_ERROR。
     for (auto version : version_path) {
         auto it = _rs_version_map.find(version);
         if (it == _rs_version_map.end()) {
@@ -222,7 +231,9 @@ Status BaseTablet::capture_rs_readers_unlocked(const Versions& version_path,
                         tablet_id(), version.first, version.second);
             }
         }
+        // 读取器创建与所有权转移（Reader Instantiation）
         RowsetReaderSharedPtr rs_reader;
+        // 实例化特定存储类型（如 Alpha Rowset 或 Beta Rowset）的 RowsetReader，负责打开底层 Segment 文件并初始化数据解码上下文。
         auto res = it->second->create_reader(&rs_reader);
         if (!res.ok()) {
             return Status::Error<CAPTURE_ROWSET_READER_ERROR>(

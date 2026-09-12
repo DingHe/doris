@@ -102,26 +102,41 @@ Status VStatisticsIterator::next_batch(Block* block) {
 //     so delete predicate columns (whose loc exceeds block->columns()) are simply skipped.
 //   - Delete predicate evaluation happens entirely through _current_return_columns and
 //     _evaluate_short_circuit_predicate(), which are independent of the block structure.
+// 主要职责是：根据上层查询请求的 _output_schema（输出 Schema），为 block 分配并初始化各个列（Column），或者在跨 Block 预读时复用现有内存并清空数据。
+// 传入一个指向 Block 对象的智能指针引用。这个 block 就是当前 Context 用来存放从物理迭代器（如 SegmentIterator）读出数据的内存缓冲区。
 Status VMergeIteratorContext::block_reset(const std::shared_ptr<Block>& block) {
+    // 当 block 刚被创建、内部没有任何列结构（列数为 0）时，进入此分支进行列结构的首次构建：
     if (!block->columns()) {
+        // 获取 _output_schema 中定义的列 ID 列表。这里关键的设计在于只遍历 _output_schema 中需要的列（即上层查询要求的 return_columns），而自动忽略了存储层内部用于过滤的 Delete Predicate（删除谓词）列
         const auto& column_ids = _output_schema->column_ids();
         for (size_t i = 0; i < _output_schema->num_column_ids(); ++i) {
+            // 类型推导与校验：根据列描述符获取该列的数据类型指针（DataTypePtr），若类型为空则返回错误状态。
             auto column_desc = _output_schema->column(column_ids[i]);
             auto data_type = Schema::get_data_type_ptr(*column_desc);
             if (data_type == nullptr) {
                 return Status::RuntimeError("invalid data type");
             }
+            // 调用 create_column() 创建对应类型的空数据列（如 ColumnInt32、ColumnString 等）。
             auto column = data_type->create_column();
+            // 预留内存空间（reserve(_block_row_max)）：按 _block_row_max（通常为 4064 行）提前预分配底层内存容量，大幅减少后续插入数据时的动态扩容（realloc）开销。
             column->reserve(_block_row_max);
+            // 将组合好的列（包含列数据、类型、列名）插入到 block 容器中。
             block->insert(ColumnWithTypeAndName(std::move(column), data_type, column_desc->name()));
         }
     } else {
+    // 分支二：复用 Block 结构并清空数据 (else)
         block->clear_column_data();
     }
     return Status::OK();
 }
 
+// 最核心的多维排序与去重裁决函数
+// 它在 VMergeIterator 的优先队列（最小/最大堆）比较器中被调用。
+// 其核心作用是：比较当前 Context 与另一个 Context (rhs) 各自指针指向的数据行，确定哪一行具有更高的优先级（先输出），并在 Unique Key 模型下进行版本覆盖标记（设置 _skip 和 _same）。
+// 返回 true 表示 this（当前 Context）的优先级低于 rhs（应该后弹出/后输出）；返回 false 表示 this 的优先级高于或等于 rhs（先弹出/先输出）。注意：在 C++ std::priority_queue（大顶堆）中，比较仿函数返回 true 代表排在后面。
 bool VMergeIteratorContext::compare(const VMergeIteratorContext& rhs) const {
+    // 自定义列比较 (_compare_columns)：如果指定了 _compare_columns（通过 UNLIKELY 优化），按数组指定的列索引顺序比较 _block 中 _index_in_block 行与 rhs._block 中 rhs._index_in_block 行。
+    // 默认比较 Schema 中的前 _num_key_columns 列。
     int cmp_res = UNLIKELY(_compare_columns)
                           ? _block->compare_at(_index_in_block, rhs._index_in_block,
                                                _compare_columns, *rhs._block, -1)
@@ -131,7 +146,9 @@ bool VMergeIteratorContext::compare(const VMergeIteratorContext& rhs) const {
     if (cmp_res != 0) {
         return UNLIKELY(_is_reverse) ? cmp_res < 0 : cmp_res > 0;
     }
-
+    // 阶段二：Sequence 列比较与 Tie-breaker 打平决策
+    // 当 Key 完全相同（cmp_res == 0）时，进入此阶段：
+    // 比较 Sequence 列：如果指定了 Sequence 列（如 updated_time），比较两行在该列的值。col_cmp_res > 0 表示 this 的 Sequence 值更大。
     auto col_cmp_res = 0;
     if (_sequence_id_idx != -1) {
         col_cmp_res = _block->compare_column_at(_index_in_block, rhs._index_in_block,
@@ -140,10 +157,15 @@ bool VMergeIteratorContext::compare(const VMergeIteratorContext& rhs) const {
     // When the sequence column is equal too, fall back to data_id ordering.
     // Otherwise pick the sort direction by `_small_seq_first`:
     //   false => larger value sorts first; true => smaller value sorts first.
+    // 平局打平逻辑（三元表达式解析）：
+    // 当 Sequence 值也相同（col_cmp_res == 0，或者没有 Sequence 列）：
+    // 依赖 Data ID 打平：比较 data_id()（代表 Segment / Rowset 的物理写入/导入先后顺序）。
     auto result = col_cmp_res == 0 ? (_use_insert_order_when_same ? (data_id() > rhs.data_id())
                                                                   : (data_id() < rhs.data_id()))
+    // 当 Sequence 值不相同（col_cmp_res != 0）：
+    // _small_seq_first == false（默认模式，用于 Unique Key 表）：Sequence 值大的代表最新版本，优先级更高。如果 col_cmp_res < 0（即 this 的 Sequence 小于 rhs），result 为 true（this 优先级低）。
                                    : (_small_seq_first ? (col_cmp_res > 0) : (col_cmp_res < 0));
-
+    // 阶段三：Unique 去重标记与状态设置（副作用机制）
     if (_is_unique) {
         result ? set_skip(true) : rhs.set_skip(true);
     }
@@ -370,14 +392,17 @@ Status VMergeIteratorContext::advance() {
     } while (_valid);
     return Status::OK();
 }
-
+// 当当前 Block 的数据被消费完毕后，该方法负责从底层的物理迭代器 _iter 读取下一个非空 Block。它的设计精髓在于实现了 Block 内存对象的池化复用（Memory Reuse）与生命周期安全管理（Block View 兼容）。
 Status VMergeIteratorContext::_load_next_block() {
     do {
+        // 废弃旧 Block：将当前刚消费完数据的 _block 转移并推入 _block_list 链表中保存。
         if (_block != nullptr) {
             _block_list.push_back(_block);
             _block = nullptr;
         }
+        // 寻找可安全的复用 Block（引用计数检查）：
         for (auto it = _block_list.begin(); it != _block_list.end(); it++) {
+            // 如果 it->use_count() == 1，说明上层（如 BlockView）已经不再持有这个 Block 的任何数据指针（只剩下 _block_list 自身这一个引用）。
             if (it->use_count() == 1) {
                 RETURN_IF_ERROR(block_reset(*it));
                 _block = *it;
@@ -385,10 +410,12 @@ Status VMergeIteratorContext::_load_next_block() {
                 break;
             }
         }
+        // 如果 _block_list 中的 Block 都在被上层引用（use_count > 1），或者链表为空，则创建新的 Block 结构并调用 block_reset(_block) 分配列结构。
         if (_block == nullptr) {
             _block = std::make_shared<Block>();
             RETURN_IF_ERROR(block_reset(_block));
         }
+        // 调用物理迭代器：驱动底层的 _iter（如 SegmentIterator）向 _block 中填充数据 Batch。
         Status st = _iter->next_batch(_block.get());
         if (!st.ok()) {
             _valid = false;
@@ -510,6 +537,15 @@ Status VUnionIterator::current_block_row_locations(std::vector<RowLocation>* loc
     return _cur_iter->current_block_row_locations(locations);
 }
 
+// 工厂函数（Factory Function），用于创建并返回一个包装在 std::unique_ptr 中的向量化归并迭代器 VMergeIterator
+// 核心作用是将传入的多个底层 Segment 迭代器（inputs）组合成一个统一的迭代器，在读取数据时按 Key 序进行多路归并（Multi-way Merge Sort），同时处理版本覆盖、Sequence 列对比和去重逻辑。
+// inputs 底层待归并的所有 Segment 迭代器右值引用（所有权转移）。
+// sequence_id_idx  Sequence 列在 Schema 中的列索引。在 Unique Key 模型中用于按序列号（如 updated_time）判定同一 Key 的最新记录。
+// is_unique 是否为 Unique Key 数据模型。如果是 true，归并过程中相同的 Key 只会保留最新版本/最大 Sequence 的一行（即 Merge-on-Read 模式下的去重）。
+// is_reverse 是否进行逆序（降序）归并（例如为了支持倒序 TopN 或特定方向的索引扫描）。
+// merged_rows 输出统计指针，记录归并过程中因为版本覆盖/去重而被合并/丢弃的数据行数（用于 Profile 统计）。
+// output_schema 归并后输出 Block 的列结构（Schema）。
+// small_seq_first 当相同 Key 出现相同的 Sequence ID 时，控制是否“小序列优先”（通常用于特定场景的数据替换规则）。
 RowwiseIteratorUPtr new_merge_iterator(std::vector<RowwiseIteratorUPtr>&& inputs,
                                        int sequence_id_idx, bool is_unique, bool is_reverse,
                                        uint64_t* merged_rows, SchemaSPtr output_schema,
@@ -517,6 +553,10 @@ RowwiseIteratorUPtr new_merge_iterator(std::vector<RowwiseIteratorUPtr>&& inputs
     // when the size of inputs is 1, we also need to use VMergeIterator, because the
     // next_block_view function only be implemented in VMergeIterator. The reason why
     // the size of inputs is 1 is that the segment was filtered out by zone map or others.
+    // 现象：按常理，如果 inputs.size() == 1（只有一个 Segment），单路数据天然有序，直接返回原 Iterator（或走 UnionIterator）性能最好。但这里即使只有 1 个 input，依然强制创建了 VMergeIterator。
+    // 接口能力差异（next_block_view）：上层向量化读取逻辑（如垂直合并 Vertical Merge 或特定的 Batch 组装算子）依赖 VMergeIterator 独有的 next_block_view(...) 接口，而普通的 SegmentIterator 没有实现该接口。
+    // 索引过滤导致的边界情况：一个 Rowset 原本可能包含多个 Segment，但由于 ZoneMap、BloomFilter 或 Bitmap 索引过滤，其他 Segment 被剪枝（裁剪）掉，最终只剩下 1 个 Segment（甚至经过过滤后为空）。为了向上层对外暴露统一且一致的迭代器行为与接口，引擎选择统一封装为 VMergeIterator。
+
     return std::make_unique<VMergeIterator>(std::move(inputs), sequence_id_idx, is_unique,
                                             is_reverse, merged_rows, std::move(output_schema),
                                             small_seq_first);

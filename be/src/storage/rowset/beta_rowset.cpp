@@ -106,12 +106,16 @@ Status check_segment_rows_consistency(const std::vector<uint32_t>& rows_from_met
 }
 } // namespace
 
+// BetaRowset::get_segment_num_rows 是 Apache Doris 中 BetaRowset（即 Segment v2 存储格式的 Rowset）获取当前 Rowset 下各个 Segment 文件数据行数 的核心逻辑函数。
+// 设计非常典型，体现了 “优先从元数据读取（Fast Path） + 数据一致性校验（Consistency Check） + 回退从 Segment Footer 解析（Fallback Path） + 一次性并发初始化（std::call_once 机制）” 的高并发高性能设计模式。
 Status BetaRowset::get_segment_num_rows(std::vector<uint32_t>* segment_rows,
                                         bool enable_segment_cache, OlapReaderStatistics* read_stats,
                                         const io::IOContext* io_ctx) {
+    // 状态断言与一次性初始化锁
 #ifndef BE_TEST
     // `ROWSET_UNLOADING` is state for closed() called but owned by some readers.
     // So here `ROWSET_UNLOADING` is allowed.
+
     DCHECK_NE(_rowset_state_machine.rowset_state(), ROWSET_UNLOADED);
 #endif
     RETURN_IF_ERROR(_load_segment_rows_once.call([this, enable_segment_cache, read_stats, io_ctx] {
@@ -119,7 +123,9 @@ Status BetaRowset::get_segment_num_rows(std::vector<uint32_t>* segment_rows,
         if (segment_count == 0) {
             return Status::OK();
         }
-
+        // 路径 A：优先从 Rowset Meta 获取（Fast Path）
+        // Doris 在写入或导入数据完成（Commit/Publish 阶段）时，会将每个 Segment 的行数直接记录在存储层元数据 RowsetMeta（Protocol Buffer 结构）中。
+        // 优势：直接内存拷贝，避免触发磁盘/远程存储 IO，性能极高。
         if (!_rowset_meta->get_num_segment_rows().empty()) {
             if (_rowset_meta->get_num_segment_rows().size() == segment_count) {
                 // use segment rows in rowset meta if eligible
@@ -289,7 +295,8 @@ Status BetaRowset::load_segment(int64_t seg_id, OlapReaderStatistics* stats,
     }
     return Status::OK();
 }
-
+// result 是一个指向 RowsetReaderSharedPtr（即 std::shared_ptr<RowsetReader>）的指针
+//
 Status BetaRowset::create_reader(RowsetReaderSharedPtr* result) {
     // NOTE: We use std::static_pointer_cast for performance
     result->reset(new BetaRowsetReader(std::static_pointer_cast<BetaRowset>(shared_from_this())));

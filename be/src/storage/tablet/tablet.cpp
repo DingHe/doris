@@ -486,24 +486,35 @@ Status Tablet::revise_tablet_meta(const std::vector<RowsetSharedPtr>& to_add,
     LOG(INFO) << "finish to revise tablet. tablet_id=" << tablet_id();
     return Status::OK();
 }
-
+// Apache Doris / StarRocks 存储引擎在导入数据提交（Commit Stage）或合并数据（Compaction Finish）时，将新生成的 Rowset 持久化并注册到内存 Tablet 结构中的核心写入入口。
+// 通过加写锁（_meta_lock）保证互斥，它完成了元数据校验、内存映射更新、过期重叠 Rowset 替换（Compaction 清理）等一系列原子操作。
+// Tablet::add_rowset 是存储层保证 MVCC 视图演进与写入事务提交（Commit Transaction） 的核心代码：
+// 强一致性：通过唯一 ID 判重与 Version 重叠检查，确保写入数据不重不漏。
+// 平滑版本替换：将 Compaction 生成的大版本加入后，自动剔除被其包含的小版本，并将其推入 Stale 机制，使得读写互不阻塞。
 Status Tablet::add_rowset(RowsetSharedPtr rowset) {
     DCHECK(rowset != nullptr);
+    // 写锁保护：加写锁 _meta_lock 确保并发导入或 Compaction 线程安全地修改内存中的版本链和元数据。
     std::lock_guard wrlock(_meta_lock);
     SCOPED_SIMPLE_TRACE_IF_TIMEOUT(TRACE_TABLET_LOCK_THRESHOLD);
     // If the rowset already exist, just return directly.  The rowset_id is an unique-id,
     // we can use it to check this situation.
+    // 幂等处理（Idempotency）：Rowset ID 是全局唯一的 GUID。如果在高并发或 RPC 重试场景下提交了重复的 Rowset，直接安全返回 Status::OK()，防止重复插入引发数据异常。
     if (_contains_rowset(rowset->rowset_id())) {
         return Status::OK();
     }
     // Otherwise, the version should be not contained in any existing rowset.
+    // 防版本冲突：检查新传入的 rowset->version()（如 [5-5] 或 Compaction 生成的 [2-10]）是否与现有的活跃版本存在违规重叠（如已有 [5-5] 又尝试插入 [5-5]）。若重叠则触发错误，保护数据一致性。
     RETURN_IF_ERROR(_contains_version(rowset->version()));
-
+    // 将 RowsetMeta 追加至底层的 TabletMeta 并保存，完成持久化。
     RETURN_IF_ERROR(_tablet_meta->add_rs_meta(rowset->rowset_meta()));
+    // 在内存的 Version-to-Rowset 映射表中插入该键值对
     _rs_version_map[rowset->version()] = rowset;
     _timestamped_version_tracker.add_version(rowset->version());
+    // Compaction Score 增加：更新当前 Tablet 的 Compaction 评分，为后台 Compaction 调度策略（判断是否需要触发合并）提供依据。
     add_compaction_score(rowset->rowset_meta()->get_compaction_score());
-
+    // 合并版本（Compaction）旧 Rowset 擦除逻辑
+    // 场景解释：当此函数由 Compaction 任务 调用时，新加入的 rowset 是一个范围更大的合并版本（例如 [2-5]）。
+    // 清理旧版本：代码遍历 _rs_version_map，找出所有版本完全包含在 [2-5] 内部的小 Rowset（如 [2-2], [3-4], [5-5]），并将它们收集进 rowsets_to_delete。
     std::vector<RowsetSharedPtr> rowsets_to_delete;
     // yiguolei: temp code, should remove the rowset contains by this rowset
     // but it should be removed in multi path version
@@ -516,6 +527,7 @@ Status Tablet::add_rowset(RowsetSharedPtr rowset) {
             rowsets_to_delete.push_back(it.second);
         }
     }
+    // modify_rowsets：原子性地将这些旧 Rowset 从 _rs_version_map 移除并移动到 _stale_rs_version_map（过期版本映射表）中，完成新旧 Rowsets 的无缝平滑交接。
     std::vector<RowsetSharedPtr> empty_vec;
     RETURN_IF_ERROR(modify_rowsets(empty_vec, rowsets_to_delete));
     ++_newly_created_rowset_num;
@@ -530,7 +542,8 @@ bool Tablet::rowset_exists_unlocked(const RowsetSharedPtr& rowset) {
     }
     return true;
 }
-
+// Apache Doris / StarRocks 存储引擎中 最关键的元数据原子更新函数。
+// 主要服务于 Compaction（数据合并） 和 Schema Change 流程。其核心职责是将合并/重构前的旧 to_delete Rowset 集合从活跃映射表中安全下线，并将全新的 to_add Rowset 集合上线。
 Status Tablet::modify_rowsets(std::vector<RowsetSharedPtr>& to_add,
                               std::vector<RowsetSharedPtr>& to_delete, bool check_delete) {
     // the compaction process allow to compact the single version, eg: version[4-4].
@@ -548,7 +561,8 @@ Status Tablet::modify_rowsets(std::vector<RowsetSharedPtr>& to_add,
     if (to_add.empty() && to_delete.empty()) {
         return Status::OK();
     }
-
+    // 待擦除版本合法性严格校验
+    // 防脏写与并发冲突：在并发 Compaction 或版本管理逻辑中，校验待删除的 Rowset 是否仍然存在于 _rs_version_map 中，且其 rowset_id 必须完全对齐。如果 ID 变了，说明该版本已被其他异步线程替换，避免误删新数据。
     if (check_delete) {
         for (auto&& rs : to_delete) {
             if (auto it = _rs_version_map.find(rs->version()); it == _rs_version_map.end()) {
@@ -565,7 +579,10 @@ Status Tablet::modify_rowsets(std::vector<RowsetSharedPtr>& to_add,
             }
         }
     }
-
+    // 2. 特殊场景判定：同版本原位合并（Single-version Compaction）
+    // 核心背景（代码注释含义）：
+    // 在 Doris 中，单版本内部（例如单个 [7-7] 版本内包含大量 Segment 小文件）也可以发起 Compaction 进行文件重排。这种情况下输入版本和输出版本完全一致（[7-7] $\rightarrow$ [7-7]）。
+    // 判定作用：如果是同版本合并（same_version == true），处理逻辑与多版本合并（如 [2-2] + [3-3] -> [2-3]）存在关键的区别。
     bool same_version = true;
     std::sort(to_add.begin(), to_add.end(), Rowset::comparator);
     std::sort(to_delete.begin(), to_delete.end(), Rowset::comparator);
@@ -579,7 +596,9 @@ Status Tablet::modify_rowsets(std::vector<RowsetSharedPtr>& to_add,
     } else {
         same_version = false;
     }
-
+    // 3. 擦除旧 Rowset 与 MVCC 暂存机制
+    // 从活跃集合下线：从 _rs_version_map 中移除目标 Rowset。
+    // 跨版本合并（MVCC 延迟回收）：如果 !same_version，不能直接销毁旧 Rowset，因为此时可能还有运行中的历史 Query 正在读取旧版本。必须设置 set_stale_at(now) 并将其推入 _stale_rs_version_map，等待过期时间（通常几分钟）后再由 GC 彻底删除物理文件。
     std::vector<RowsetMetaSharedPtr> rs_metas_to_delete;
     int64_t now = ::time(nullptr);
     for (auto& rs : to_delete) {
@@ -592,7 +611,8 @@ Status Tablet::modify_rowsets(std::vector<RowsetSharedPtr>& to_add,
             _stale_rs_version_map[rs->version()] = rs;
         }
     }
-
+    // 4. 注册新 Rowset 与同版本直接废弃逻辑
+    // 上线新版本：将 to_add 中的新 Rowset 放入 _rs_version_map。
     std::vector<RowsetMetaSharedPtr> rs_metas_to_add;
     for (auto& rs : to_add) {
         rs_metas_to_add.push_back(rs->rowset_meta());
@@ -620,7 +640,8 @@ Status Tablet::modify_rowsets(std::vector<RowsetSharedPtr>& to_add,
             }
         }
     }
-
+    // 5. Compaction Score 动态更新
+    // 评分纠偏：通过计算 新 Rowset 积分 - 旧 Rowset 积分 的增量差值，精准更新当前 Tablet 的 Compaction 组合得分，帮助后台 Compaction 调度器准确评估该 Tablet 的健康度。
     int32_t add_score = 0;
     for (auto rs : to_add) {
         add_score += rs->rowset_meta()->get_compaction_score();
@@ -1197,17 +1218,27 @@ void Tablet::_max_continuous_version_from_beginning_unlocked(Version* version, V
         *max_version = existing_versions.back();
     }
 }
-
+// 用于驱动 Cumulative Compaction（增量合并）策略的核心分界点计算函数。
+// 确定 Cumulative Point（增量合并切分点）的物理位置，将 Tablet 内部的全部 Rowset 划分为 Base 区（历史基线区） 与 Cumulative 区（增量写入区）。
+// 核心概念：什么是 Cumulative Point？
+// 在 LSM-Tree / Doris 存储架构中，Rowset 被划分为两个区域：
+// Cumulative Point 左侧（Base 区）：数据已经经过充分的合并，重叠度低，参与 Base Compaction（执行频率低、消耗 IO 大）。
+// Cumulative Point 右侧（Cumulative 区）：新导入的碎小 Rowset，重叠度高，参与 Cumulative Compaction（执行频率高、速度快，用于迅速减少版本数）。
 void Tablet::calculate_cumulative_point() {
+    // 并发控制：修改 Cumulative Point 属于修改 Tablet 核心状态元数据，因此必须加写锁 _meta_lock。
     std::lock_guard wrlock(_meta_lock);
     SCOPED_SIMPLE_TRACE_IF_TIMEOUT(TRACE_TABLET_LOCK_THRESHOLD);
     int64_t ret_cumulative_point;
+    // 策略模式（Strategy Pattern）：
+    // Doris 支持不同的 Cumulative Compaction 算法策略（如传统的 SizeBasedCumulativeCompactionPolicy 基于大小的策略、或 NumBasedCumulativeCompactionPolicy 基于文件数的策略）。
+    // 将当前 Tablet 对象的指针、所有 _tablet_meta->all_rs_metas()、以及当前的 _cumulative_point 传入策略对象。策略算法会根据 Rowset 的文件大小、版本重叠度、有序程度等因素，计算出新的 Cumulative Point 应该推进到哪一个 Version（ret_cumulative_point）。
     _cumulative_compaction_policy->calculate_cumulative_point(
             this, _tablet_meta->all_rs_metas(), _cumulative_point, &ret_cumulative_point);
-
+    // 无效值检查：如果计算结果为 K_INVALID_CUMULATIVE_POINT（例如当前没有足够的 Rowset 满足推进条件，或者正在发生全局变更），则保持现状不进行更新。
     if (ret_cumulative_point == K_INVALID_CUMULATIVE_POINT) {
         return;
     }
+    // 推进分界点：调用 set_cumulative_layer_point 更新内存与 TabletMeta 中的切分点值。
     set_cumulative_layer_point(ret_cumulative_point);
 }
 

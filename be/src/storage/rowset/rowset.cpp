@@ -59,13 +59,16 @@ Rowset::Rowset(const TabletSchemaSPtr& schema, RowsetMetaSharedPtr rowset_meta,
     // build schema from RowsetMeta.tablet_schema or Tablet.tablet_schema
     _schema = _rowset_meta->tablet_schema() ? _rowset_meta->tablet_schema() : schema;
 }
-
+// 将 Rowset 的状态切换为“已加载（ROWSET_LOADED）”。
+// bool use_cache（默认值为 true）： 控制在加载 Segment 文件时是否使用缓存（例如文件描述符 fd 缓存或 Index 缓存）。
 Status Rowset::load(bool use_cache) {
     // if the state is ROWSET_UNLOADING it means close() is called
     // and the rowset is already loaded, and the resource is not closed yet.
+    // 快速检查已加载状态（Double-Check 优化）
     if (_rowset_state_machine.rowset_state() == ROWSET_LOADED) {
         return Status::OK();
     }
+    // 加锁保护并执行状态转换
     {
         // before lock, if rowset state is ROWSET_UNLOADING, maybe it is doing do_close in release
         std::lock_guard load_lock(_lock);
@@ -81,18 +84,31 @@ Status Rowset::load(bool use_cache) {
                   << _rowset_meta->tablet_id();
     return Status::OK();
 }
-
+// 将一个处于 Pending（挂起/未提交）状态的 Rowset 正式发布为可见状态（VISIBLE）。
+// 在 Apache Doris 的导入事务流程中，数据刚写入时处于内部不可见的隔离状态；
+// 只有当 FE（FrontEnd）通知 Backend (BE) 事务提交成功时，BE 才会调用此函数将该 Rowset 标记为对外可见，使其可以被客户端 SQL 查询到。
+// Version version： 当前 Rowset 被分配的可见版本号（如 [start_version, end_version]）。
+// 数据版本是 Doris 实现 MVCC（多版本并发控制）的核心。通过赋予它具体版本号，查询引擎才能根据版本匹配并读取对应的数据。
+// int64_t commit_tso： 事务提交时的 TSO（Timestamp Oracle，时间戳服务）物理/逻辑时间戳。
+// 用于存算分离架构或事务数据一致性追踪，记录该批数据真正 Commit 时的全局时间戳。
 void Rowset::make_visible(Version version, int64_t commit_tso) {
+    // 将 Rowset 对象的内部标志位 _is_pending 设为 false，表示该 Rowset 已经完成了数据准备阶段，不再处于挂起状态。
     _is_pending = false;
+    // 将传入的正式版本号 version 写入该 Rowset 的元数据对象（_rowset_meta）中。
     _rowset_meta->set_version(version);
+    // 将元数据中的状态标记更新为 VISIBLE（可见状态），此时数据正式开启对查询引擎暴露。
     _rowset_meta->set_rowset_state(VISIBLE);
     // update create time to the visible time,
     // it's used to skip recently published version during compaction
+    // 说明为什么要重置 creation_time：将创建时间更新为可见的时间，目的是避免 Compaction（数据合并任务）过早拉取并合并刚发布的新数据。
     _rowset_meta->set_creation_time(UnixSeconds());
-
+    // 检查当前 Rowset 是否包含删除条件（如用户执行了 DELETE FROM table WHERE ... 导入的逻辑删除指令）。
     if (_rowset_meta->has_delete_predicate()) {
+        // 如果包含删除条件，需要将其删除谓词的版本号更新为当前 Rowset 版本范围的起始版本 version.first（并通过 cast_set<int32_t> 进行安全类型转换）。
+        // 这样在读取时，读取引擎就能精准判断该删除条件作用的版本边界。
         _rowset_meta->mutable_delete_predicate()->set_version(cast_set<int32_t>(version.first));
     }
+    // 将事务提交的 TSO 时间戳写入元数据，以便后续进行数据可见性校验或跨节点协同。
     _rowset_meta->set_commit_tso(commit_tso);
 }
 

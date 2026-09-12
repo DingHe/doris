@@ -40,6 +40,14 @@
 
 namespace doris {
 
+
+// 在 Apache Doris 中，Rowset（行集） 代表物理存储层面上一次导入或一次 Compaction（数据合并）所产生的不可变（Immutable）数据集合。
+// 一个 Rowset 通常包含一个或多个 Segment 文件（存储实际数据）以及对应的索引文件（如倒排索引、Bloom Filter 等）。
+// Rowset 抽象类的主要职责包括：
+// 生命周期管理与状态追踪：维护 Rowset 从未加载（UNLOADED）、已加载（LOADED）到卸载中（UNLOADED/UNLOADING）的状态，并借助引用计数实现多线程安全关闭与资源释放。
+// 元数据（Metadata）代理与暴露：通过持有的 RowsetMetaSharedPtr，对外暴露版本号（Version）、数据/索引大小、行数、Segment 数量、主键范围等元信息。
+// 数据读取入口：作为 RowsetReader 的工厂，负责创建读取底层 Segment 数据的 Reader 接口。
+// 物理文件与存储管理：提供文件移除（remove）、硬链接复制（link_files_to）、上传到远程存储（upload_to）、文件完整性校验等物理 IO 相关的操作。
 class Rowset;
 
 namespace io {
@@ -57,17 +65,22 @@ class RowsetReader;
 //    ROWSET_UNLOADING   -->|
 enum RowsetState {
     // state for new created rowset
+    // 初始未加载状态，或者资源已安全关闭/卸载的状态。
     ROWSET_UNLOADED,
     // state after load() called
+    // 调用 load() 成功后的状态，表示底层文件/索引已被打开或加载到内存。
     ROWSET_LOADED,
     // state for closed() called but owned by some readers
+    // 调用了 close() 但当前仍有 RowsetReader 在读取（引用计数 _refs_by_reader > 0），此时延迟卸载资源。
     ROWSET_UNLOADING
 };
 
 class RowsetStateMachine {
 public:
+    // 构造函数，初始化状态为 ROWSET_UNLOADED。
     RowsetStateMachine() : _rowset_state(ROWSET_UNLOADED) {}
-
+    // 处理加载事件。
+    // 仅允许从 ROWSET_UNLOADED 转移至 ROWSET_LOADED，非法转移返回错误码 ROWSET_INVALID_STATE_TRANSITION。
     Status on_load() {
         switch (_rowset_state) {
         case ROWSET_UNLOADED:
@@ -80,7 +93,8 @@ public:
         }
         return Status::OK();
     }
-
+    // 处理关闭事件（从 ROWSET_LOADED 触发）。
+    // 若无 Reader 引用（refs_by_reader == 0）则直接转为 ROWSET_UNLOADED；若仍有 Reader 引用，则转为 ROWSET_UNLOADING。
     Status on_close(uint64_t refs_by_reader) {
         switch (_rowset_state) {
         case ROWSET_LOADED:
@@ -97,7 +111,7 @@ public:
         }
         return Status::OK();
     }
-
+    // 当 Reader 释放引用且引用计数归零时触发。将状态从 ROWSET_UNLOADING 转移至 ROWSET_UNLOADED。
     Status on_release() {
         switch (_rowset_state) {
         case ROWSET_UNLOADING:
@@ -110,7 +124,7 @@ public:
         }
         return Status::OK();
     }
-
+    // 获取当前 Rowset 的状态。
     RowsetState rowset_state() { return _rowset_state; }
 
 private:
@@ -357,33 +371,43 @@ protected:
     virtual Status check_current_rowset_segment() = 0;
 
     virtual void clear_inverted_index_cache() = 0;
-
+    // 向该 Rowset 所对应的 Tablet Schema（表结构 schema信息）。
     TabletSchemaSPtr _schema;
-
+    // 指向 Rowset 的元数据对象，包含版本、Segment 数量、统计数据等。
     RowsetMetaSharedPtr _rowset_meta;
 
     // Local rowset requires a tablet path to obtain the absolute path on the local fs
+    // Tablet 在本地文件系统中的绝对路径（本地存储模式必需）。
     std::string _tablet_path;
 
     // init in constructor
+    // 标识该 Rowset 是否处于 Pending 状态（未发布/对查询不可见）。
     bool _is_pending;    // rowset is pending iff it's not in visible state
+    // 标识该 Rowset 是否为 Cumulative Compaction 产生的 Rowset。
     bool _is_cumulative; // rowset is cumulative iff it's visible and start version < end version
 
     // mutex lock for load/close api because it is costly
+    // 保护 load / close / release 等高昂资源操作的互斥锁，确保线程安全。
     std::mutex _lock;
+    // 标记该 Rowset 的物理文件是否需要在析构或过期时被物理删除。
     bool _need_delete_file = false;
     // variable to indicate how many rowset readers owned this rowset
+    // 原子引用计数，记录当前有多少个 RowsetReader 正持有并读取该 Rowset。
     std::atomic<uint64_t> _refs_by_reader;
     // rowset state machine
+    // 管理该 Rowset 生命周期的状态机。
     RowsetStateMachine _rowset_state_machine;
+    // 延迟过期/清理的时间戳，用于回收机制。
     std::atomic<uint64_t> _delayed_expired_timestamp = 0;
 
     // <column_uniq_id>, skip index compaction
+    // 记录跳过倒排索引合并的列 ID（column_uniq_id）集合。
     std::set<int32_t> skip_index_compaction;
 
     // only used for cloud mode, it indicates whether this rowset is a hole rowset.
     // a hole rowset is a rowset that has no data, but is used to fill the version gap
     // it is used to ensure that the version sequence is continuous.
+    // 仅用于存算分离/存算一体云模式，标记该 Rowset 是否为“空洞 Rowset”（无实际数据，仅用于填补版本连续性空缺）。
     bool _is_hole_rowset = false;
 };
 

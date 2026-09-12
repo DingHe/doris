@@ -367,8 +367,11 @@ SegmentIterator::SegmentIterator(std::shared_ptr<Segment> segment, SchemaSPtr sc
           _inited(false),
           _pool(new ObjectPool) {}
 
+// 初始化的入口包装函数
 Status SegmentIterator::init(const StorageReadOptions& opts) {
+    // 1. 调用实际的初始化实现函数 _init_impl
     auto status = _init_impl(opts);
+    // 2. 错误处理与健康状态更新（Health Status Feedback）
     if (!status.ok()) {
         _segment->update_healthy_status(status);
     }
@@ -406,18 +409,23 @@ std::unique_ptr<AdaptiveBlockSizePredictor> SegmentIterator::_make_block_size_pr
             _opts.preferred_block_size_bytes, metadata_hint_bytes_per_row,
             AdaptiveBlockSizePredictor::kDefaultProbeRows, _opts.block_row_max);
 }
-
+// Apache Doris BE 中 SegmentIterator 的真正物理初始化实现逻辑。
+// 责在进行任何物理 Page 读取或索引裁剪之前，完成参数快照、安全谓词过滤、动态 Batch 预测器构建、Schema 字段与倒排索引字段映射绑定、列/索引迭代器实例化（init_iterators()）以及复合表达式上下文（_construct_compound_expr_context()）的构建。
 Status SegmentIterator::_init_impl(const StorageReadOptions& opts) {
     // get file handle from file descriptor of segment
+    // 初始化状态幂等与耗时统计
+    // 通过 _inited 标记避免重复初始化。
     if (_inited) {
         return Status::OK();
     }
     _opts = opts;
     SCOPED_RAW_TIMER(&_opts.stats->segment_iterator_init_timer_ns);
     _inited = true;
+    // 文件句柄赋值：将 _segment 底层的 FileReader 赋值给迭代器作为后续 Data Page IO 读取句柄。
     _file_reader = _segment->_file_reader;
     _col_predicates.clear();
-
+    // 安全谓词下推筛选 (can_apply_predicate_safely)
+    // 原理：并非所有上层传入的谓词都能安全地在存储引擎（Segment 物理层）下推执行。
     for (const auto& predicate : opts.column_predicates) {
         if (!_segment->can_apply_predicate_safely(predicate->column_id(), *_schema,
                                                   _opts.target_cast_type_for_variants, _opts)) {
@@ -427,20 +435,24 @@ Status SegmentIterator::_init_impl(const StorageReadOptions& opts) {
     }
     _tablet_id = opts.tablet_id;
     // Read options will not change, so that just resize here
+    // 动态/自适应 Batch Size 预测器
+    // 背景：Doris 采用向量化 Block 批处理机制。
+    // 自适应调节：除了预分配固定最大行数（block_row_max）的 RowID 缓存数组，还通过 _make_block_size_predictor() 创建动态 Batch 预测器。
+    // 在后续读取变长数据（如 String, Array, JSON Variant）时，根据列的内存开销动态调整每次返回的 Block 行数，防止产生超大 Block 挤爆内存。
     _block_rowids.resize(_opts.block_row_max);
 
     // Adaptive batch size: snapshot the initial row limit and create predictor if enabled.
     _initial_block_row_max = _opts.block_row_max;
     _block_size_predictor = _make_block_size_predictor();
-
+    // RowID 追踪：如果 Schema 包含 RowID 列，开启 _record_rowids，记录读取行的物理行号（用于 Delete/Update/Unique Key 检查）。
     if (_schema->rowid_col_idx() > 0) {
         _record_rowids = true;
     }
-
+    // 算子下推句柄：保存虚拟列表达式（virtual_column_exprs）、倒排/全文检索打分（score_runtime）和向量近似近邻检索（ann_topn_runtime）。
     _virtual_column_exprs = _opts.virtual_column_exprs;
     _score_runtime = _opts.score_runtime;
     _ann_topn_runtime = _opts.ann_topn_runtime;
-
+    // Nested 列剪枝：如果当前的 Reader 类型是普通 Query 且 RuntimeState 中开启了嵌套列剪枝，则标记 _enable_prune_nested_column = true，减少 Complex/Nested 类型的无效数据 Page 读取。
     _enable_prune_nested_column = _opts.io_ctx.reader_type == ReaderType::READER_QUERY &&
                                   _opts.runtime_state &&
                                   _opts.runtime_state->enable_prune_nested_column();
@@ -448,12 +460,13 @@ Status SegmentIterator::_init_impl(const StorageReadOptions& opts) {
     if (opts.output_columns != nullptr) {
         _output_columns = *(opts.output_columns);
     }
-
+    // 倒排索引字段映射构造与 Variant 稀疏列 Cache (_storage_name_and_type)
     _storage_name_and_type.resize(_schema->columns().size());
     auto storage_format = _opts.tablet_schema->get_inverted_index_storage_format();
     for (int i = 0; i < _schema->columns().size(); ++i) {
         const TabletColumn* col = _schema->column(i);
         if (col) {
+            // 数据类型确定：优先从 Segment 拿底层真实的物理持久化数据类型 get_data_type_of，拿不到则按 Schema 创建。
             auto storage_type = _segment->get_data_type_of(*col, _opts);
             if (storage_type == nullptr) {
                 storage_type =
@@ -467,14 +480,18 @@ Status SegmentIterator::_init_impl(const StorageReadOptions& opts) {
             // After consideration, it was decided to change the field name from column_name to column_unique_id in
             // format V2, while format V1 continues to use column_name.
             std::string field_name;
+            // V1 格式：以列名 col->name() 作为 Lucene/Inverted Index 的 Document Field 名称。缺点是 Alter Table 改列名后旧索引失效。
             if (storage_format == InvertedIndexStorageFormatPB::V1) {
                 field_name = col->name();
             } else {
+            // V2 格式：使用全局唯一的 Column Unique ID。
                 if (col->is_extracted_column()) {
+                    // Variant 抽取子列：parent_unique_id.sub_col_name。
                     // variant sub col
                     // field_name format: parent_unique_id.sub_col_name
                     field_name = std::to_string(col->parent_unique_id()) + "." + col->name();
                 } else {
+                    //普通列：std::to_string(col->unique_id())。
                     field_name = std::to_string(col->unique_id());
                 }
             }
@@ -488,13 +505,15 @@ Status SegmentIterator::_init_impl(const StorageReadOptions& opts) {
             }
         }
     }
-
+    // 物理迭代器与下推表达式初始化
+    // 依次实例化物理列迭代器（ColumnIterator）与索引迭代器（IndexIterator）
     RETURN_IF_ERROR(init_iterators());
-
+    // 构建复合表达式（如 AND/OR/复杂的 Function Expr）下推计算上下文，供后续做更复杂的复杂谓词评估。
     RETURN_IF_ERROR(_construct_compound_expr_context());
     VLOG_DEBUG << fmt::format(
             "Segment iterator init, virtual_column_exprs size: {}, common_expr_pushdown size: {}",
             _opts.virtual_column_exprs.size(), _common_expr_ctxs_push_down.size());
+    // 预先初始化谓词过滤结果位图/缓存容器，准备迎接真正的 Scan 数据提取。
     _initialize_predicate_results();
     return Status::OK();
 }
@@ -508,48 +527,61 @@ void SegmentIterator::_initialize_predicate_results() {
 
     _calculate_common_expr_index_exec_status();
 }
-
+// 用于实例化并初始化当前 Segment 中所有被引用的物理列迭代器（ColumnIterator）和二级/倒排索引迭代器（IndexIterator）
 Status SegmentIterator::init_iterators() {
+    // 1. 初始化所有物理数据列/返回列的 ColumnIterator
     RETURN_IF_ERROR(_init_return_column_iterators());
+    // 2. 初始化所有配置了二级索引/倒排索引列的 IndexIterator
     RETURN_IF_ERROR(_init_index_iterators());
     return Status::OK();
 }
-
+// 在首次真正触发数据读取（Scan）时调用的延迟初始化函数（Lazy Initialization）。
+// _lazy_init 集中处理物理索引剪枝（Index Pruning）、Delete Bitmap 行裁剪、向量化延迟物化结构初始化、向量/ANN/TopN 索引生效，以及列 Column Buffer 预分配，是确定“哪些物理行最终需要被读取”的最关键关卡。
 Status SegmentIterator::_lazy_init(Block* block) {
     if (_lazy_inited) {
         return Status::OK();
     }
     SCOPED_RAW_TIMER(&_opts.stats->block_init_ns);
     DorisMetrics::instance()->segment_read_total->increment(1);
+    // 全量位图设定：最开始将当前 Segment 的所有行（0 到 num_rows - 1）加入 _row_bitmap（Roaring Bitmap）。
     _row_bitmap.addRange(0, _segment->num_rows());
+    // Condition Cache 过滤：如果命中了历史 Query 留下的条件缓存，直接对 _row_bitmap 进行初步快速过滤。
     _init_row_bitmap_by_condition_cache();
 
     // z-order can not use prefix index
+    // 2. 多级索引物理裁剪（Prefix Key / ZoneMap / Inverted Index）
+    // 前缀 Key 索引剪枝（_get_row_ranges_by_keys）：对普通排序列，利用 Short Key 索引二分查找确定大致的 Row Range。（针对 Z-ORDER 或 Cluster Key 则跳过此步骤）。
     if (_segment->_tablet_schema->sort_type() != SortType::ZORDER &&
         _segment->_tablet_schema->cluster_key_uids().empty()) {
         RETURN_IF_ERROR(_get_row_ranges_by_keys());
     }
+    // 列条件与高级索引剪枝（_get_row_ranges_by_column_conditions）：触发 ZoneMap、Bloom Filter、Inverted Index（倒排索引）计算，大幅收缩 _row_bitmap 包含的绝对行号。
     RETURN_IF_ERROR(_get_row_ranges_by_column_conditions());
+    // 延迟物化数据结构初始化（_vec_init_lazy_materialization）：划分哪些列是第一阶段过滤用的 _predicate_column_ids，哪些是第二阶段才读取的数据列 _non_predicate_columns。
     RETURN_IF_ERROR(_vec_init_lazy_materialization());
     // Remove rows that have been marked deleted
+    // Delete Bitmap 逻辑删除裁剪与上层 RowRanges 求交
     if (_opts.delete_bitmap.count(segment_id()) > 0 &&
         _opts.delete_bitmap.at(segment_id()) != nullptr) {
         size_t pre_size = _row_bitmap.cardinality();
+        // 执行位图减法 _row_bitmap -= delete_bitmap，被删除的行在此彻底被物理过滤，永远不会发起磁盘 Page 读取！
         _row_bitmap -= *(_opts.delete_bitmap.at(segment_id()));
         _opts.stats->rows_del_by_bitmap += (pre_size - _row_bitmap.cardinality());
         VLOG_DEBUG << "read on segment: " << segment_id() << ", delete bitmap cardinality: "
                    << _opts.delete_bitmap.at(segment_id())->cardinality() << ", "
                    << _opts.stats->rows_del_by_bitmap << " rows deleted by bitmap";
     }
-
+    // RowRanges 求交集：与上层（如 RowsetReader 侧传入）进一步限定的物理行号范围取交集。
     if (!_opts.row_ranges.is_empty()) {
         _row_bitmap &= RowRanges::ranges_to_roaring(_opts.row_ranges);
     }
-
+    // 在执行向量相似度搜索（如 SELECT *, distance(...) FROM tbl ORDER BY distance LIMIT 10）时，为上层物化并返回“向量距离/相似度 Score 列”做准备。
     _prepare_score_column_materialization();
-
+    // 调用底层 Segment 绑定的 ANN 向量索引（如 HNSW / FAISS）
+    // 结合索引在全局直接检索出 TopN 的相似行，并再次对 _row_bitmap 进行 AND 求交操作，大幅裁剪物理行，将非 TopN 的行号直接过滤掉。
     RETURN_IF_ERROR(_apply_ann_topn_predicate());
-
+    // 按需反向扫描：如果 SQL 包含倒序扫描需求（例如 ORDER BY pk DESC），创建 BackwardBitmapRangeIterator，
+    // 会从 _row_bitmap 的高位物理行号向低位倒序产生连续的 Block 范围；反之则构造正向的 BitmapRangeIterator。
     if (_opts.read_orderby_key_reverse) {
         _range_iter.reset(new BackwardBitmapRangeIterator(_row_bitmap));
     } else {
@@ -560,16 +592,20 @@ Status SegmentIterator::_lazy_init(Block* block) {
     // prediction) because the predictor may increase block_row_max on subsequent batches
     // up to this ceiling. Using the current (possibly reduced) _opts.block_row_max would
     // cause heap-buffer-overflow if a later prediction is larger.
+    // Doris 内部存在自适应 Batch Size 预测器（Adaptive Predictor），会在扫描过程中根据过滤率动态增减后续批次的 block_row_max（最高可扩展至初始最大上限 _initial_block_row_max）。
     auto nrows_reserve_limit =
             std::min(_row_bitmap.cardinality(), uint64_t(_initial_block_row_max));
+    // 在启用了延迟物化、RowID 记录或复杂表达式计算时，系统需要用 _block_rowids 记录当前 Batch 读出的物理行号（以备第二阶段做稀疏离散读取）。此处直接将其一次性扩容至最大安全的 _initial_block_row_max。
     if (_lazy_materialization_read || _opts.record_rowids || _is_need_expr_eval) {
         _block_rowids.resize(_initial_block_row_max);
     }
+    // 将其大小调整为 Schema 中的物理列数，为随后循环创建具体的 ColumnPtr（如 ColumnVector, ColumnString）提供容器空间。
     _current_return_columns.resize(_schema->columns().size());
 
     for (size_t i = 0; i < _schema->column_ids().size(); i++) {
         ColumnId cid = _schema->column_ids()[i];
         const auto* column_desc = _schema->column(cid);
+        // 谓词过滤列初始化
         if (_is_pred_column[cid]) {
             auto storage_column_type = _storage_name_and_type[cid].second;
             RETURN_IF_CATCH_EXCEPTION(
@@ -577,9 +613,14 @@ Status SegmentIterator::_lazy_init(Block* block) {
                     // because the size of _current_return_columns equals _schema->tablet_columns().size()
                     _current_return_columns[cid] = Schema::get_predicate_column_ptr(
                             storage_column_type, _opts.io_ctx.reader_type));
+            // 唯一元数据绑定：调用 set_rowset_segment_id 注入当前 Segment 所在的 Rowset ID 与 Segment ID。这在计算包含全表唯一行标识（RowID/Global Dict/MVCC 追踪）时至关重要。
             _current_return_columns[cid]->set_rowset_segment_id(
                     {_segment->rowset_id(), _segment->id()});
+            // 内存预分配（Reserve）：按上一阶段算出的 nrows_reserve_limit 进行容量预留，确保后续批次提取时无需频繁重新分配堆内存（Realloc）。
             _current_return_columns[cid]->reserve(nrows_reserve_limit);
+        // 未生效隐藏 Delete 条件列的处理
+        // 在 Doris 中执行带条件的删除（如 DELETE FROM tbl WHERE status = 0）时，系统会生成包含该删除条件的 Segment。
+        // 对于后续导入的新数据 Segment（如版本 C），该 Segment 物理上并没有定义这个 Delete 过滤条件，但底层 Schema 为了版本对齐仍会包含 status 列。
         } else if (i >= block->columns()) {
             // This column needs to be scanned, but doesn't need to be returned upward. (delete sign)
             // if i >= block->columns means the column and not the pred_column means `column i` is
@@ -602,6 +643,8 @@ Status SegmentIterator::_lazy_init(Block* block) {
     //      `select b from table;`
     // a column only effective in segment iterator, the block from query engine only contain the b column,
     // so no need to filter a column by expr.
+    // 在存储层内部，可能存在一些仅用于 Delete 条件筛选或内部 MVCC 计算的隐藏谓词列。这些列的索引号（*it）可能大于或等于上层 Query Engine 传入的 block 所包含的物理列数（block->columns()）。
+    // 如果将越界的列索引留存在 _columns_to_filter 中，后续对 block 执行列过滤/擦除时，就会导致严重的数组越界（Out-of-bound Access）或无效的 Column 操作崩溃。此处通过标准的 C++ iterator 安全擦除模式（it = _columns_to_filter.erase(it)），安全地清理掉这些仅在存储层内部生效的列。
     for (auto it = _columns_to_filter.begin(); it != _columns_to_filter.end();) {
         if (*it >= block->columns()) {
             it = _columns_to_filter.erase(it);
@@ -609,9 +652,10 @@ Status SegmentIterator::_lazy_init(Block* block) {
             ++it;
         }
     }
-
+    // 将标志位置为 true。
+    // 当后续上层算子不断循环调用 _next_batch_internal 读取数据批次时，开头检查到 if (_lazy_inited) 会直接返回 Status::OK()，避免重复执行开销昂贵的索引剪枝和 Buffer 分配逻辑。
     _lazy_inited = true;
-
+    // 根据前面的 _row_bitmap 计算出即将需要读取的数据 Page/Column Range，并向 IO 线程池或操作系统 Page Cache 提交异步预取请求（Prefetch Request）。
     _init_segment_prefetchers();
 
     return Status::OK();
@@ -704,17 +748,20 @@ void SegmentIterator::_init_segment_prefetchers() {
         }
     }
 }
-
+// 利用物理存储中的 Short Key（前缀稀疏索引），根据 SQL 查询传入的主键/排序键范围（_opts.key_ranges），二分查找计算出符合条件的数据行区间（RowRanges），并对 _row_bitmap 进行求交集剪枝。
 Status SegmentIterator::_get_row_ranges_by_keys() {
     SCOPED_RAW_TIMER(&_opts.stats->generate_row_ranges_by_keys_ns);
     DorisMetrics::instance()->segment_row_total->increment(num_rows());
 
     // fast path for empty segment or empty key ranges
+    // 性能优化：如果之前的步骤已经把 _row_bitmap 裁剪为空（无存活行），或者上层 Optimizer 根本没有下推 key 范围过滤，直接提前返回 Status::OK()，避免做无用功。
     if (_row_bitmap.isEmpty() || _opts.key_ranges.empty()) {
         return Status::OK();
     }
 
     // Read & seek key columns is a waste of time when no key column in _schema
+    // Short Key 索引的 Seek 需要解析 Key 列的数据格式。
+    // 如果当前 SQL 查询的列（_schema）中完全没有包含任何物理 Key 列（例如 SELECT val_col FROM tbl WHERE key_col > 10，其中 key_col 并不在选中的输出列或谓词读取列表中），去解析并 Seek Key 列反而会带来额外开销，因此此处直接跳过 Seek 流程。
     if (std::none_of(_schema->columns().begin(), _schema->columns().end(),
                      [&](const TabletColumnPtr& col) {
                          return col &&
@@ -724,10 +771,13 @@ Status SegmentIterator::_get_row_ranges_by_keys() {
     }
 
     RowRanges result_ranges;
+    // 基于前缀索引二分查找 RowID 范围（Upper/Lower Lookup）
     for (auto& key_range : _opts.key_ranges) {
         rowid_t lower_rowid = 0;
         rowid_t upper_rowid = num_rows();
+        // 准备 Short Key Index 的 Block 数据
         RETURN_IF_ERROR(_prepare_seek(key_range));
+        // 先定位上限 upper_rowid
         if (key_range.upper_key != nullptr) {
             // If client want to read upper_bound, the include_upper is true. So we
             // should get the first ordinal at which key is larger than upper_bound.
@@ -735,15 +785,20 @@ Status SegmentIterator::_get_row_ranges_by_keys() {
             RETURN_IF_ERROR(_lookup_ordinal(*key_range.upper_key, !key_range.include_upper,
                                             num_rows(), &upper_rowid));
         }
+        // Lower Bound Lookup（寻找下限行号）
         if (upper_rowid > 0 && key_range.lower_key != nullptr) {
             RETURN_IF_ERROR(_lookup_ordinal(*key_range.lower_key, key_range.include_lower,
                                             upper_rowid, &lower_rowid));
         }
+        // 区间合并：将每一个 [lower_rowid, upper_rowid) 行区间通过 ranges_union 累加到最终的 result_ranges 中（支持多个点查或范围查的并集）
         auto row_range = RowRanges::create_single(lower_rowid, upper_rowid);
         RowRanges::ranges_union(result_ranges, row_range, &result_ranges);
     }
+    // 位图二次裁剪与过滤指标累加
     size_t pre_size = _row_bitmap.cardinality();
+    // 位图求交（Bitwise AND）：将二分查找计算出的 Short Key 结果区间转换为 Roaring Bitmap，并与当前 _row_bitmap 做交集计算（&=）。
     _row_bitmap &= RowRanges::ranges_to_roaring(result_ranges);
+    // 统计数据更新：记录经过 Short Key 索引过滤掉的物理行数，方便在 EXPLAIN ANALYZE 中追踪 Key 索引的过滤效率。
     _opts.stats->rows_key_range_filtered += (pre_size - _row_bitmap.cardinality());
 
     return Status::OK();
@@ -812,34 +867,40 @@ Status SegmentIterator::_prepare_seek(const StorageReadOptions::KeyRange& key_ra
 
     return Status::OK();
 }
-
+// Doris 实现高效列谓词索引剪枝（Inverted Index / ZoneMap / Bloom Filter）的聚合枢纽
+// 核心目标是在读取实际数据 Page 之前，利用倒排索引和各类统计索引大幅收缩存活行号位图（_row_bitmap），并根据过滤情况优化后续的列读取路径。
 Status SegmentIterator::_get_row_ranges_by_column_conditions() {
     SCOPED_RAW_TIMER(&_opts.stats->generate_row_ranges_by_column_conditions_ns);
     if (_row_bitmap.isEmpty()) {
         return Status::OK();
     }
 
-    {
+    {   // 1. 倒排索引评估与位图裁剪（Inverted Index Pipeline）
         if (_opts.runtime_state &&
             _opts.runtime_state->query_options().enable_inverted_index_query &&
             (has_index_in_iterators() || !_common_expr_ctxs_push_down.empty())) {
             SCOPED_RAW_TIMER(&_opts.stats->inverted_index_filter_timer);
             size_t input_rows = _row_bitmap.cardinality();
             // Only apply column-level inverted index if we have iterators
+            // a. 应用列级倒排索引
             if (has_index_in_iterators()) {
                 RETURN_IF_ERROR(_apply_inverted_index());
             }
             // Always apply expr-level index (e.g., search expressions) if we have common_expr_pushdown
             // This allows search expressions with variant subcolumns to be evaluated even when
             // the segment doesn't have all subcolumns
+            // b. 应用表达式级倒排索引 (支持 Variant 动态子列与复合表达式)
             RETURN_IF_ERROR(_apply_index_expr());
+            // c. 提取已完全评估的倒排索引结果 Bitmap
             for (auto it = _common_expr_ctxs_push_down.begin();
                  it != _common_expr_ctxs_push_down.end();) {
                 if ((*it)->all_expr_inverted_index_evaluated()) {
                     const auto* result = (*it)->get_index_context()->get_index_result_for_expr(
                             (*it)->root().get());
                     if (result != nullptr) {
+                        // 位图求交
                         _row_bitmap &= *result->get_data_bitmap();
+                        // 完全计算过的表达式直接移除
                         it = _common_expr_ctxs_push_down.erase(it);
                     }
                 } else {
@@ -849,6 +910,9 @@ Status SegmentIterator::_get_row_ranges_by_column_conditions() {
             _opts.condition_cache_digest =
                     _common_expr_ctxs_push_down.empty() ? 0 : _opts.condition_cache_digest;
             _opts.stats->rows_inverted_index_filtered += (input_rows - _row_bitmap.cardinality());
+            // 2. IO 读取优化：跳过全满足列的索引读取
+            // 核心优化：检查某个列 cid 上的所有谓词条件是否均已被倒排索引 100% 精确过滤。
+            // 效果：如果是，说明剩余在 _row_bitmap 中的所有行已经绝对满足该列的谓词条件，因此将 _need_read_data_indices[cid] 标记为 false，后续在第一阶段谓词列过滤读取时，可以直接跳过读取该列的磁盘数据 Page！
             for (auto cid : _schema->column_ids()) {
                 bool result_true = _check_all_conditions_passed_inverted_index_for_column(cid);
                 if (result_true) {
@@ -879,7 +943,12 @@ Status SegmentIterator::_get_row_ranges_by_column_conditions() {
                     _common_expr_ctxs_push_down.size(), _col_predicates.size());
         }
     })
-
+    // 3. 统计索引与谓词过滤（ZoneMap, Bloom Filter, Dict Filter）
+    // 触发基于 Segment 块级/Page 级统计索引的过滤，包含：
+    // ZoneMap 索引：按 Min/Max 范围裁剪 Page。
+    // Bloom Filter 索引：快速排除不包含目标 Key 的 Page。
+    // Runtime Filter / TopN Filter：运行时下推的动态过滤条件。
+    // Delete Condition：物理级 Delete 过滤条件。
     if (!_row_bitmap.isEmpty() &&
         (!_opts.topn_filter_source_node_ids.empty() || !_opts.col_id_to_predicates.empty() ||
          _opts.delete_condition_predicates->num_of_column_predicate() > 0 ||
@@ -887,6 +956,7 @@ Status SegmentIterator::_get_row_ranges_by_column_conditions() {
         RowRanges condition_row_ranges = RowRanges::create_single(_segment->num_rows());
         RETURN_IF_ERROR(_get_row_ranges_from_conditions(&condition_row_ranges));
         size_t pre_size = _row_bitmap.cardinality();
+        // 将计算出的 condition_row_ranges 转换为位图后，再次与 _row_bitmap 执行 &= 求交集，并更新统计计数
         _row_bitmap &= RowRanges::ranges_to_roaring(condition_row_ranges);
         _opts.stats->rows_conditions_filtered += (pre_size - _row_bitmap.cardinality());
     }
@@ -1547,20 +1617,28 @@ bool SegmentIterator::_check_all_conditions_passed_inverted_index_for_column(Col
     }
     return default_return;
 }
-
+// Apache Doris BE 中负责按 Schema 初始化所有列迭代器（ColumnIterator）的物理构建逻辑。
+// 根据请求的 Schema 遍历每一列，识别该列是常规物理列还是各种特殊/虚拟列，并为其创建并初始化正确的迭代器句柄。
 Status SegmentIterator::_init_return_column_iterators() {
+    // 耗时统计：使用 SCOPED_RAW_TIMER 将当前初始化的 CPU/IO 耗时记录到 Profile 中，方便分析 Query 性能。
     SCOPED_RAW_TIMER(&_opts.stats->segment_iterator_init_return_column_iterators_timer_ns);
+    // 空数据熔断：如果当前 Segment 的起始游标已经超过总行数，说明当前 Segment 为空或无有效数据，直接返回，避免不必要的对象初始化开销。
     if (_cur_rowid >= num_rows()) {
         return Status::OK();
     }
 
     for (auto cid : _schema->column_ids()) {
+        // 特殊列 Handling：单 Tablet 内物理 RowID 列 (ROWID_COL)
+        // 作用：当查询需要显式读取物理行号（如 Update / Delete / Unique Key Merge-on-Write 机制）时，触发生成 RowIdColumnIterator。
+        // 底层特点：该迭代器并不对应物理磁盘上存储的真实 Page 列，而是在读取时根据 (tablet_id, rowset_id, segment_id, ordinal_id) 内存动态计算组装出 64 位全局唯一的 RowID 字段。
         if (_schema->column(cid)->name() == BeConsts::ROWID_COL) {
             _column_iterators[cid].reset(
                     new RowIdColumnIterator(_opts.tablet_id, _opts.rowset_id, _segment->id()));
             continue;
         }
-
+        // 特殊列 Handling：跨节点全局 RowID 列 (GLOBAL_ROWID_COL)
+        // 作用：分布式/全球唯一 RowID（常用在分布式索引、点查或全局位图追溯场景）。
+        // 从 runtime_state 的 id_file_map 中获取 (tablet_id, rowset_id, segment_id) 到短整型 file_id 的压缩映射，实例化 RowIdColumnIteratorV2，减少全局标识符占用的内存与传输带宽。
         if (_schema->column(cid)->name().starts_with(BeConsts::GLOBAL_ROWID_COL)) {
             auto& id_file_map = _opts.runtime_state->get_id_file_map();
             uint32_t file_id = id_file_map->get_file_mapping_id(std::make_shared<FileMapping>(
@@ -1569,16 +1647,20 @@ Status SegmentIterator::_init_return_column_iterators() {
                     IdManager::ID_VERSION, BackendOptions::get_backend_id(), file_id));
             continue;
         }
-
+        // 特殊列 Handling：虚拟列/计算列 (VIRTUAL_COLUMN_PREFIX)
+        // 作用：处理类似全文检索相关性得分（SCORE 列）、Variant 类型动态展开的虚列或高阶函数生成的虚拟列。
         if (_schema->column(cid)->name().starts_with(BeConsts::VIRTUAL_COLUMN_PREFIX)) {
             _column_iterators[cid] = std::make_unique<VirtualColumnIterator>();
             continue;
         }
-
+        // 常规物理列初始化与谓词标记
+        // 目的：统计哪些列参与了谓词条件（Filter Predicate）或删除条件（Delete Condition），标记在 tmp_is_pred_column 位图数组中。
         std::set<ColumnId> del_cond_id_set;
         _opts.delete_condition_predicates->get_all_column_ids(del_cond_id_set);
         std::vector<bool> tmp_is_pred_column;
         tmp_is_pred_column.resize(_schema->columns().size(), false);
+        // 在 Doris 的列式存储设计中，如果一列属于“谓词列”，下层 ColumnIterator 可能会触发特殊的优化策略
+        // （例如：优先读取该列的最后一个 Page，检查该列在整个 Segment 内是否达到了全字典编码 full dict encoding。如果达到了全字典编码，过滤谓词就能直接转化为针对 Integer Code 的极速数值比较）。
         for (auto predicate : _col_predicates) {
             auto p_cid = predicate->column_id();
             tmp_is_pred_column[p_cid] = true;
@@ -1587,8 +1669,11 @@ Status SegmentIterator::_init_return_column_iterators() {
         for (auto d_cid : del_cond_id_set) {
             tmp_is_pred_column[d_cid] = true;
         }
-
+        // 物理列迭代器创建与物理 init
+        // 惰性创建（Lazy Reset）：只有未初始化的列（nullptr）才真正实例化，避免重复创建。
         if (_column_iterators[cid] == nullptr) {
+            // new_column_iterator：通过 Segment 工厂方法根据列的数据类型（Scalar、Array、Map、Struct、Variant 等）选择并构造对应的物理 ColumnIterator（如 FileColumnIterator 或嵌套类型的 ArrayColumnIterator）。
+            // 同时支持 Variant 稀疏列缓存（_variant_sparse_column_cache）。
             RETURN_IF_ERROR(_segment->new_column_iterator(_opts.tablet_schema->column(cid),
                                                           &_column_iterators[cid], &_opts,
                                                           &_variant_sparse_column_cache));
@@ -1601,10 +1686,12 @@ Status SegmentIterator::_init_return_column_iterators() {
                     .stats = _opts.stats,
                     .io_ctx = _opts.io_ctx,
             };
+            // 传递 ColumnIteratorOptions：将 use_page_cache（PageCache 开关）、is_predicate_column、底层 file_reader 以及 IO 上下文传给列迭代器
+            // 并调用 init(iter_opts) 完成物理 Page Index、Dict Page 的加载与解压准备。
             RETURN_IF_ERROR(_column_iterators[cid]->init(iter_opts));
         }
     }
-
+    // Debug 模式下的安全性校验
 #ifndef NDEBUG
     for (const auto& entry : _virtual_column_exprs) {
         ColumnId vir_col_cid = entry.first;
@@ -1618,18 +1705,19 @@ Status SegmentIterator::_init_return_column_iterators() {
 #endif
     return Status::OK();
 }
-
+// Apache Doris BE 存储引擎中负责初始化二级索引/倒排索引（Inverted Index）与 ANN 向量索引迭代器的物理构建函数。
 Status SegmentIterator::_init_index_iterators() {
     SCOPED_RAW_TIMER(&_opts.stats->segment_iterator_init_index_iterators_timer_ns);
     if (_cur_rowid >= num_rows()) {
         return Status::OK();
     }
-
+    // 创建一个在当前 Segment 索引查询生命周期内共享的 IndexQueryContext 容器。
     _index_query_context = std::make_shared<IndexQueryContext>();
     _index_query_context->io_ctx = &_opts.io_ctx;
     _index_query_context->stats = _opts.stats;
     _index_query_context->runtime_state = _opts.runtime_state;
-
+    // 打分与相关性计算：如果存在 _score_runtime（例如 BM25 全文检索打分或向量 TopN 搜索），
+    // 会额外注入文档集合统计信息（collection_statistics）、相似度模型（CollectionSimilarity）、LIMIT 限制和排序方向（升序/降序），供底层的倒排/向量索引在检索时直接计算相关性分数。
     if (_score_runtime) {
         _index_query_context->collection_statistics = _opts.collection_statistics;
         _index_query_context->collection_similarity = std::make_shared<CollectionSimilarity>();
@@ -1638,24 +1726,37 @@ Status SegmentIterator::_init_index_iterators() {
     }
 
     // Inverted index iterators
+    // 第一阶段：倒排索引迭代器构建 (Inverted Index Iterators)
+    // 重点处理了 普通物理列 与 半结构化 Variant 类型的提取子列（Extracted Columns） 两种情况：
     for (auto cid : _schema->column_ids()) {
         // Use segment’s own index_meta, for compatibility with future indexing needs to default to lowercase.
+        // 解决的核心痛苦问题是：Variant 类型的 JSON 子路径（例如 a.b.c）在 Schema 中可能只是一个占位/抽取列（Extracted Column），其真实的倒排索引元数据（Index Metadata）并不直接挂在普通的 TabletSchema 顶层，
+        // 而是绑定在 Variant 的父节点及其内部动态抽取的子列物理结构中。
         if (_index_iterators[cid] == nullptr) {
             // Scan-time Variant path placeholders retain the Variant storage type. Use their
             // parent unique id and path to locate the extracted column's inverted-index metadata.
             const auto& column = _opts.tablet_schema->column(cid);
             std::vector<const TabletIndex*> inverted_indexs;
             // Keep shared_ptr alive to prevent use-after-free when accessing raw pointers
+            // 存放 std::shared_ptr<const TabletIndex> 的容器。
             TabletIndexes inverted_indexs_holder;
             // If the column is an extracted column, we need to find the sub-column in the parent column reader.
             std::shared_ptr<ColumnReader> column_reader;
+            // 判断当前列是否为从 Variant 扩展/抽取出来的 JSON 路径列。
+            // parent_unique_id()：Variant 列在磁盘上以根列（Parent Column）的形式存在，子路径列记录了父列的 Unique ID。
             if (column.is_extracted_column()) {
+                // _column_reader_cache：从 Segment 的列读取器缓存中获取父列的 ColumnReader。获取失败则直接 continue（说明底层物理数据不存在，跳过索引读取）。
                 if (!_segment->_column_reader_cache->get_column_reader(
                             column.parent_unique_id(), &column_reader, _opts.stats) ||
                     column_reader == nullptr) {
                     continue;
                 }
+                // 在 DEBUG 模式下断言并安全地转型为专用的 VariantColumnReader 指针。
                 auto* variant_reader = assert_cast<VariantColumnReader*>(column_reader.get());
+                // 动态数据类型推导 (infer_data_type_for_path)
+                // 背景：JSON 里的某个 Field（如 a.b）在扫描初期（Scan Time）占位符类型可能默认还是 TYPE_VARIANT（未指定具体类型）。
+                // 类型推导：索引的匹配与查找强依赖具体的数据类型（比如 Int32 的倒排索引与 String 的倒排索引物理结构完全不同）。
+                // 此处调用 variant_reader->infer_data_type_for_path 结合当前 Segment 的实际物理 Page 元数据，推导出该路径真实的物理类型（例如推导出实际存的是 TYPE_STRING 或 TYPE_BIGINT），更新 data_type。
                 DataTypePtr data_type = _storage_name_and_type[cid].second;
                 if (data_type != nullptr &&
                     data_type->get_primitive_type() == PrimitiveType::TYPE_VARIANT) {
@@ -1666,17 +1767,21 @@ Status SegmentIterator::_init_index_iterators() {
                         data_type = inferred_type;
                     }
                 }
+                // 带着子列的 Path 信息以及推导出的 data_type，在 VariantColumnReader 维护的子列索引映射表中查找匹配的倒排索引（TabletIndex）。
                 inverted_indexs_holder = variant_reader->find_subcolumn_tablet_indexes(
                         column, data_type, _opts.stats);
                 // Extract raw pointers from shared_ptr for iteration
+                // 将 inverted_indexs_holder 中智能指针引用的物理索引元数据地址装入 inverted_indexs 列表中，供后续代码统一调用
                 for (const auto& index_ptr : inverted_indexs_holder) {
                     inverted_indexs.push_back(index_ptr.get());
                 }
             }
             // If the column is not an extracted column, we can directly get the inverted index metadata from the tablet schema.
+            // 非 Variant 扩展列直接从当前 Segment 的 TabletSchema 中拉取挂载在该列上的倒排索引元数据列表。
             else {
                 inverted_indexs = _segment->_tablet_schema->inverted_indexs(column);
             }
+            // 针对 Variant 类型抽取列（Extracted Sub-column）进行倒排索引绑定时的“未命中/无候选索引”诊断与 Trace 逻辑
             if (column.is_extracted_column() && inverted_indexs.empty() && _opts.stats != nullptr) {
                 const auto relative_path = column.path_info_ptr()->copy_pop_front().get_path();
                 const auto diagnostic = fmt::format(
@@ -1688,10 +1793,14 @@ Status SegmentIterator::_init_index_iterators() {
                 VLOG_DEBUG << diagnostic;
                 _opts.stats->inverted_index_stats.add_binding_diagnostic(diagnostic);
             }
+            // 遍历候选倒排索引元数据（inverted_indexs）、实例化物理 InvertedIndexIterator，并记录 Variant/半结构化列索引绑定结果（Accepted/No Iterator）的核心执行与可观测性（Diagnostic）逻辑。
             for (const auto& inverted_index : inverted_indexs) {
                 const bool had_iterator = _index_iterators[cid] != nullptr;
+                // 物理层的工厂函数。它会根据 inverted_index 元数据（如索引类型为 Fulltext/Inverted，使用的分词器，索引文件路径等），在底层打开对应的物理索引文件（如 .idx 文件），
+                // 并实例化具体的 InvertedIndexIterator 赋值给 _index_iterators[cid]。若遇到文件损坏或 IO 错误，直接通过 RETURN_IF_ERROR 宏向上传播错误状态。
                 RETURN_IF_ERROR(_segment->new_index_iterator(column, inverted_index, _opts,
                                                              &_index_iterators[cid]));
+                // 触发条件：只有当当前列属于 Variant 类型抽取出来的子路径列（Extracted Column） 或 原生 Variant 根类型列，且开启了 Query Profile 统计（_opts.stats != nullptr）时，才会进入诊断记录逻辑。
                 if ((column.is_extracted_column() || column.is_variant_type()) &&
                     _opts.stats != nullptr) {
                     const auto diagnostic = fmt::format(
@@ -1707,6 +1816,7 @@ Status SegmentIterator::_init_index_iterators() {
                             inverted_index->get_index_suffix(), inverted_index->field_pattern(),
                             had_iterator ? "preserved" : "created");
                     VLOG_DEBUG << diagnostic;
+                    // 将这段诊断字符串塞入当前查询的 InvertedIndexStats 中。
                     _opts.stats->inverted_index_stats.add_binding_diagnostic(diagnostic);
                 }
             }
@@ -1717,6 +1827,8 @@ Status SegmentIterator::_init_index_iterators() {
     }
 
     // Ann index iterators
+    // 负责初始化 ANN（Approximate Nearest Neighbor，近似最近邻/向量）索引迭代器（AnnIndexIterator） 的循环处理逻辑
+    // 为倒排索引（Inverted Index）初始化之后的补全阶段，专门为存储高维向量数据（如 HNSW、IVF-Flat 等向量索引） 的列创建物理索引检索句柄，并注入全局查询上下文。
     for (auto cid : _schema->column_ids()) {
         if (_index_iterators[cid] == nullptr) {
             const auto& column = _opts.tablet_schema->column(cid);
@@ -1734,13 +1846,18 @@ Status SegmentIterator::_init_index_iterators() {
 
     return Status::OK();
 }
+// 根据当前表的主键模型类型（Keys Type）和物理索引配置，决定是使用 Merge-on-Write 模型下的 Primary Key Index（主键索引/PK Index） 还是普通的 Short Key Index（前缀稀疏索引/SK Index） 来检索物理行号。
 
 Status SegmentIterator::_lookup_ordinal(const RowCursor& key, bool is_include, rowid_t upper_bound,
                                         rowid_t* rowid) {
+    // Unique Key 模型（Merge-on-Write）分支：_lookup_ordinal_from_pk_index
+    // 表模型为 UNIQUE_KEYS（主键唯一模型）
+    // 启用并生成了 Primary Key Index（通常是 Doris Merge-on-Write/MoW 开启时构建的有序索引树或 BloomFilter 结合结构）。
     if (_segment->_tablet_schema->keys_type() == UNIQUE_KEYS &&
         _segment->get_primary_key_index() != nullptr) {
         return _lookup_ordinal_from_pk_index(key, is_include, rowid);
     }
+    // 通用/Dup/Agg模型分支：_lookup_ordinal_from_sk_index
     return _lookup_ordinal_from_sk_index(key, is_include, upper_bound, rowid);
 }
 
@@ -1753,23 +1870,29 @@ Status SegmentIterator::_lookup_ordinal(const RowCursor& key, bool is_include, r
 // 1. get [start, end) ordinal through short key index
 // 2. binary search to find exact ordinal that match the input condition
 // Make is_include template to reduce branch
+// BE 存储引擎中利用 Short Key Index（前缀稀疏索引） 定位物理行号（RowID/Ordinal）的核心实现。
+// 采用了 “两阶段查找（Two-phase Search）” 架构：先利用内存中的稀疏索引块进行粗粒度 Index Page 范围锁定，再通过磁盘数据块的 二分查找（Binary Search） 进行精细化 RowID 定位。
 Status SegmentIterator::_lookup_ordinal_from_sk_index(const RowCursor& key, bool is_include,
                                                       rowid_t upper_bound, rowid_t* rowid) {
+    // Doris 的 Short Key 索引截取表 Schema 前 N 个 Key 列（最多 36 字节）进行连续二进制编码。
     const ShortKeyIndexDecoder* sk_index_decoder = _segment->get_short_key_index();
     DCHECK(sk_index_decoder != nullptr);
-
+    // 将传入的 RowCursor 按照 Tablet 的 Short Key 规则编码为字节流 index_key
     std::string index_key;
     key.encode_key_with_padding(&index_key, _segment->_tablet_schema->num_short_key_columns(),
                                 is_include);
 
     const auto& key_col_ids = key.schema()->column_ids();
-
+    // 阶段一：利用 Short Key 稀疏索引定位起始 Block（粗粒度定位）
     ssize_t start_block_id = 0;
     auto start_iter = sk_index_decoder->lower_bound(index_key);
     if (start_iter.valid()) {
         // Because previous block may contain this key, so we should set rowid to
         // last block's first row.
         start_block_id = start_iter.ordinal();
+        // 回退一块（start_block_id--）的原因
+        // Doris 的 Short Key Index 是稀疏索引，每个 Index Item 记录的是对应 Block（默认 1024 行）第一行的 Key。
+        // 即使 lower_bound 匹配到了 Block $N$，目标 Key 依然可能落位于 Block $N-1$ 的后半部分。为了不漏过边界数据，起始块强制往回推退 1 个 Block。
         if (start_block_id > 0) {
             start_block_id--;
         }
@@ -1780,7 +1903,7 @@ Status SegmentIterator::_lookup_ordinal_from_sk_index(const RowCursor& key, bool
         start_block_id = sk_index_decoder->num_items() - 1;
     }
     rowid_t start = cast_set<rowid_t>(start_block_id) * sk_index_decoder->num_rows_per_block();
-
+    // 阶段一（续）：确定终止范围上限 end
     rowid_t end = upper_bound;
     auto end_iter = sk_index_decoder->upper_bound(index_key);
     if (end_iter.valid()) {
@@ -1788,9 +1911,12 @@ Status SegmentIterator::_lookup_ordinal_from_sk_index(const RowCursor& key, bool
     }
 
     // binary search to find the exact key
+    // 阶段二：针对精确行号的磁盘数据二分查找（精细粒度定位）
     while (start < end) {
         rowid_t mid = (start + end) / 2;
+        // 解压并定位到物理第 mid 行的数据 Page
         RETURN_IF_ERROR(_seek_and_peek(mid));
+        // 将待查 key 与 mid 行真实存储的前缀 Key 列进行逐字节比较。
         int cmp = _compare_short_key_with_seek_block(key, key_col_ids);
         if (cmp > 0) {
             start = mid + 1;
@@ -2878,17 +3004,20 @@ Status SegmentIterator::copy_column_data_by_selector(IColumn* input_col_ptr,
     output_col->reserve(select_size);
     return input_col_ptr->filter_by_selector(sel_rowid_idx, select_size, output_col.get());
 }
-
+// Apache Doris BE 中 存储引擎数据读取（Scan）与谓词过滤（Filtering）最核心的物理执行流程（Execution Core）
+// 完整实现了存储引擎层的 延迟物化（Lazy Materialization）、谓词列与非谓词列分级读取（Multi-stage Reading）、向量化/短路谓词评估（Vectorized & Short-Circuit Predicate Evaluation），
+// 以及 虚拟列/索引分级推导（Virtual Column / Match Project Materialization）。
+// 整体执行顺序遵循“先读少量谓词列剪枝行号，过滤后再按需提取非谓词列（数据列）”的延迟物化思想：
 Status SegmentIterator::_next_batch_internal(Block* block) {
     SCOPED_CONCURRENCY_COUNT(ConcurrencyStatsManager::instance().segment_iterator_next_batch);
-
+    // 内存重用（mem_reuse）：Doris 存储引擎为了极力减少 JVM/C++ 堆内存分配与 GC 压力，要求上层传入的 Block 必须复用底层的 Column Buffer。
     bool is_mem_reuse = block->mem_reuse();
     DCHECK(is_mem_reuse);
-
+    // 真正触发索引裁剪（ZoneMap, BloomFilter, Inverted Index 等），生成最终待扫描的物理行号集合（_row_bitmap）
     RETURN_IF_ERROR(_lazy_init(block));
 
     SCOPED_RAW_TIMER(&_opts.stats->block_load_ns);
-
+    // 自适应 Batch Limit 上限裁剪（TopN / Limit 优化）
     if (_opts.read_limit > 0 && _rows_returned >= _opts.read_limit) {
         return _process_eof(block);
     }
@@ -2896,6 +3025,8 @@ Status SegmentIterator::_next_batch_internal(Block* block) {
     // If the row bitmap size is smaller than nrows_read_limit, there's no need to reserve that many column rows.
     uint32_t nrows_read_limit =
             std::min(cast_set<uint32_t>(_row_bitmap.cardinality()), _opts.block_row_max);
+    // 当下推到 Segment 的查询只有 LIMIT 而没有剩余需要在 SegmentIterator 侧评估的 Filter 时，直接将本批次的读取上限封顶为 cap。
+    // 这极大地优化了单纯 TopN/Limit 查询的磁盘 IO 开销，避免了多余的数据 Page 读取。
     if (_can_opt_limit_reads()) {
         // No SegmentIterator-side conjunct remains to be evaluated, so LIMIT is equivalent before
         // and after filtering. Cap the first read directly; this is the no-conjunct fast path that
@@ -2913,29 +3044,44 @@ Status SegmentIterator::_next_batch_internal(Block* block) {
                     nrows_read_limit, _opts.read_limit);
         }
     })
-
+    // 重置与初始化输出 Block 结构
     RETURN_IF_ERROR(_init_current_block(block, _current_return_columns, nrows_read_limit));
+    // 重置标志位向量，用于记录在当前 Block 读取过程中，有哪些列已经完成过低基数字典编码转换或 Variant 类型转换（防止同一 Block 内重复转换）。
     _converted_column_ids.assign(_schema->columns().size(), false);
 
     _selected_size = 0;
+    // 按索引定位并提取谓词列（数据读取关键）
+    // 这是延迟物化（Lazy Materialization）的第一个物理 IO 动作。
+    // 读取范围：它只读取 _predicate_column_ids 中的列（即 WHERE 条件中涉及到的列，如 age > 18 中的 age 列）。
     RETURN_IF_ERROR(_read_columns_by_index(nrows_read_limit, _selected_size));
+    // MVCC 多版本与时间戳替换（Unique / Aggregate 模型特有）
+    // 在 Doris 的 Unique Key 模型（尤其是 MoW - Merge on Write 或 Sequence 列）或 Aggregate 模型中，如果谓词列中包含了隐式的 Version 列/ Sequence 比较列，此处会用最新的版本号替换当前 Block 中的旧版本数据。
     _replace_version_col_if_needed(_predicate_column_ids, _selected_size);
+    // 在支持 事务/TSO（Timestamp Oracle）的存储场景下，将对应谓词列上的时间戳信息更新为可读可见状态。
     _update_tso_col_if_needed(_predicate_column_ids, _selected_size);
-
+    // 增加加载的 Block 计数。
     _opts.stats->blocks_load += 1;
+    // 累加本次真正从存储层原始读取的行数（用于在 Profile 的 RawRowsRead 中展示）。
     _opts.stats->raw_rows_read += _selected_size;
-
+    // 快速裁剪（Fast-path Return）：如果当前 Segment 数据已经被彻底读完，或者当前 Block 范围内所有数据行都已经全被索引裁剪掉，导致 _selected_size == 0，则直接调用 _process_eof(block) 结束当前 Block 读取。
     if (_selected_size == 0) {
         return _process_eof(block);
     }
-
+    // Apache Doris BE 存储引擎中 SegmentIterator 在向量化（Vectorized）模式下做“谓词过滤（Filtering）与延迟物化数据提取（Lazy Materialization Read）”的核心执行流水线。
+    // 是否需要向量化/短路/复杂表达式评估?
     if (_is_need_vec_eval || _is_need_short_eval || _is_need_expr_eval) {
         _sel_rowid_idx.resize(_selected_size);
 
+        // 向量化（Vectorized）与短路（Short-circuit）谓词评估核心控制逻辑。
         if (_is_need_vec_eval || _is_need_short_eval) {
+            // 如果列数据类型为 String/VARCHAR 且在物理 Page 存储时使用了字典编码（Low Cardinality/Dictionary Encoding），Doris 会将上层传入的字符串谓词（如 city = 'Beijing'）隐式转换为对字典 ID（整数） 的比较。
             _convert_dict_code_for_predicate_if_necessary();
 
             // step 1: evaluate vectorization predicate
+            // Step 1: SIMD 向量化谓词评估（Vectorized Evaluation）
+            // 处理对象：数值类型（Int, Float, Decimal 等）的简单过滤条件（如 a > 10）。
+            // 底层机制：利用 C++ 向量化与 SIMD 指令并行计算生成 Selection Vector（选择位图）。
+            // 作用：将当前批次（Block）中存活的行相对索引写入 _sel_rowid_idx 数组，并更新 _selected_size（缩小计算基数）。
             _selected_size =
                     _evaluate_vectorization_predicate(_sel_rowid_idx.data(), _selected_size);
 
@@ -2943,6 +3089,9 @@ Status SegmentIterator::_next_batch_internal(Block* block) {
             // todo(wb) research whether need to read short predicate after vectorization evaluation
             //          to reduce cost of read short circuit columns.
             //          In SSB test, it make no difference; So need more scenarios to test
+            // Step 2: 动态短路谓词评估（Short-Circuit Evaluation）
+            // 处理对象：变长数据类型、正则表达式、IN 集合过滤或开销较大的标量函数过滤。
+            // 级联效益：前置的 Step 1 已经淘汰了大部分不匹配的行，因此 Step 2 的短路评估仅需要作用于 _sel_rowid_idx 中残存的少数行上，有效节省 CPU 算力。
             _selected_size =
                     _evaluate_short_circuit_predicate(_sel_rowid_idx.data(), _selected_size);
             VLOG_DEBUG << fmt::format("After evaluate predicates, selected size: {} ",
@@ -2952,10 +3101,15 @@ Status SegmentIterator::_next_batch_internal(Block* block) {
                 // when lazy materialization enables, _predicate_column_ids = distinct(_short_cir_pred_column_ids + _vec_pred_column_ids)
                 // see _vec_init_lazy_materialization
                 // todo(wb) need to tell input columnids from output columnids
+                // 输出对齐：当经过 Step 1 和 Step 2 筛选后仍有行存活（_selected_size > 0）时，通过存活索引数组 _sel_rowid_idx 将这些谓词列的真实数据拷贝写入输出 Block 的对应列中。
                 RETURN_IF_ERROR(_output_column_by_sel_idx(block, _predicate_column_ids,
                                                           _sel_rowid_idx.data(), _selected_size));
 
                 // step 3.2: read remaining expr column and evaluate it.
+                // Step 3.2: 复杂通用表达式列的“二次延迟读取与评估”（Common Expr Evaluation）
+                // 延迟提取：如果 SQL 中包含了不能直接在物理存储层下推计算的复合表达式（例如 concat(a, b) = 'xyz'）：
+                // Doris 在此之前完全不读取 a 和 b 列。
+                // 直到 Step 1/2 计算完成且有数据存活时，才调用 _read_columns_by_rowids 根据存活行的物理 RowID 精准提取 _common_expr_column_ids。
                 if (_is_need_expr_eval) {
                     // The predicate column contains the remaining expr column, no need second read.
                     if (_common_expr_column_ids.size() > 0) {
@@ -2973,33 +3127,49 @@ Status SegmentIterator::_next_batch_internal(Block* block) {
                             _process_common_expr(_sel_rowid_idx.data(), _selected_size, block));
                 }
             } else {
+            // 全剪枝 Fast-path (Zero-selected Handle)
+            // 零存活优化：如果 Step 1 或 Step 2 执行后 _selected_size == 0（当前 Block 中的行全被 Filter 过滤掉）：
                 _fill_column_nothing();
                 if (_is_need_expr_eval) {
                     RETURN_IF_ERROR(_process_columns(_common_expr_column_ids, block));
                 }
             }
         } else if (_is_need_expr_eval) {
+        // 当物理层不需要（或无法）执行 SIMD 向量化/短路谓词剪枝时，系统会回退到此逻辑，直接对当前 Block 内的所有行进行表达式求解。
+        // 进入该分支的前提是需要进行表达式评估（_is_need_expr_eval == true），因此表达式所依赖的物理输入列（_predicate_column_ids）绝不能为空。
+        // 如果为空，说明上层 Planner/Optimizer 下推的表达式解析有问题，在 Debug 模式下会直接触发断言崩溃以提醒开发者。
             DCHECK(!_predicate_column_ids.empty());
+            // 将底层列数据输出到 Block 容器
+            // _process_columns：负责将这些原始物理列格式（例如 Run-Length / Bit-Shuffle 编码解压后的列）转换为向量化 Block 所要求的标准 Column 接口形态（如 ColumnVector, ColumnString 等），为后面的 VExpr（向量化表达式）计算提供统一的数据结构。
             RETURN_IF_ERROR(_process_columns(_predicate_column_ids, block));
             // first read all rows are insert block, initialize sel_rowid_idx to all rows.
             for (uint16_t i = 0; i < _selected_size; ++i) {
                 _sel_rowid_idx[i] = i;
             }
+            // 执行通用表达式评估
             RETURN_IF_ERROR(_process_common_expr(_sel_rowid_idx.data(), _selected_size, block));
         }
-
+        // 负责对最终存活的行进行 Limit 截断、稀疏物理读取“非谓词数据列（Non-predicate Columns）”，并更新条件缓存（Condition Cache）与补全延迟剪枝列。
+        // 如果查询包含 LIMIT（例如 SELECT col_a FROM tbl WHERE col_b > 10 LIMIT 5），且经过谓词评估后存活的行数（_selected_size）依然大于剩余需要的 read_limit 行数，该函数会直接将 _selected_size 裁剪压缩到 limit 对应的大小。
         RETURN_IF_ERROR(_apply_read_limit_to_selected_rows(block, _selected_size));
 
         // step4: read non_predicate column
+        // 非谓词数据列的按需稀疏读取（Late Materialization Core）
+        // 延迟物化真正的性能爆发点：_non_predicate_columns 指的是仅出现在 SELECT 目标列表中、但未参与任何 WHERE 谓词过滤的数据列（例如超大文本 comment 列）
         if (_selected_size > 0) {
             if (!_non_predicate_columns.empty()) {
+                // 传入了存活行下标 _sel_rowid_idx.data() 和最终存活行数 _selected_size。
+                // 机制：它只去磁盘读取这 _selected_size 行数据所在的 Data Page（点查/跳跃式 Page 提取），完全跳过了那些被过滤掉的几万/几十万行数据，极大地节省了磁盘 IO 吞吐与内存解压开销。
                 RETURN_IF_ERROR(_read_columns_by_rowids(
                         _non_predicate_columns, _block_rowids, _sel_rowid_idx.data(),
                         _selected_size, &_current_return_columns,
                         _opts.condition_cache_digest && !_find_condition_cache, false));
+                // 针对刚读出的非谓词列，补充 Unique/Aggregate 模型的 MVCC 版本号与 TSO 时间戳修正。
                 _replace_version_col_if_needed(_non_predicate_columns, _selected_size);
                 _update_tso_col_if_needed(_non_predicate_columns, _selected_size);
             } else {
+            // 触发场景：当前查询没有需要读取的非谓词列（例如 SELECT count(*) WHERE ... 或只查谓词列），但启用了条件缓存（Condition Cache）。
+            // 作用机制：通过物理 rowid 计算出对应的 Cache Offset，将该 Segment 内匹配当前条件行的 Block 粒度缓存位置置为 true。后续重复/相似查询可以直接复用该 Cache，跳过对底层物理索引和谓词的二次计算。
                 if (_opts.condition_cache_digest && !_find_condition_cache) {
                     auto& condition_cache = *_condition_cache;
                     for (size_t i = 0; i < _selected_size; ++i) {
@@ -3009,15 +3179,21 @@ Status SegmentIterator::_next_batch_internal(Block* block) {
                 }
             }
         }
-
+        // 对于动态 Schema 类型（如 Variant / JSON 列）或复杂的 Complex/Nested 嵌套数据类型，为了进一步提升性能，部分子列的提取会被推迟到最后阶段。
         RETURN_IF_ERROR(_read_lazy_pruned_columns(block));
     }
 
     // step5: output columns
+    // 在经历了前面的谓词列过滤、数据列延迟物化提取之后，这段代码负责将非谓词列写回 Block、将倒排索引匹配结果/打分转为虚拟列、完成虚拟列物化、更新返回行数计数，并对最终输出的 Block 进行合规性检查。
+    // 将提取的非谓词列数据填充/写回 Block
     RETURN_IF_ERROR(_output_non_pred_columns(block));
     // Convert inverted index bitmaps to result columns for virtual column exprs
     // (e.g., MATCH projections). This must run before _materialization_of_virtual_column
     // so that fast_execute() can find the pre-computed result columns.
+
+    // 倒排索引结果转虚拟列（Inverted Index Bitmap / Match Projection）
+    // 核心背景：在全文检索/倒排索引场景下，用户可能会在 SELECT 目标列表中直接投影 MATCH 的匹配结果（例如相关性打分 Score、高亮位置或匹配标志位）。
+    // 作用：根据前面的选择集位图（sel_rowid_idx）和存活行数 _selected_size，把倒排索引推导出的内存位图/匹配数据预先转化为真实的 Result Column 并填入 Block，供后续表达式的 fast_execute() 快速提取使用。
     if (!_virtual_column_exprs.empty()) {
         bool use_sel = _is_need_vec_eval || _is_need_short_eval || _is_need_expr_eval;
         uint16_t* sel_rowid_idx = use_sel ? _sel_rowid_idx.data() : nullptr;
@@ -3028,6 +3204,8 @@ Status SegmentIterator::_next_batch_internal(Block* block) {
         }
         _output_index_result_column(vir_ctxs, sel_rowid_idx, _selected_size);
     }
+    // 虚拟列物化（Virtual Column Materialization）
+    // 针对虚拟列（Virtual Columns，例如由表达式派生出的非物理持久化列、全文检索得分列、或 Variant 提取的动态虚拟字段），在此处调用表达式上下文进行物化计算，将其转化为标准 Column 追加到 block 中。
     RETURN_IF_ERROR(_materialization_of_virtual_column(block));
     if (_opts.read_limit > 0) {
         _rows_returned += block->rows();
