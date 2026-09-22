@@ -82,16 +82,28 @@ import java.util.stream.Collectors;
  * this node, ie, they only reference tuples materialized by this node or one of
  * its children (= are bound by tupleIds).
  */
+// Apache Doris FE（Frontend）模块中的 PlanNode 类是物理执行计划/逻辑算子树节点的核心抽象基类。
+// 继承自通用树节点 TreeNode<PlanNode>，代表查询执行计划树（Plan Tree）中的一个关系算子（如 Scan、Join、Aggregate、Project、Exchange 等）
+// 执行计划树的抽象基类：定义了所有执行计划节点通用的属性（如节点 ID、Tuple ID、Limit、谓词列表、统计信息等）和行为。
+// 连接 FE 优化器与 BE 执行引擎的桥梁：
+// 元数据与统计信息：在 FE 侧计算算子的 Cardinality（基数）、Data Distribution（数据分布）和 Parallelism（并发度/Instance数）。
+// Thrift 序列化：通过 treeToThrift() 和 toThrift() 方法，将 FE 生成的 Java 对象树转换（序列化）为 Thrift 数据结构（TPlan / TPlanNode），下发给 BE（Backend）执行。
+// 下推谓词与 Project 映射：维护当前算子需要执行的过滤谓词（conjuncts）以及列裁剪/投影表达式（projectList）。
+// 支持 Runtime Filter 与 Local Exchange：作为运行时动态过滤（RF）和分布式/本地 Shuffle 交换算子的挂载节点。
 public abstract class PlanNode extends TreeNode<PlanNode> {
+    // 算子节点的名称，如 "HASH JOIN"、"OlapScanNode" 等。构造函数中会自动加上 "V" 前缀（代表 Vectorized 向量化执行引擎）。
     protected String planNodeName;
-
+    // 作用：在整个 Plan Tree 内唯一的节点 ID，由 Planner 统一分配。
     protected PlanNodeId id;  // unique w/in plan tree; assigned by planner
+    // 当前节点输出的最大行数限制（LIMIT）。-1 代表无限制。
     protected long limit; // max. # of rows to be returned; 0: no limit
+    // 跳过的行数偏移量（OFFSET）。
     protected long offset;
 
     // ids materialized by the tree rooted at this node
+    // 当前节点及其子树所物化（Materialize）出来的 Tuple ID 列表
     protected ArrayList<TupleId> tupleIds;
-
+    // 当前节点绑定的过滤谓词列表（条件之间为 AND 关系）。
     protected List<Expr> conjuncts = Lists.newArrayList();
 
     // Conjuncts used to filter the original load file.
@@ -104,23 +116,28 @@ public abstract class PlanNode extends TreeNode<PlanNode> {
     //  2. Filter data by using "preFilterConjuncts".
     //  3. Do column mapping and transforming.
     //  4. Filter data by using "conjuncts".
+    // 导入/加载（Load）计划中使用的预过滤谓词。在数据进行列转换映射之前直接对原始文件内容进行过滤。
     protected List<Expr> preFilterConjuncts = Lists.newArrayList();
 
     // Fragment that this PlanNode is executed in. Valid only after this PlanNode has been
     // assigned to a fragment. Set and maintained by enclosing PlanFragment.
+    // 当前 PlanNode 所归属的执行分片（PlanFragment）。
     protected PlanFragment fragment;
 
     // estimate of the output cardinality of this node; set in computeStats();
     // invalid: -1
+    // 估计的当前算子输出行数（基数）。-1 表示无效或未计算。
     protected long cardinality;
-
+    // 在应用了 Runtime Filter 等过滤条件后，估计剩余的输出行数。
     protected long cardinalityAfterFilter = -1;
 
     // number of nodes on which the plan tree rooted at this node would execute;
     // set in computeStats(); invalid: -1
+    // 该节点及其子树预计在多少个 BE 节点上并行执行。-1 表示无效。
     protected int numNodes;
 
     // sum of tupleIds' avgSerializedSizes; set in computeStats()
+    // 单行数据的平均序列化字节大小（等于涉及 Tuple 的 avgSerializedSizes 之和）。
     protected float avgRowSize;
 
     // Most of the plan node has the same numInstance as its (left) child, except some special nodes, such as
@@ -129,26 +146,34 @@ public abstract class PlanNode extends TreeNode<PlanNode> {
     // 3. union node, whose numInstance is the sum of its children's numInstance
     // ...
     // only special nodes need to call setNumInstances() and getNumInstances() from attribute numInstances
+    // 当前算子在 BE 侧运行的并行 Instance（实例）数量。
     protected int numInstances;
 
     // Runtime filters assigned to this node.
+    // 分配/挂载到当前节点的 Runtime Filter 动态过滤条件列表。
     protected List<RuntimeFilter> runtimeFilters = new ArrayList<>();
-
+    // 当前节点输出的 Slot ID 列表（用于控制传递给上层算子的列）。
     protected List<SlotId> outputSlotIds;
-
+    // 当前节点最终输出的 Tuple 描述符。
     protected TupleDescriptor outputTupleDesc;
+    // 最终的投影表达式列表，对应 outputTupleDesc 的各个 Slot。
     protected List<Expr> projectList;
+    // 多层 Projection 转换过程中的中间输出 Tuple 描述符列表。
     private final List<TupleDescriptor> intermediateOutputTupleDescList = Lists.newArrayList();
+    // 多层 Projection 转换过程中的中间投影表达式列表。
     private final List<List<Expr>> intermediateProjectListList = Lists.newArrayList();
-
+    // 在 Doris 新优化器 Nereids 中对应的 Logical/Physical Plan ID（默认为 -1），用于新旧优化器体系的 ID 映射。
     protected int nereidsId = -1;
 
     // Per-child hash-distribution key exprs: childrenDistributeExprLists.get(i) is the expr list
     // used to (re)partition this node's i-th child's input — consumed by getChildDistributeExprList()
     // when deriving local-exchange keys.
+    // 各个子节点的 Hash 分布/分区 Key 表达式列表。
+    // childrenDistributeExprLists.get(i) 对应第 i 个子节点的重分区 Key。
     protected List<List<Expr>> childrenDistributeExprLists = new ArrayList<>();
     // This node's own output hash-distribution key exprs — serialized to BE for its LocalExchange /
     // shuffle (see distributeExprLists()).
+    // 当前节点自身输出数据的 Hash 分布 Key 表达式列表（用于 BE 侧 LocalExchange 或 Shuffle）。
     protected List<Expr> distributeExprLists = new ArrayList<>();
 
     protected PlanNode(PlanNodeId id, List<TupleId> tupleIds, String planNodeName) {
@@ -463,6 +488,7 @@ public abstract class PlanNode extends TreeNode<PlanNode> {
     }
 
     // Convert this plan node, including all children, to its Thrift representation.
+    // 将以当前节点为根的完整 Plan Tree 转换为 Thrift 的 TPlan 对象。
     public TPlan treeToThrift() {
         TPlan result = new TPlan();
         treeToThriftHelper(result);
@@ -470,6 +496,8 @@ public abstract class PlanNode extends TreeNode<PlanNode> {
     }
 
     // Append a flattened version of this plan node, including all children, to 'container'.
+    // treeToThrift 的递归辅助函数。将当前节点的信息填充到 TPlanNode 消息中（包括 Node ID、Limit、Tuple IDs、Conjuncts、Runtime Filters、Projections、Distribution Exprs 等），
+    // 调用抽象方法 toThrift(msg) 补充子类属性，并递归处理子节点（ExchangeNode 除外，其子节点在不同 Fragment 中）。
     private void treeToThriftHelper(TPlan container) {
         TPlanNode msg = new TPlanNode();
         msg.node_id = id.asInt();
@@ -558,6 +586,7 @@ public abstract class PlanNode extends TreeNode<PlanNode> {
 
     // Convert this plan node into msg (excluding children), which requires setting
     // the node type and the node-specific field.
+    // 将各自特有的算子属性（如 HashJoin 类型的 Join 条件、Scan 节点的 Table 信息等）填充到 Thrift 的 TPlanNode 结构体中。
     protected abstract void toThrift(TPlanNode msg);
 
     public TNormalizedPlanNode normalize(Normalizer normalizer) {
@@ -767,10 +796,11 @@ public abstract class PlanNode extends TreeNode<PlanNode> {
     public void setCardinalityAfterFilter(long cardinalityAfterFilter) {
         this.cardinalityAfterFilter = cardinalityAfterFilter;
     }
-
+    // 下推到 Scan 节点的无分组聚合操作类型（如 COUNT / MAX / MIN 下推到存储引擎）。默认为 TPushAggOp.NONE。
     protected TPushAggOp pushDownAggNoGroupingOp = TPushAggOp.NONE;
     // Explicit COUNT arguments. COUNT(*)/COUNT(1) intentionally keep this empty even though
     // column pruning retains one placeholder scan slot.
+    // 下推 COUNT(col) 操作时显式指定的 Slot ID 列表。
     protected List<SlotId> pushDownCountSlotIds = Collections.emptyList();
 
     public void setPushDownAggNoGrouping(TPushAggOp pushDownAggNoGroupingOp) {

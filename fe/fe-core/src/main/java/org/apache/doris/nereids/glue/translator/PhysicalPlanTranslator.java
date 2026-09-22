@@ -258,6 +258,14 @@ import java.util.stream.Stream;
  * Must always visit plan's children first when you implement a method to translate from PhysicalPlan to PlanNode.
  * </STRONG>
  */
+// 物理执行计划翻译（Plan Translation）：
+// Nereids 生成的物理计划树（PhysicalPlan）是一棵由逻辑/物理算子节点构成的抽象树。
+// PhysicalPlanTranslator 采用访问者模式（Visitor Pattern）遍历这棵物理计划树，将其翻译为 Doris BE 执行引擎能够直接执行的分布式执行片段树（PlanFragment 树，内部包含具体的 PlanNode 和 DataSink）。
+// 重用旧引擎执行管道（Legacy Planner Compatibility）：
+// 为了复用 Doris 现有的分布式 Fragment 调度、Runtime Filter 传递以及各类 DataSink 逻辑，Translator 将抽象的 PhysicalPlan 转换为旧版 Planner 体系下的 PlanNode（如 ExchangeNode、AggregationNode 等）和 PlanFragment。
+// 分配资源与元数据映射：
+// 在翻译过程中，负责分配 PlanNodeId、FragmentId、TupleDescriptor，以及将表达式（Expression）转换为旧版的 Expr（例如通过 ExpressionTranslator）。
+
 public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, PlanTranslatorContext> {
 
     private static final Logger LOG = LogManager.getLogger(PhysicalPlanTranslator.class);
@@ -283,6 +291,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
      * @param physicalPlan Nereids Physical Plan tree
      * @return Stale Planner PlanFragment tree
      */
+    // 整个物理计划翻译的触发入口。
     public PlanFragment translatePlan(PhysicalPlan physicalPlan) {
         PlanFragment rootFragment = physicalPlan.accept(this, context);
         if (CollectionUtils.isEmpty(rootFragment.getOutputExprs())) {
@@ -321,17 +330,28 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
     /* ********************************************************************************************
      * distribute node
      * ******************************************************************************************** */
-
+    // 将 Nereids 中的物理数据分发节点（PhysicalDistribute）翻译为旧版执行引擎中的 ExchangeNode，并完成 PlanFragment 的切分与连接。
+    // 核心职责是：处理物理计划中的数据重分布节点（PhysicalDistribute），在此建立 Fragment 的分布式切分边界，将其翻译为接收端的 ExchangeNode 和发送端的 DataStreamSink，并构建全新的下游 Fragment。
+    // PhysicalDistribute<? extends Plan> distribute  输入的物理重分布算子节点。它描述了数据在节点间如何流动/洗牌（Shuffle、Gather、Broadcast、Bucket Shuffle 等）以及需要的目标数据分布规格（DistributionSpec）。
+    // PlanTranslatorContext context  计划翻译器上下文对象。用于在翻译过程中维护全局状态（例如生成递增的 PlanNodeId、FragmentId、注册/获取生成好的 PlanFragment，以及维护 CTE 和 Runtime Filter 的映射状态等）。
     @Override
     public PlanFragment visitPhysicalDistribute(PhysicalDistribute<? extends Plan> distribute,
             PlanTranslatorContext context) {
+        // 递归翻译上游计划并获取分布表达式
+        // 获取 PhysicalDistribute 节点的子节点（即数据发送端/上游物理算子）。
+        // 在物理计划中它们是父子关系，但经过重分布后，它们将被切割到不同的 PlanFragment 中。
         Plan upstream = distribute.child(); // now they're in one fragment but will be split by ExchangeNode.
+        // 采用 Accessor/Visitor 模式递归翻译上游子树。这一步会返回上游已构建好的 upstreamFragment（包含上游的执行节点树）。
         PlanFragment upstreamFragment = upstream.accept(this, context);
+        // 获取上游节点原本的数据分布表达式列表（例如 Hash 分区的 Key 列表达式），用于后续设置 ExchangeNode 的子节点分布属性。
         List<List<Expr>> upstreamDistributeExprs = getDistributeExprs(upstream);
-
+        // 获取当前重分布算子期望达到的目标分布规格（如 Hash 分布、单节点汇聚 Gather、广播 Broadcast 等）。
         DistributionSpec targetDistribution = distribute.getDistributionSpec();
 
         // TODO: why need set streaming here? should remove this.
+        // 检查上游 Fragment 的根节点是否为聚合节点，且上游物理算子是否为 Local 阶段（AggPhase.LOCAL）的哈希聚合。
+        // 如果满足条件，将 PhysicalHashAggregate 的流式优化标志（isMaybeUsingStream）传递给执行层的 AggregationNode。
+        // 开启后，如果本地预聚合效果不好（基数高），BE 节点会直接将数据流式透传给 Exchange，避免维护庞大的本地 Hash 表。
         if (upstreamFragment.getPlanRoot() instanceof AggregationNode && upstream instanceof PhysicalHashAggregate) {
             PhysicalHashAggregate<?> hashAggregate = (PhysicalHashAggregate<?>) upstream;
             if (hashAggregate.getAggPhase() == AggPhase.LOCAL
@@ -341,9 +361,14 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             }
         }
         // all PhysicalDistribute translate to ExchangeNode. upstream as input.
+        // 创建接收端节点 ExchangeNode。它需要一个全新的全局唯一 PlanNodeId，并将上游 Fragment 的根节点作为其输入模型参照。
         ExchangeNode exchangeNode = new ExchangeNode(context.nextPlanNodeId(), upstreamFragment.getPlanRoot());
+        // 将新建的 ExchangeNode ID 与 Nereids 物理重分布算子建立映射关系，方便分析与 Debug 跟踪。
         updateLegacyPlanIdToPhysicalPlan(exchangeNode, distribute);
+        // 获取当前重分布节点输出的合法表达式 ID 列表。
         List<ExprId> validOutputIds = distribute.getOutputExprIds();
+        // 如果上游是哈希聚合，必须显式把分组列（Group By Keys）的 ExprId 补全到输出列表的最前面。
+        // 因为跨网络 Shuffle 传输后，下游的 Global Aggregation 阶段必须依赖分组 Key 来汇总本地聚合的结果。
         if (upstream instanceof PhysicalHashAggregate) {
             // we must add group by keys to output list,
             // otherwise we could not process aggregate's output without group by keys
@@ -355,6 +380,10 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             keys.addAll(validOutputIds);
             validOutputIds = keys;
         }
+        // 处理 CTE 广播/多路复用（MultiCast）上游投影
+        // 当上游 Fragment 是 CTE 多路复用片段（MultiCastPlanFragment，即一个 CTE 生产的数据被多个 Consumer 消费）时：
+        // 获取当前消费分支对应的 DataStreamSink。
+        // 如果上游没有显示 Project 节点，需要手动建立 PhysicalCTEConsumer 消费端 Slot 与 Producer 生产端 Slot 的表达式映射，并在 Sink 端设置 Projection 表达式与 Tuple Descriptor，确保发出的数据 Tuple 结构与 Consumer 要求匹配。
         if (upstreamFragment instanceof MultiCastPlanFragment) {
             // TODO: remove this logic when we split to multi-window in logical window to physical window conversion
             MultiCastDataSink multiCastDataSink = (MultiCastDataSink) upstreamFragment.getSink();
@@ -373,13 +402,25 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             }
         }
         // target data partition
+        // 目标数据分区计算与 ExchangeNode 属性设置
+        // 将物理层面的 DistributionSpec（如 HashDistributionSpec）转换为具体的执行层 DataPartition（定义了具体的 Hash 算法、分区列、Bucket 数量等）。
         DataPartition targetDataPartition = toDataPartition(targetDistribution, validOutputIds, context);
+        // 为 ExchangeNode 设置分区类型（如 UNPARTITIONED、RANDOM、HASH_PARTITIONED），以及当前节点和子节点的分布表达式。
         exchangeNode.setPartitionType(targetDataPartition.getType());
         exchangeNode.setDistributeExprLists(getDistributeExpr(distribute));
         exchangeNode.setChildrenDistributeExprLists(upstreamDistributeExprs);
         // its source partition is targetDataPartition. and outputPartition is UNPARTITIONED now, will be set when
         // visit its SinkNode
+        // 构建下游 Fragment 及并发度（Instances）计算
+        // 创建全新的下游 PlanFragment。
+        // 该 Fragment 拥有新的全局唯一 FragmentId；
+        // 根节点（PlanRoot）即为刚刚创建的 exchangeNode；
+        // 该 Fragment 内部的数据源分布（DataPartition）即为 targetDataPartition。
         PlanFragment downstreamFragment = new PlanFragment(context.nextFragmentId(), exchangeNode, targetDataPartition);
+        // 根据分布类型设置 ExchangeNode 的并行实例数（numInstances）：
+        // Gather / StorageGather：数据汇总到一个节点处理（例如最终的结果汇总），实例数强制设为 1。
+        // AllSingleton：需要运行在所有节点（如广播单例场景），实例数设置为集群中存活的 BE 节点数量。
+        // 其他（Hash / Random 等）：继承上游 PlanRoot 的并行度/实例数。
         if (targetDistribution instanceof DistributionSpecGather
                 || targetDistribution instanceof DistributionSpecStorageGather) {
             // gather to one instance
@@ -396,6 +437,11 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         }
 
         // process multicast sink
+        // 连接上游与下游 Fragment（构建数据传输通道）
+        // 分支一：CTE 多路由/MultiCast 绑定
+        // 将 dataStreamSink 的目标 ExchangeNode ID 设置为当前 exchangeNode.getId()，输出分区设置为 targetDataPartition。
+        // 建立 Fragment 的父子/拓扑依赖关系（downstreamFragment.addChild(...)）。
+        // 更新上下文中的 CTEScanNode 绑定关系，并注册 Runtime Filter Translator 映射，确保运行时过滤器（Runtime Filter）能准确推送到 CTE DataSink。
         if (upstreamFragment instanceof MultiCastPlanFragment) {
             MultiCastDataSink multiCastDataSink = (MultiCastDataSink) upstreamFragment.getSink();
             DataStreamSink dataStreamSink = multiCastDataSink.getDataStreamSinks().get(
@@ -414,6 +460,11 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                     runtimeFilterTranslator.getContext().getPlanNodeIdToCTEDataSinkMap()
                             .put(cteScanNode.getId(), dataStreamSink));
         } else {
+        // 分支二：常规单路由管道绑定
+        // 注释清晰地解释了切分过程：将原本在一个 Fragment 里的算子，切分为通过网络通信的两个 Fragment。
+        // 将 upstreamFragment 的目标接收者指定为 exchangeNode。
+        // 设置 upstreamFragment 的输出数据分区为 targetDataPartition。
+        // 在上游 Fragment 的顶部挂载一个 DataStreamSink，其目标指向 exchangeNode.getId()，这样上游 BE 节点执行完后就会通过网络将数据 Stream 到 ExchangeNode。
             /*
              * FragmentA (NodeA) ---> FragmentB (NodeB)
              * ↓
@@ -427,7 +478,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             streamSink.setOutputPartition(targetDataPartition);
             upstreamFragment.setSink(streamSink);
         }
-
+        // 注册并返回下游 Fragment
         context.addPlanFragment(downstreamFragment);
         return downstreamFragment;
     }
@@ -461,7 +512,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         rootFragment.setSink(sink);
         return rootFragment;
     }
-
+    // 处理查询结果集的返回（如返回给 MySQL 客户端或 Arrow 格式），为根 Fragment 挂载 ResultSink。
     @Override
     public PlanFragment visitPhysicalResultSink(PhysicalResultSink<? extends Plan> physicalResultSink,
             PlanTranslatorContext context) {
@@ -487,7 +538,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         rootFragment.setSink(sink);
         return rootFragment;
     }
-
+    // 处理 Doris 内置 OLAP 表的数据写入/导入（如 INSERT INTO）。
     @Override
     public PlanFragment visitPhysicalOlapTableSink(PhysicalOlapTableSink<? extends Plan> olapTableSink,
             PlanTranslatorContext context) {
@@ -543,7 +594,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
 
         return rootFragment;
     }
-
+    // 处理外表（如 Iceberg）的行级 DML 操作（DELETE / MERGE / UPDATE）
     @Override
     public PlanFragment visitPhysicalExternalRowLevelDeleteSink(
             PhysicalExternalRowLevelDeleteSink<? extends Plan> deleteSink, PlanTranslatorContext context) {
@@ -650,7 +701,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                 providerTableHandle, connectorColumns, connectorColumns, null, writeOperation,
                 requireMergeCardinalityCheck, boundWriteMetadataIdentity, metadata);
     }
-
+    // 处理外表 Connector（如 Iceberg, MaxCompute, JDBC 等）的数据写入。
     @Override
     public PlanFragment visitPhysicalConnectorTableSink(
             PhysicalConnectorTableSink<? extends Plan> connectorTableSink,
@@ -3486,11 +3537,16 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         }
         return false;
     }
-
+    // 提取并转换传入的一个或多个物理子计划（Child Plan）的数据分布表达式（Distribution Expressions），
+    // 用于构建上层算子（如 DataSink、Join 或 Exchange Node）之间的数据 Shuffle 或分片逻辑。
+    // Plan... plans：  含义：表示一个或多个子物理计划节点（通常是当前物理算子的子节点，如 HashJoinNode 的左子节点和右子节点）。
     private List<List<Expr>> getDistributeExprs(Plan... plans) {
         List<List<Expr>> distributeExprLists = Lists.newArrayList();
+        // 遍历可变参数数组 plans 中的每一个子计划节点 child
         for (Plan child : plans) {
+            // 提取当前子计划的分布规格属性。
             DistributionSpec spec = ((PhysicalPlan) child).getPhysicalProperties().getDistributionSpec();
+            // 解析并收集单个节点的分布表达式
             distributeExprLists.add(getDistributeExpr(child.getOutputExprIds(), spec));
         }
         return distributeExprLists;
@@ -3505,8 +3561,11 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         }
         return getDistributeExpr(physicalPlan.getOutputExprIds(), props.getDistributionSpec());
     }
-
+    // 根据传入的分布式规格（DistributionSpec），在指定的子节点输出列集合中，解析并匹配出用于数据 Hash 分片（Data Shuffle / Partition）的具体物理槽位引用（SlotRef 表达式）。
+    // List<ExprId> childOutputIds：  含义：当前子计划节点（Child Plan）实际能够输出的列标识列表（ExprId 是 Doris 内部为每一个表达式/列分配的唯一长整型 ID）。
+    // DistributionSpec spec：记录了数据在物理上是如何分布的（例如：是以哪些列做 Hash 分布，还是 Gather/Replicated 模式）。
     private List<Expr> getDistributeExpr(List<ExprId> childOutputIds, DistributionSpec spec) {
+        // 判断是否为 Hash 分布规格
         if (spec instanceof DistributionSpecHash) {
             DistributionSpecHash distributionSpecHash = (DistributionSpecHash) spec;
             List<Expr> partitionExprs = Lists.newArrayList();

@@ -54,19 +54,36 @@ import java.util.stream.Collectors;
 /**
  * Aggregation computation.
  */
+// AggregationNode 代表分布式执行计划中的聚合计算节点（在向量化引擎中对应 BE 端的 VAGGREGATE 算子）。
+// 聚合算子建模：基于优化器传入的 AggregateInfo，定义 GROUP BY 列、聚合函数（如 SUM, COUNT, AVG）、HAVING 过滤条件以及排序规则（SortInfo）。
+// 多阶段分布式聚合调度：支持两阶段/多阶段分布式聚合策略。通过控制 needsFinalize（是否是最终输出阶段）和 aggInfo.isMerge()（是否处理中间聚合状态/序列化数据），
+//  配合预聚合（Pre-aggregation）和流式聚合（Streaming Aggregation）来优化大数据量 Shuffle 性能。
+// 序列化与 Thrift 转换：将 FE 生成的物理聚合计划翻译转换为 Thrift 结构体（TAggregationNode），下发给后端 BE 节点构建具体的 C++ 算子（如 AggSinkOperatorX / StreamingAggOperatorX / DistinctStreamingAggOperatorX）。
+// 并发与本地数据分布推导（Local Exchange）：针对 Pipeline 执行引擎，实现 enforceAndDeriveLocalExchange，推导节点间是否需要插入 Hash 或 Passthrough 类型的 Local Exchange（并行度交换/本地 Shuffle）以保障正确性与发挥最大并行能
 public class AggregationNode extends PlanNode {
+    // 聚合元数据对象。
+    // 包含当前聚合节点所需的所有表达式，包括分组表达式列表（groupingExprs）、聚合函数表达式列表（aggregateExprs）以及输出 Tuple 描述符等。
     private final AggregateInfo aggInfo;
 
     // Set to true if this aggregation node needs to run the Finalize step. This
     // node is the root node of a distributed aggregation.
+    // 是否为 Finalize 阶段（最终计算阶段）。
+    // • true：表示该节点是分布式聚合的根节点，需要执行 finalize() 操作（将中间状态转化为最终的聚合列值并输出）。
+    // • false：表示该节点只进行局部预聚合或中间 Merge，输出的是序列化后的中间聚合状态（Serialize）。
     private boolean needsFinalize;
+    // 是否为 Colocate 聚合。
+    // 标识该聚合是否属于 Colocate Join / Colocate Agg 场景（即数据在 Backend 上已经按照 Group Key 完成了物理分布，无需重新 Shuffle）。
     private boolean isColocate = false;
 
     // If true, use streaming preaggregation algorithm. Not valid if this is a merge agg.
+    // 是否使用流式预聚合算法（Streaming Pre-aggregation）。
+    // 用于一阶段局部预聚合。开启后，数据不会构建大的 Hash 表，而是以流水线（Streaming）方式快速规约，如果 Hash 冲突率高则直接 Passthrough 下发，能极大节省内存和降低延迟。
     private boolean useStreamingPreagg;
-
+    // 按 Group Key 排序的信息。
+    // 当聚合操作后续需要按照 Group By 的列进行排序输出，或者使用了某些支持流式/排序输入的聚合优化时，存放相关的排序元素（Order Elements）。
     private SortInfo sortByGroupKey;
-
+    // 是否为 Query Cache（查询缓存）候选节点。
+    // 标识该聚合节点及其生成的中间/最终结果是否符合放入 Doris 查询缓存的条件。
     private boolean queryCacheCandidate;
 
     /**
@@ -94,10 +111,12 @@ public class AggregationNode extends PlanNode {
     }
 
     // Used by new optimizer
+    // 设置是否启用流式预聚合（useStreamingPreagg）。通常由优化器（如 Nereids）在推导物理计划时调用。
     public void setUseStreamingPreagg(boolean useStreamingPreagg) {
         this.useStreamingPreagg = useStreamingPreagg;
     }
-
+    // 依据当前节点的聚合属性（aggInfo.isMerge() 与 needsFinalize）动态更新节点在 Explain 和日志中显示的名称。
+    // 固定前缀：VAGGREGATE (（V 代表 Vectorized 向量化）。
     private void updateplanNodeName() {
         StringBuilder sb = new StringBuilder();
         sb.append("VAGGREGATE");
@@ -115,7 +134,7 @@ public class AggregationNode extends PlanNode {
         sb.append(")");
         setPlanNodeName(sb.toString());
     }
-
+    // 将当前 Java 物理计划节点转换为 Thrift 结构体 TPlanNode，这是下发给 BE Backend 节点的通信对象。
     @Override
     protected void toThrift(TPlanNode msg) {
         aggInfo.updateMaterializedSlots();
@@ -153,7 +172,7 @@ public class AggregationNode extends PlanNode {
             msg.agg_node.setGroupingExprs(ExprToThriftVisitor.treesToThrift(groupingExprs));
         }
     }
-
+    // 规整化（Normalize）聚合节点，主要用于复用查询缓存（Query Cache）的抽象计划匹配。
     @Override
     public void normalize(TNormalizedPlanNode normalizedPlan, Normalizer normalizer) {
         TNormalizedAggregateNode normalizedAggregateNode = new TNormalizedAggregateNode();
@@ -177,7 +196,7 @@ public class AggregationNode extends PlanNode {
             normalizedAggregateNode.setSortInfo(sortByGroupKey.toThrift());
         }
     }
-
+    // 规范化当前聚合节点的 Output Project（投影列）。
     @Override
     protected void normalizeProjects(TNormalizedPlanNode normalizedPlanNode, Normalizer normalizer) {
         List<SlotDescriptor> outputSlots =
@@ -248,6 +267,8 @@ public class AggregationNode extends PlanNode {
     }
 
     // If `GroupingExprs` is empty and agg need to finalize, the result must be output by single instance
+    // 判断当前节点是否是一个必须单线程/单实例（Serial）运行的节点。
+    // 如果 groupingExprs 为空（即标量聚合 SELECT SUM(a) FROM t，没有 Group By）且 needsFinalize 为 true，则返回 true。因为全局无 Group By 的最终聚合结果必须汇总到一个节点上输出
     @Override
     public boolean isSerialNode() {
         return aggInfo.getGroupingExprs().isEmpty() && needsFinalize;
@@ -273,6 +294,7 @@ public class AggregationNode extends PlanNode {
         this.queryCacheCandidate = queryCacheCandidate;
     }
 
+    // 在分布式执行计划建立后，为当前聚合节点与其子节点之间推导并强制插入（Enforce）合适的 LocalExchangeNode（用于 Backend 节点内多线程间的并行数据 Shuffle/Passthrough）。
     @Override
     public Pair<PlanNode, LocalExchangeType> enforceAndDeriveLocalExchange(
             PlanTranslatorContext translatorContext, PlanNode parent, LocalExchangeTypeRequire parentRequire) {
@@ -402,7 +424,7 @@ public class AggregationNode extends PlanNode {
         }
         return Lists.newArrayList(aggInfo.getGroupingExprs());
     }
-
+    // 判断当前聚合算子为了计算正确性，是否要求上游输入数据必须按 Hash 分布。
     @Override
     public boolean requiresShuffleForCorrectness() {
         // Mirrors BE's AggSinkOperatorX::is_shuffled_operator() exactly:

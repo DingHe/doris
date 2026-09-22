@@ -39,8 +39,19 @@ import java.util.Optional;
  * Used in {@link org.apache.doris.nereids.pattern.GroupExpressionMatching.GroupExpressionIterator},
  * as a place-holder when do match root.
  */
+// 在 Apache Doris 的新一代查询优化器 Nereids 中，GroupPlan 是 Memo 数据结构以及 Pattern 模式匹配系统里的一个非常关键的占位与代理节点。
+// 在基于 Cascades 框架的 Nereids 优化器中，执行计划（Plan Tree）会被探索并存储在 Memo（备忘录） 数据结构中：
+// Memo 由多个 Group（组） 组成，每个 Group 表达一组逻辑上等价的表达式（GroupExpression）。
+// 在对 Memo 中的计划树进行模式匹配（Pattern Matching）或规则优化（Rule Application）时，为了避免将子树完整展开成庞大的实体 Plan 结构，优化器引入了 GroupPlan。
+// 主要作用总结：
+//  Memo 节点的占位符（Placeholder / Leaf Wrapper）：
+// GroupPlan 继承自 LogicalLeaf，代表一个没有子节点的逻辑叶子节点。它封装了一个 Group 引用，表明“这里代表某个 Group”，而不需要关心该 Group 内部具体包含哪些物理或逻辑计划。
+// 隔离与延迟展开：
+// 在做 Root 节点的 Pattern 匹配（如 GroupExpressionMatching）时，GroupPlan 充当了子计划的占位节点。只有在模式匹配成功、需要深入匹配子节点时，优化器才会迭代展开其对应的真正 Group。
+// 复用 Group 的属性与元数据：
+//尽管 GroupPlan 本身是一个虚拟的占位节点，但它代理了它所持有的 Group 的 LogicalProperties（例如输出列 Slot 等）和 Statistics（统计信息），使得上一层节点可以正常进行类型检查、列引用推导及代价估算。
 public class GroupPlan extends LogicalLeaf implements BlockFuncDepsPropagation {
-
+    // 当前 GroupPlan 所代表/封装的 Group（Memo 中的组对象）引用。
     private final Group group;
 
     public GroupPlan(Group group) {

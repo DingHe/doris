@@ -31,6 +31,10 @@ import javax.annotation.Nullable;
 /**
  * Abstract class for all physical plan that have one child.
  */
+// 在 Nereids 优化器中，执行计划树由抽象语法树（AST）逐步转换为逻辑计划（Logical Plan），最终通过 Cost-Based Optimizer (CBO) 变换为物理计划（Physical Plan）。
+// 统一单孩子物理算子的基底：它是所有恰好拥有一个子节点（Child Node）的物理计划算子（如 PhysicalFilter、PhysicalProject、PhysicalSort、PhysicalLimit、PhysicalDistribute 等）的通用抽象基类。
+// 连接物理计划层次与单孩子接口：它继承自物理计划抽象基类 AbstractPhysicalPlan，同时实现了单孩子计划接口 UnaryPlan<CHILD_TYPE>。这使得所有继承它的物理算子能够自动获得单孩子算子的通用操作能力（例如 child() 方法定位、子树遍历、子节点替换等），无需重复编写这些样板代码。
+// 支持范型约束：通过泛型 <CHILD_TYPE Plan extends>，可以在编译期严格限定子节点的类型，保证算子树构造时的类型安全。
 public abstract class PhysicalUnary<CHILD_TYPE extends Plan>
         extends AbstractPhysicalPlan
         implements UnaryPlan<CHILD_TYPE> {

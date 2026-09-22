@@ -40,18 +40,31 @@ import java.util.Set;
 /**
  * Describe hash distribution.
  */
+// DistributionSpecHash 是物理属性（Physical Properties）推导与分布式执行计划生成体系中最核心、也是最复杂的哈希数据分布规格（Hash Distribution Specification）。
+// 在分布式 SQL 引擎中，Join（如 Hash Join、Colocate Join、Bucket Shuffle Join）、Aggregate（聚合算子）等分布式算子性能高低极大程度上依赖于数据在节点间的 Hash 分布形态。DistributionSpecHash 的主要作用包括：
+// 描述 Hash 分布状态：记录数据流是按哪些列（orderedShuffledColumns）以何种 Hash 方式（shuffleType）重新分布（Shuffle）或原生地（Natural）落盘在节点上的。
+// 支持等价列推导与属性传递（Equivalence Set）：在 Join 算子中，如 a.id = b.id，数据按 a.id 做了 Hash Shuffle 后，物理上等同于按 b.id 进行了 Hash Shuffle。DistributionSpecHash 维护了等价列集合（equivalenceExprIds），使物理优化器能够精准识别这种逻辑等价性，从而避免不必要的二次 Shuffle。
+// 支持 Colocate Join 与 Bucket Shuffle Join 优化：保存底层 Doris 表的 tableId、selectedIndexId 以及 partitionIds，使得优化器在评估物理算子时，可以精确判断两张表的数据是否满足 Colocate Join（本地关联）或 Bucket Shuffle Join 的分布要求。
+// 属性满足性判定（Satisfy Check）：根据上层算子对分布的要求（如严格相等 REQUIRE_EQUAL 或包含即可 REQUIRE），动态判断当前数据流是否需要插入 PhysicalDistribute（Shuffle Exchange）算子。
 @Developing
 public class DistributionSpecHash extends DistributionSpec {
-
+    // 有序 Hash 分布列列表。按顺序记录了计算 Hash 值所依据的列的 ExprId。
     private final List<ExprId> orderedShuffledColumns;
+    // Shuffle 类型。标识当前 Hash 分布是存储原生的、执行引擎 Shuffle 产出的，还是上层算子要求的规则。
     private final ShuffleType shuffleType;
     // use for satisfied judge
+    // 等价列集合列表。索引 $i$ 对应 orderedShuffledColumns 中第 $i$ 个位置的列及其所有等价列（例如 [a.id, b.id]）。
     private final List<Set<ExprId>> equivalenceExprIds;
+    // 列 ID 到等价集索引的映射表。快速根据某个列的 ExprId 查出它位于 equivalenceExprIds 中的第几个位置（即第几维 Hash Key）。
     private final Map<ExprId, Integer> exprIdToEquivalenceSet;
 
     // below two attributes use for colocate join, only store one table info is enough
+    // 表 ID。
+    // 关联的 Doris 物理表 ID（用户 Colocate Join 匹配）。若无相关表则设为 -1L。
     private final long tableId;
+    // 分区 ID 集合。当前数据涉及的物理分区集合。如果分区不一致，可能无法触发 Bucket Shuffle / Colocate。
     private final Set<Long> partitionIds;
+    // 物化视图/索引 ID。关联的 Table Index ID（如 Rollup / Materialized View），默认为 -1L。
     private final long selectedIndexId;
 
     /**
@@ -338,14 +351,19 @@ public class DistributionSpecHash extends DistributionSpec {
      */
     public enum ShuffleType {
         // require, need to satisfy the distribution spec by contains.
+        // （要求类型） 上层物理算子向下传递的要求，表示只要数据按包含指定列的子集进行 Hash 分布即可满足。
         REQUIRE,
         // output, execution only could be done on the node with data
+        // （产出类型） 数据来自于存储层原生分布（如从 Scan 算子直接读取的数据）。
         NATURAL,
         // output, for shuffle by execution hash method
+        // （产出类型） 数据是通过执行引擎的 Hash Shuffle 逻辑重新打散分发后的状态。
         EXECUTION_BUCKETED,
         // output, for shuffle by storage hash method
+        // （产出类型） 数据分布严格契合 Doris 存储层分桶规则的状态（用于 Colocate Join 等场景）。
         STORAGE_BUCKETED,
         // require, need to satisfy the distribution spec by equals.
+        // （要求类型） 上层物理算子要求的严格匹配类型，表示数据分布必须与要求的列数及顺序完全相等。
         REQUIRE_EQUAL
     }
 }
