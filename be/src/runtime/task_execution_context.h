@@ -29,6 +29,15 @@ class RuntimeState;
 //
 // For recursive CTE, the PFC (which inherits from this class) is held by external threads
 // (scanner threads, brpc callbacks, etc.) via weak_ptr<TaskExecutionContext>.
+// 在 Apache Doris 的 MPP 执行引擎中，一个查询任务（如 Fragment / PipelineFragment）通常由主线程（如 Fragment 执行线程）创建并驱动，但执行过程中会有大量的异步线程或子线程参与协作，例如：
+// Scanner 线程：从存储引擎读取数据；
+// BRPC 回调线程：处理网络传输与 RPC 数据发送；
+// 异步 IO / 调度线程。
+// TaskExecutionContext 的核心作用是：
+// 作为执行上下文基类：为具体的 Fragment 执行上下文（如 PipelineFragmentContext）提供统一的基类类型，并继承 std::enable_shared_from_this。
+// 配合弱引用（std::weak_ptr）进行安全访问：工作线程不直接持有上下文的强引用（避免循环引用导致无法释放），而是持有 weak_ptr。
+// 工作线程在访问上下文前，通过 lock() 方法提升为 shared_ptr；若锁成功，说明对象仍存活可以安全访问；若返回空，说明上下文已被销毁，线程直接安全退出即可。
+
 class TaskExecutionContext : public std::enable_shared_from_this<TaskExecutionContext> {
 public:
     TaskExecutionContext();

@@ -341,35 +341,49 @@ void PInternalService::tablet_writer_open(google::protobuf::RpcController* contr
     }
 }
 
+// controller ： bRPC 的 RPC 控制器对象，用于管理当前 RPC 请求的状态与上下文。例如：检查 RPC 是否超时、获取客户端 IP/Port 地址、取消 RPC 调用、设置或读取 HTTP/bRPC 的 Header 元数据等。
+// const PExecPlanFragmentRequest* request 包含了执行当前 PlanFragment 所需的所有数据，如 Thrift 序列化后的物理计划（TExecPlanFragmentParams）、Fragment ID、Query ID、后端并发度、Scan Range（数据分片信息）等。
 void PInternalService::exec_plan_fragment(google::protobuf::RpcController* controller,
                                           const PExecPlanFragmentRequest* request,
                                           PExecPlanFragmentResult* response,
                                           google::protobuf::Closure* done) {
+    // 声明并初始化一个 Linux 标准的 timeval 时间结构体，并通过 gettimeofday 获取当前系统的微秒级精准时间。
+    // 细节：tv.tv_sec 表示秒数，tv.tv_usec 表示微秒数。
     timeval tv {};
     gettimeofday(&tv, nullptr);
+    // 将当前 BE 接收到该 RPC 请求的时间戳（毫秒级）记录到返回结果 response 的 received_time 字段中。
     response->set_received_time(tv.tv_sec * 1000LL + tv.tv_usec / 1000);
+    // 尝试将真实的执行逻辑包装成一个 Lambda 任务，非阻塞地提交到 BE 的轻量任务线程池 (_light_work_pool) 中。
     bool ret = _light_work_pool.try_offer([this, controller, request, response, done]() {
         _exec_plan_fragment_in_pthread(controller, request, response, done);
     });
+    // 处理线程池队列已满（入队失败）的过载保护逻辑。
+    // 将 response 中的状态码设置为错误（例如 Status::TooManyTasks 或过载拒绝状态），并在内部直接调用 done->Run()，向客户端（FE）立刻返回过载报错，避免请求在 BE 侧死等。
     if (!ret) {
         offer_failed(response, done, _light_work_pool);
         return;
     }
 }
-
+// 核心职责是：在后台的工作线程中真正发起物理执行片段（Fragment）的准备与执行，捕获过程中的各种异常，填充响应时间戳与执行状态，并确保 bRPC 回调闭包被安全触发。
 void PInternalService::_exec_plan_fragment_in_pthread(google::protobuf::RpcController* controller,
                                                       const PExecPlanFragmentRequest* request,
                                                       PExecPlanFragmentResult* response,
                                                       google::protobuf::Closure* done) {
+    // 获取当前系统时间（毫秒级），并记录到 response 的 execution_time 字段中。
+    // 表示 BE 正式开始在后台线程中处理/执行 PlanFragment 的时刻。
     timeval tv1 {};
     gettimeofday(&tv1, nullptr);
     response->set_execution_time(tv1.tv_sec * 1000LL + tv1.tv_usec / 1000);
+    // 在 bRPC 框架中，done 指针必须被调用一次（done->Run()）来结束 RPC 请求。如果函数因抛出异常、提前 return 等原因漏掉调用 done->Run()，会导致 FE 侧 RPC 连接挂起直至超时。
     brpc::ClosureGuard closure_guard(done);
     auto st = Status::OK();
+    // 检查 Protobuf 是否指定了紧凑格式。用于指示内嵌的 Thrift 执行计划数据是否使用了紧凑序列化（Compact Protocol）以节省传输带宽。
     bool compact = request->has_compact() ? request->compact() : false;
+    // 指示当前请求的协议版本，默认为 VERSION_1。用于 Doris 跨版本升级时的 RPC 兼容性处理。
     PFragmentRequestVersion version =
             request->has_version() ? request->version() : PFragmentRequestVersion::VERSION_1;
     try {
+    // 调用真实的底层实现函数。在该函数内部，Doris 会将 Thrift 字符串反序列化为 TExecPlanFragmentParams，并交由全局 FragmentMgr 准备或启动 Pipeline 执行引擎。
         st = _exec_plan_fragment_impl(request->request(), version, compact);
     } catch (const Exception& e) {
         st = e.to_status();
@@ -382,6 +396,7 @@ void PInternalService::_exec_plan_fragment_in_pthread(google::protobuf::RpcContr
     if (!st.ok()) {
         LOG(WARNING) << "exec plan fragment failed, errmsg=" << st;
     }
+    // 将 Doris C++ 层的 Status 对象转换为 Protobuf 格式的 PStatus，填入 response 的 status 字段中，用于向 FE 返回当前操作的成功状态或错误详情。
     st.to_protobuf(response->mutable_status());
     timeval tv2 {};
     gettimeofday(&tv2, nullptr);
@@ -562,27 +577,34 @@ void PInternalService::tablet_writer_cancel(google::protobuf::RpcController* con
         return;
     }
 }
-
+// 环境就绪校验 $\rightarrow$ 反序列化 FE 发来的 Thrift 执行计划 $\rightarrow$ 兼容性修复 $\rightarrow$ 提交给 FragmentMgr 正式启动 Pipeline 执行引擎。
+// const std::string& ser_request 序列化后的物理执行计划数据字符串（Serialized Request），由 FE 传入，内部存放的是经由 Thrift 序列化后的二进制/紧凑数据（对应 TPipelineFragmentParamsList）
+// PFragmentRequestVersion version RPC 请求的版本号枚举（如 VERSION_3）。
+// const std::function<void(RuntimeState*, Status*)>& cb ：Fragment 执行结束时的回调函数（Callback）。
 Status PInternalService::_exec_plan_fragment_impl(
         const std::string& ser_request, PFragmentRequestVersion version, bool compact,
         const std::function<void(RuntimeState*, Status*)>& cb) {
     // Sometimes the BE do not receive the first heartbeat message and it receives request from FE
     // If BE execute this fragment, it will core when it wants to get some property from master info.
+	// 检查当前 BE 节点是否已经成功接收到了来自 FE Master 的首次心跳初始化消息。
     if (ExecEnv::GetInstance()->cluster_info() == nullptr) {
         return Status::InternalError(
                 "Have not receive the first heartbeat message from master, not ready to provide "
                 "service");
     }
+	// 使用 Doris 的 CHECK 宏验证版本号是否为 VERSION_3（Pipeline 执行引擎对应的协议版本）。如果不满足，程序会直接报错终止（Fatal）。
     CHECK(version == PFragmentRequestVersion::VERSION_3)
             << "only support version 3, received " << version;
+	// 进入 Pipeline 引擎的 Fragment 解析与准备主分支。
     if (version == PFragmentRequestVersion::VERSION_3) {
+		// 解析二进制数据块。
         TPipelineFragmentParamsList t_request;
         {
             const uint8_t* buf = (const uint8_t*)ser_request.data();
             uint32_t len = ser_request.size();
             RETURN_IF_ERROR(deserialize_thrift_msg(buf, &len, compact, &t_request));
         }
-
+		// 一个 RPC 请求可能同时打包下发同一个 Query 在该 BE 上的多个 Fragment（以减少 RPC 交互次数）。如果解出的列表为空，说明 RPC 数据异常；timer 用于统计准备这些 Fragments 消耗的总 CPU 耗时。
         const auto& fragment_list = t_request.params_list;
         if (fragment_list.empty()) {
             return Status::InternalError("Invalid TPipelineFragmentParamsList!");
@@ -591,6 +613,10 @@ Status PInternalService::_exec_plan_fragment_impl(
         timer.start();
 
         // work for old version frontend
+		// 向后兼容（Backward Compatibility）处理。
+		// 底层背景：在较老的 Doris 版本中，runtime_filter_params 和 topn_filter_descs（TopN 动态过滤描述符）是附带在具体的 Fragment 本地参数（local_params）里的。
+		// 新版本中将它们提升到了全局的 t_request.runtime_filter_info 中。
+		// 如果检测到上游 FE 是旧版本（没有设置顶层 runtime_filter_info），就手动提取第一个 Fragment 的 Filter 参数进行顶层补齐，确保后续 Pipeline 执行引擎能够统一读取。
         if (!t_request.__isset.runtime_filter_info) {
             TRuntimeFilterInfo runtime_filter_info;
             auto local_param = fragment_list[0].local_params[0];
@@ -602,9 +628,13 @@ Status PInternalService::_exec_plan_fragment_impl(
             }
             t_request.__set_runtime_filter_info(runtime_filter_info);
         }
-
+		// 遍历 Fragment 并提交给 FragmentMgr 执行
         for (const TPipelineFragmentParams& fragment : fragment_list) {
             if (cb) {
+				// 真正启动查询物理执行的核心调用
+				// 遍历反序列化出来的每一个 TPipelineFragmentParams（即每一个 Pipeline Fragment）。
+				// 通过当前 BE 的全局环境指针 _exec_env 获取 FragmentMgr（Fragment 管理器，负责 BE 节点上所有 Fragment 的生命周期、Pipeline Task 构建和线程调度）。
+				// 根据是否传入了回调函数 cb，调用对应的 FragmentMgr::exec_plan_fragment(...) 重载函数
                 RETURN_IF_ERROR(_exec_env->fragment_mgr()->exec_plan_fragment(
                         fragment, QuerySource::INTERNAL_FRONTEND, cb, t_request));
             } else {

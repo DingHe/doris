@@ -265,36 +265,58 @@ void PipelineFragmentContext::cancel(const Status reason) {
         }
     }
 }
-
+// 在当前 Fragment 上下文中创建并注册一个新的 Pipeline 对象，建立父子 Pipeline 之间的拓扑依赖关系，并根据父 Pipeline 自动推导和初始化当前 Pipeline 的任务并发度（num_tasks）。
+// PipelinePtr parent（输入参数，默认为 nullptr）
+// 指定新创建 Pipeline 的父管道（Parent Pipeline）。如果为 nullptr，说明创建的是根管道（Root Pipeline）；如果非空，说明当前管道是因 Blocking 算子（如 HashJoin Build 端、Aggregation 聚合端等）切分出来的子管道。
+// int idx（输入参数，默认值为 -1）
+// 指定新 Pipeline 在当前 Fragment 的全局管道列表 _pipelines 中的插入位置索引。若 idx >= 0：将新 Pipeline 插入到 _pipelines 数组的指定位置（用于控制 Pipeline 的执行/准备顺序）；若 idx < 0（默认值通常为 -1）：直接追加到 _pipelines 数组的末尾。
 PipelinePtr PipelineFragmentContext::add_pipeline(PipelinePtr parent, int idx) {
+    // 分配自增 Pipeline ID
     PipelineId id = _next_pipeline_id++;
+    // 实例化 Pipeline 并计算并发任务数
+    // 如果存在父管道 parent，当前管道的初始任务数不能超过父管道的任务数，同时也不能超过当前 BE 节点分配的实例数 _num_instances（即取二者的较小值 std::min）；如果没有父管道，直接使用 _num_instances。
+    // 第二个并发度参数（基准/最大 num_tasks）：作为并发度的参考上界（未裁剪前的父管道任务数或默认实例数）。
     auto pipeline = std::make_shared<Pipeline>(
             id, parent ? std::min(parent->num_tasks(), _num_instances) : _num_instances,
             parent ? parent->num_tasks() : _num_instances);
+    // 将新 Pipeline 注册到 Fragment 的全局向量中
+    // 若指定了插入位置 idx，使用 _pipelines.insert(...) 将新创建的 pipeline 插入到 _pipelines 迭代器的指定位置（如在某些特定依赖关系的算子构建中需要调整顺序）。
     if (idx >= 0) {
         _pipelines.insert(_pipelines.begin() + idx, pipeline);
     } else {
+    // 若未指定索引（即 idx 为负数），调用 _pipelines.emplace_back(pipeline) 直接尾插到 _pipelines 容器末尾。
         _pipelines.emplace_back(pipeline);
     }
+    // 建立父子 Pipeline 的拓扑关联
     if (parent) {
+        // 调用 parent->set_children(pipeline)，将当前新创建的 pipeline 注册为 parent 的子管道（Child Pipeline）。这在后续依赖树构建、资源释放以及数据流依赖（SharedState 传递）时作为重要的拓扑边信息。
         parent->set_children(pipeline);
     }
     return pipeline;
 }
-
+// 主要职责是：将 FE (Frontend) 传递过来的逻辑执行计划树（ExecNode Tree）拆解转化为物理 Pipeline 拓扑结构，构建 Data Sink（数据接收/发送算子）、规划本地数据打散（Local Exchange），并最终为每一个 Instance 实例化出可被调度器执行的物理 PipelineTask。
+// ThreadPool* thread_pool  传入用于并行构建和准备 PipelineTask 的线程池。当一个 Fragment 在当前 BE 节点上拥有多个 Instance（例如并行度为 8、16 时），利用该线程池可以并行并发地对各个 Instance 进行资源初始化和 Task 构建，从而加速大型 Fragment 的准备过程。
 Status PipelineFragmentContext::_build_and_prepare_full_pipeline(ThreadPool* thread_pool) {
     {
+        // 开启构建 Pipeline 阶段的计时，结果记录在 BuildPipelinesTime 指标中。
         SCOPED_TIMER(_build_pipelines_timer);
         // 2. Build pipelines with operators in this fragment.
+        // 在当前 Fragment 上下文中新建一个空的 Pipeline 对象，并作为逻辑根管道 root_pipeline。
         auto root_pipeline = add_pipeline();
+        // 深度优先递归遍历逻辑计划树
+        // 遇到打断流水线的算子（Blocking Operator，如 Hash Join Build 端、Agg 聚合端）时，切分并创建子 Pipeline（Child Pipeline），并将生产端与消费端通过 SharedState 绑定；
+        // _root_op 将接收构建出的根算子指针。
         RETURN_IF_ERROR(_build_pipelines(_runtime_state->obj_pool(), *_query_ctx->desc_tbl,
                                          &_root_op, root_pipeline));
 
         // Propagate _num_instances from LOCAL_EXCHANGE pipelines to ancestor pipelines
         // that inherited reduced num_tasks from a serial operator.
+        // 本地并行度传播与延迟本地交换器构建
+        // 将包含 LOCAL_EXCHANGE（本地数据交换）的 Pipeline 的真实并发度（_num_instances）向上游/祖先 Pipeline 传播。解决因为某些串行算子（Serial Operator，如单线程 Exchange/Gather）导致上游 Pipeline 任务数被错误缩减的问题。
         _propagate_local_exchange_num_tasks();
 
         // Create deferred local exchangers now that all pipelines have final num_tasks.
+        // 在前一步确定了所有 Pipeline 的最终任务并发数（num_tasks）之后，延后（Deferred）实例化对应的本地数据交换器（Local Exchangers），确保数据通道两端的通道数量精确匹配。
         RETURN_IF_ERROR(_create_deferred_local_exchangers());
 
         // Raise num_tasks for pipelines whose serial non-scan operators (e.g.,
@@ -317,53 +339,75 @@ Status PipelineFragmentContext::_build_and_prepare_full_pipeline(ThreadPool* thr
         // proper pipeline boundaries with _num_instances tasks.
 
         // 3. Create sink operator
+        // 创建与绑定数据接收算子（Data Sink）
+        // 校验 Sink：校验 Thrift 参数中是否定义了当前 Fragment 的输出 Sink（如 DataStreamSink 用于跨节点传输，或 ResultSink 用于向前端返回结果）。若没有则抛出内部错误。
         if (!_params.fragment.__isset.output_sink) {
             return Status::InternalError("No output sink in this fragment!");
         }
+        // 在 obj_pool 内存池中根据 output_sink 的类型创建对应的物理 DataSinkOperatorBuilder。
         RETURN_IF_ERROR(_create_data_sink(_runtime_state->obj_pool(), _params.fragment.output_sink,
                                           _params.fragment.output_exprs, _params,
                                           root_pipeline->output_row_desc(), _runtime_state.get(),
                                           *_desc_tbl, root_pipeline->id()));
-        RETURN_IF_ERROR(_sink->init(_params.fragment.output_sink));
-        RETURN_IF_ERROR(root_pipeline->set_sink(_sink));
 
+        // 初始化该 Data Sink（解析输出表达式 output_exprs、设置 Tuple 描述等）。
+        RETURN_IF_ERROR(_sink->init(_params.fragment.output_sink));
+        // 将创建好的 Data Sink 设置为根 Pipeline 的尾部输出节点。
+        RETURN_IF_ERROR(root_pipeline->set_sink(_sink));
+        // 建立算子与 Sink 的父子连接
+        // 遍历当前 Fragment 管理的所有 Pipeline（包括根 Pipeline 及切分出的各个子 Pipeline）。
         for (PipelinePtr& pipeline : _pipelines) {
+            // 断言确保每个 Pipeline 都已挂载了对应的 Sink 算子（子 Pipeline 会挂载类似 SinkLocalExchange 的中间 Sink）。
             DCHECK(pipeline->sink() != nullptr) << pipeline->operators().size();
+            // 将当前 Pipeline 算子链的最后一个算子（operators().back()）作为孩子节点（数据提供方）绑定给当前 Pipeline 的 Sink 算子，完成 Pipeline 内部算子链的数据流闭环。
             RETURN_IF_ERROR(pipeline->sink()->set_child(pipeline->operators().back()));
         }
     }
     // 4. Build local exchanger
+    // 构建本地 Shuffle (Local Exchange)
+    // 检查当前查询是否启用了本地 Shuffle 优化（为了充分利用多核并发，在 BE 节点内部按 Bucket/Hash 重新打散数据）
     if (_runtime_state->plan_local_shuffle()) {
+        // 开启 Local Exchanger 规划阶段的计时，记录在 PlanLocalLocalExchangerTime 指标中。
         SCOPED_TIMER(_plan_local_exchanger_timer);
+        // 根据分片 Buckets 数量、Bucket 到 Instance 的映射关系表、Shuffle 索引映射表，
+        // 向对应的 Pipeline 中插入 PassthroughExchanger、HashShuffleExchanger 或 BucketShuffleExchanger 等本地数据交换管道。
         RETURN_IF_ERROR(_plan_local_exchange(_params.num_buckets,
                                              _params.bucket_seq_to_instance_idx,
                                              _params.shuffle_idx_to_instance_idx));
     }
 
     // 5. Initialize global states in pipelines.
+    // 初始化 Pipeline 全局状态（Pipeline Prepare）
+    // 调用 Pipeline 自身的 prepare 方法。该方法会依次调用管道内所有算子（Operator）和 Sink 的 prepare()，分配全局数据结构、表达式编译和共享状态初始化（SharedState）。
     for (PipelinePtr& pipeline : _pipelines) {
         SCOPED_TIMER(_prepare_all_pipelines_timer);
         pipeline->children().clear();
         RETURN_IF_ERROR(pipeline->prepare(_runtime_state.get()));
     }
-
+    // 构建物理 Pipeline Task 并初始化局部状态
     {
         SCOPED_TIMER(_build_tasks_timer);
         // 6. Build pipeline tasks and initialize local state.
+        // 核心物理实例化步骤！
+        // 根据并发度（_num_instances）和 Pipeline 拓扑，通过多线程池 thread_pool 并发为每个 Instance 实例化出最终的 PipelineTask；
+        // 将构建好的 PipelineTask 提交给 Pipeline 调度器（PipelineTaskScheduler）等待被执行。
         RETURN_IF_ERROR(_build_pipeline_tasks(thread_pool));
     }
 
     return Status::OK();
 }
-
+// PipelineFragmentContext 负责管理单个 Fragment 在当前 BE 节点上的生命周期（包括 Pipeline 的构建、资源初始化、Task 任务准备以及执行状态上报等）。
+// prepare 方法是 Fragment 真正开始物理执行前最核心的初始化准备阶段。
 Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
+    // 防重入机制。检查该 Fragment Context 是否已经执行过 prepare，如果重复调用直接返回内部错误。
     if (_prepared) {
         return Status::InternalError("Already prepared");
     }
+    // _timeout 设置：检查 Thrift 参数 _params 中是否包含了查询级别的 execution_timeout，若设置了则将其赋值给成员变量 _timeout，作为该 Fragment 执行的超时时间阈值。
     if (_params.__isset.query_options && _params.query_options.__isset.execution_timeout) {
         _timeout = _params.query_options.execution_timeout;
     }
-
+    // 初始化 Profile 与计时器（Metrics 监控）
     _fragment_level_profile = std::make_unique<RuntimeProfile>("PipelineContext");
     _prepare_timer = ADD_TIMER(_fragment_level_profile, "PrepareTime");
     SCOPED_TIMER(_prepare_timer);
@@ -374,22 +418,29 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
     _prepare_all_pipelines_timer = ADD_TIMER(_fragment_level_profile, "PrepareAllPipelinesTime");
     {
         SCOPED_TIMER(_init_context_timer);
+        // 获取当前 BE 节点上即将调度的 Instance 数量（根据 local_params 的大小设置 _num_instances）
         cast_set(_num_instances, _params.local_params.size());
+        // 计算整个集群中该 Fragment 的 Instance 总数。如果 params 中显式指定了 total_instances 则使用该值，否则回退为当前 BE 的 _num_instances。
         _total_instances =
                 _params.__isset.total_instances ? _params.total_instances : _num_instances;
 
         auto* fragment_context = this;
-
+        // 读取查询选项，设置在 Fragment 成功执行完毕后是否需要向 FE/Coordinator 上报 SUCCESS 状态。
         if (_params.query_options.__isset.is_report_success) {
             fragment_context->set_is_report_success(_params.query_options.is_report_success);
         }
 
         // 1. Set up the global runtime state.
+        // 创建 Fragment 级别的全局 RuntimeState 实例，保存 query_id、fragment_id、全局配置（query_globals）、执行环境指针（_exec_env）以及所属的 QueryContext。
         _runtime_state = RuntimeState::create_unique(
                 _params.query_id, _params.fragment_id, _params.query_options,
                 _query_ctx->query_globals, _exec_env, _query_ctx.get());
+        // 把当前 PipelineFragmentContext（继承自 TaskExecutionContext）绑定给 RuntimeState，使得全局逻辑能够回调 Fragment 上下文。
         _runtime_state->set_task_execution_context(shared_from_this());
+        // 切换当前线程的内存分配统计挂载点到该 Query 的 query_mem_tracker 上，确保后续分配的内存正确计入内存配额。
         SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_runtime_state->query_mem_tracker());
+        // 填充 RuntimeState 的运行期属性
+        // 将外部传入的各类任务相关属性（如 backend_id、数据导入特有的 import_label、数据库名 db_name、导入作业 ID load_job_id）按需注入到 _runtime_state 中，以备执行或写日志时使用。
         if (_params.__isset.backend_id) {
             _runtime_state->set_backend_id(_params.backend_id);
         }
@@ -410,6 +461,7 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
             RETURN_IF_ERROR(DescriptorTbl::create(_runtime_state->obj_pool(), _params.desc_tbl,
                                                   &_desc_tbl));
         }
+        // 绑定描述符表（Descriptor Table）与并发参数
         _runtime_state->set_desc_tbl(_desc_tbl);
         _runtime_state->set_num_per_fragment_instances(_params.num_senders);
         _runtime_state->set_load_stream_per_node(_params.load_stream_per_node);
@@ -417,6 +469,7 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
         _runtime_state->set_num_local_sink(_params.num_local_sink);
 
         // init fragment_instance_ids
+        // 遍历 local_params，提取分配到当前 BE 节点的所有 Fragment Instance 的唯一 ID (fragment_instance_id)，记录在本地数组 _fragment_instance_ids 中。
         const auto target_size = _params.local_params.size();
         _fragment_instance_ids.resize(target_size);
         for (size_t i = 0; i < _params.local_params.size(); i++) {
@@ -424,7 +477,7 @@ Status PipelineFragmentContext::prepare(ThreadPool* thread_pool) {
             _fragment_instance_ids[i] = fragment_instance_id;
         }
     }
-
+    // 构建并准备完整的 Pipeline 拓扑与 Task
     RETURN_IF_ERROR(_build_and_prepare_full_pipeline(thread_pool));
 
     _init_next_report_time();
@@ -699,18 +752,24 @@ void PipelineFragmentContext::trigger_report_if_necessary() {
         }
     }
 }
-
+// 将前端（FE）发送过来的 Thrift 逻辑执行计划节点树（plan.nodes）递归构建/拆解为 BE 物理算子链和 Pipeline 拓扑结构的核心入口函数。
+// ObjectPool* pool（输入参数） 用于统一管理构建过程中动态创建的各种算子（Operator）、表达式以及辅助对象的生命周期，方便后续在 Fragment 销毁时统一释放资源。
+// const DescriptorTbl& descs（输入参数） 包含当前查询用到的所有表、元组（Tuple）以及列（Slot）的描述信息（TupleDescriptor / SlotDescriptor），算子初始化时需要通过它来确定输入输出数据格式。
+// OperatorPtr* root（输出参数） 用于接收并带回整棵物理执行计划树的根算子（Root Operator）指针。
+// PipelinePtr cur_pipe（输入/输出参数） 传入当前正在构建的 Pipeline 对象（通常初始时是 _build_and_prepare_full_pipeline 中创建的根管道 root_pipeline）。在递归构建过程中，算子会被不断追加到该管道中；若遇到 Blocking 算子则以此为基础切分出新管道。
 Status PipelineFragmentContext::_build_pipelines(ObjectPool* pool, const DescriptorTbl& descs,
                                                  OperatorPtr* root, PipelinePtr cur_pipe) {
+    // 检查 Thrift 序列化结构 _params.fragment.plan.nodes（包含当前 Fragment 所有的 PlanNode 逻辑节点列表）是否为空。
     if (_params.fragment.plan.nodes.empty()) {
         throw Exception(ErrorCode::INTERNAL_ERROR, "Invalid plan which has no plan node!");
     }
 
     int node_idx = 0;
-
+    // FE 在传递 plan.nodes 数组时，采用的是先序遍历（Pre-order Traversal） 方式展开的树形结构。
+    // 在递归重建物理树时，node_idx 会作为传引用/指针参数，在递归过程中不断自增，从而按顺序消费 plan.nodes 中的每个逻辑节点。
     RETURN_IF_ERROR(_create_tree_helper(pool, _params.fragment.plan.nodes, descs, nullptr,
                                         &node_idx, root, cur_pipe, 0, false, false));
-
+    // 计划树节点完整性校验（Completeness Check）
     if (node_idx + 1 != _params.fragment.plan.nodes.size()) {
         return Status::InternalError(
                 "Plan tree only partially reconstructed. Not all thrift nodes were used.");
@@ -899,37 +958,61 @@ void PipelineFragmentContext::_propagate_local_exchange_num_tasks() {
             << "pipeline num_tasks topological sweep visited " << visited << " of "
             << in_degree.size() << " pipelines (cycle in _dag?)";
 }
-
+// 根据前端（FE）发送的先序遍历（Pre-order Traversal）TPlanNode 节点数组，深度优先递归地创建物理算子（Operator）、建立父子算子层级关系，并向上向下传播数据分布约束（如 Shuffled 分布、Bucket/Colocated 分布）。
+// ObjectPool* pool：内存对象池指针，用于管理动态创建的算子、表达式等对象的生命周期。
+// const std::vector<TPlanNode>& tnodes：前端传递过来的当前 Fragment 的逻辑执行计划节点数组（按先序遍历排列）。
+// const DescriptorTbl& descs：全局描述符表，包含元组（Tuple）和列（Slot）的 Schema 元数据。
+// OperatorPtr parent：当前节点的父物理算子指针。若构建的是根节点，则为 nullptr。
+// int* node_idx：指针类型，指向当前正在处理的 tnodes 数组的索引下标。在递归深度优先遍历过程中递增。
+// OperatorPtr* root：输出参数，用于带回整棵算子树的根节点算子（仅在处理根节点时赋值）。
+// PipelinePtr& cur_pipe：引用类型，指向当前正在构建的 Pipeline 对象。
+// int child_idx：当前节点在其父算子的所有子节点中的下标位置（例如 Join 算子的左子树为 0，右子树为 1）。
+// const bool followed_by_shuffled_operator：布尔标志，指示当前算子下游是否存在 Shuffle 类的算子（如 Shuffled Hash Join）。
+// const bool require_bucket_distribution：布尔标志，指示当前算子下游是否要求 Bucket/Colocated 级别的特定数据分布。
+// followed_by_shuffled_operator 解决的痛点问题
+// 在多核/多线程并发执行的 Pipeline 架构中，为了充分利用多 CPU 核心，系统经常需要在管道内部插入 LocalExchange（本地数据重分配/本地 Shuffle），将数据均匀打散到不同的并行线程执行（如 PassThrough、Hash Shuffle 等）。
+// 但是，如果下游存在一个 Shuffled Hash Join，它的左右两表必须使用完全一致的 Hash 函数和 Hash 槽位数进行数据路由（例如按照 Join Key 进行 Hash），Join 的 Build 端和 Probe 端才能在对应的线程里匹配到数据。
+// 如果下游有 Shuffled Hash Join，但上游的 LocalExchange 不知道这个信息，随便选了一个普通的 Hash 函数或简单的轮询（Passthrough）打散数据，就会导致：
+// 数据分布错位：数据被发到了错误的 Worker 线程，导致 Join 匹配不到正确的行，查询结果出错。
+// 重复/无效 Shuffle：上游打散了一次，下游发现数据分布不对又被迫再做一次额外 Shuffle，产生性能开销。
 Status PipelineFragmentContext::_create_tree_helper(
         ObjectPool* pool, const std::vector<TPlanNode>& tnodes, const DescriptorTbl& descs,
         OperatorPtr parent, int* node_idx, OperatorPtr* root, PipelinePtr& cur_pipe, int child_idx,
         const bool followed_by_shuffled_operator, const bool require_bucket_distribution) {
     // propagate error case
+    // 数组边界防御性校验
+    // 检查指针 *node_idx 是否超出了 tnodes 数组的范围。如果越界，说明 Thrift 结构损坏，直接抛出 InternalError；校验通过后获取当前待处理的 Thrift 逻辑节点 tnode。
     if (*node_idx >= tnodes.size()) {
         return Status::InternalError(
                 "Failed to reconstruct plan tree from thrift. Node id: {}, number of nodes: {}",
                 *node_idx, tnodes.size());
     }
     const TPlanNode& tnode = tnodes[*node_idx];
-
+    // 获取当前逻辑节点的子节点数量（例如 Scan 为 0，Agg 为 1，Join 为 2）。
     int num_children = tnodes[*node_idx].num_children;
+    // 初始化继承自上游/父节点的分布属性标志，后续会结合当前算子特性进行更新并传给子节点。
     bool current_followed_by_shuffled_operator = followed_by_shuffled_operator;
     bool current_require_bucket_distribution = require_bucket_distribution;
     // TODO: Create CacheOperator is confused now
     OperatorPtr op = nullptr;
     OperatorPtr cache_op = nullptr;
+    // 调用工厂方法 _create_operator，根据 tnode 的类型（如 Agg、Join、Scan 等）实例化具体的物理算子对象 op（以及可能的缓存算子 cache_op），
+    // 并根据算子特性（如 Blocking 算子）动态切分或调整 cur_pipe。
     RETURN_IF_ERROR(_create_operator(pool, tnodes[*node_idx], descs, op, cur_pipe,
                                      parent == nullptr ? -1 : parent->node_id(), child_idx,
                                      followed_by_shuffled_operator,
                                      current_require_bucket_distribution, cache_op));
     // Initialization must be done here. For example, group by expressions in agg will be used to
     // decide if a local shuffle should be planed, so it must be initialized here.
+    // 调用算子的 init 方法解析表达式、配置参数等。
     RETURN_IF_ERROR(op->init(tnode, _runtime_state.get()));
     // assert(parent != nullptr || (node_idx == 0 && root_expr != nullptr));
+    // 建立父子算子树状连接
     if (parent != nullptr) {
         // add to parent's child(s)
         RETURN_IF_ERROR(parent->set_child(cache_op ? cache_op : op));
     } else {
+    // 如果 parent 为空，说明当前算子是整个 Fragment 执行计划树的根算子，将其赋值给输出参数 *root。
         *root = op;
     }
     /**
@@ -943,10 +1026,14 @@ Status PipelineFragmentContext::_create_tree_helper(
      * If an operator's is followed by a local exchange without shuffle (e.g. passthrough), a
      * shuffled local exchanger will be used before join so it is not followed by shuffle join.
      */
+    // 计算并向下传播数据分布标志（Shuffle & Bucket Distribution）
+    // 获取当前位置要求的数据分布（如果当前管道内没有算子，取 Sink 的分布要求；否则取当前算子 op 的分布要求）。
     auto required_data_distribution =
             cur_pipe->operators().empty()
                     ? cur_pipe->sink()->required_data_distribution(_runtime_state.get())
                     : op->required_data_distribution(_runtime_state.get());
+    // 判断当前算子/Sink 本身是否是 Shuffled 算子（如 Shuffled Hash Join），或者上游传递了该标志；
+    // 同时结合 required_data_distribution 是否为 Hash Exchange 或 NOOP，确定数据在经过当前算子后，是否需要保持/满足全局 Hash Shuffle 的分布要求（防止上游 Local Exchange 误打散 Hash 分区数据）
     current_followed_by_shuffled_operator =
             ((followed_by_shuffled_operator ||
               (cur_pipe->operators().empty() ? cur_pipe->sink()->is_shuffled_operator()
@@ -955,6 +1042,7 @@ Status PipelineFragmentContext::_create_tree_helper(
             (followed_by_shuffled_operator &&
              required_data_distribution.distribution_type == TLocalPartitionType::NOOP);
 
+    // 判断当前算子是否是 Colocated 算子（如 Bucket Shuffle Join），确定是否需要将特定的 Bucket 数据分布要求传递给子节点。
     current_require_bucket_distribution =
             ((require_bucket_distribution ||
               (cur_pipe->operators().empty() ? cur_pipe->sink()->is_colocated_operator()
@@ -962,12 +1050,15 @@ Status PipelineFragmentContext::_create_tree_helper(
              Pipeline::is_hash_exchange(required_data_distribution.distribution_type)) ||
             (require_bucket_distribution &&
              required_data_distribution.distribution_type == TLocalPartitionType::NOOP);
-
+    // 如果当前算子没有子节点（num_children == 0，即处于树的叶子节点，如 ScanOperator 或 ExchangeSourceOperator），
+    // 将其是否为单线程串行算子（is_serial_operator()）记录到 Fragment 上下文变量 _use_serial_source 中。
     if (num_children == 0) {
         _use_serial_source = op->is_serial_operator();
     }
     // rely on that tnodes is preorder of the plan
+    // 递归构建所有子节点（Children Traversal）
     for (int i = 0; i < num_children; i++) {
+        // 由于 tnodes 是先序遍历数组，递增 *node_idx 指向下一个子节点的 Thrift 定义。
         ++*node_idx;
         RETURN_IF_ERROR(_create_tree_helper(pool, tnodes, descs, op, node_idx, nullptr, cur_pipe, i,
                                             current_followed_by_shuffled_operator,
@@ -1498,7 +1589,19 @@ Status PipelineFragmentContext::_create_data_sink(ObjectPool* pool, const TDataS
 }
 
 // NOLINTBEGIN(readability-function-size)
-// NOLINTBEGIN(readability-function-cognitive-complexity)
+// NOLINTBEGIN(readability-function-cognitive-
+// Pipeline 架构（Pipeline Execution Engine） 构建的核心入口之一
+// 主要职责是：读取 FE（FrontEnd）下发的 Thrift 逻辑计划树节点（TPlanNode），构建对应的 BE（BackEnd）执行算子（OperatorX 和 DataSinkOperatorX），并将其编排到流水线（Pipeline）及其依赖图（DAG）中。
+// ObjectPool* pool   1. 内存池，用于管理算子对象的生命周期
+// const TPlanNode& tnode  2. 当前待解析的 Thrift 逻辑计划节点（FE 传给 BE）
+// const DescriptorTbl& descs 3. 元数据描述符表（包含 Schema, Tuple, Slot 等信息）
+// OperatorPtr& op 4. [输出参数] 构建出的 Source/Transform 算子指针
+// PipelinePtr& cur_pipe  5. [输入/输出] 当前正在构建的 Pipeline
+// int parent_idx  6. 父算子在树中的索引（用于匹配前序遍历结构）
+// int child_idx  7. 子算子在树中的索引
+// const bool followed_by_shuffled_operator  8. 标记后续是否跟有 Shuffle 算子（影响并行度/数据分布）
+// const bool require_bucket_distribution   9. 标记是否要求按 Bucket 分布数据
+// OperatorPtr& cache_op  10. [输出参数] 若开启 Query Cache，指向 Cache 算子
 Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNode& tnode,
                                                  const DescriptorTbl& descs, OperatorPtr& op,
                                                  PipelinePtr& cur_pipe, int parent_idx,
@@ -1507,6 +1610,8 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                                                  const bool require_bucket_distribution,
                                                  OperatorPtr& cache_op) {
     std::vector<DataSinkOperatorPtr> sink_ops;
+    // 使用 RAII Defer 模式：确保在此函数退出（包括 return 退出）前，调用算子的 update_operator 方法
+    // 更新算子属性（如并发度、Shuffle 及 Bucket 分布要求）
     Defer defer = Defer([&]() {
         if (op) {
             op->update_operator(tnode, followed_by_shuffled_operator, require_bucket_distribution);
@@ -1517,12 +1622,19 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
     });
     // We directly construct the operator from Thrift because the given array is in the order of preorder traversal.
     // Therefore, here we need to use a stack-like structure.
+    // FE 传过来的 TPlanNode 数组是按【先序遍历（Preorder Traversal）】排列的。
+    // 这里通过内部栈结构弹出/调整父子 Pipeline 的对应关系，更新 cur_pipe。
     _pipeline_parent_map.pop(cur_pipe, parent_idx, child_idx);
     std::stringstream error_msg;
     bool enable_query_cache = _params.fragment.__isset.query_cache_param;
 
     bool fe_with_old_version = false;
     switch (tnode.node_type) {
+    // Scan 类型算子构建 (以 OLAP Scan 为例)
+    // OLAP_SCAN_NODE（Olap 表扫描节点） 在 Pipeline 执行引擎中构建对应 OperatorX 的核心实现，重点处理了 Query Cache（查询缓存）的联动校验与初始化 以及 Binlog 扫描场景下的缓存失效逻辑。
+    // 背景原理：FE 生成的计划树是按先序遍历（Pre-order Traversal）顺序发给 BE 进行解析构建的。在逻辑计划树中，Query Cache 的 Source/Cache 节点位于 ScanNode 的上层（祖先节点）。
+    // 因此，当遍历解析到底层的 OLAP_SCAN_NODE 时，上层的 Query Cache 节点必须已经被解析完毕，并且创建好了全局共享的 _query_cache_runtime。
+    // 为什么必须 fail loudly（直接抛错）：正如注释所述，如果在此处 _query_cache_runtime 缺失而让 Scan 节点盲目使用自己的默认 Runtime 运行，一旦发生 Cache HIT（缓存命中），Scan 节点会因为不知道缓存命中的状态而主动跳过底层数据扫描（Skip Scanning），同时又没有上层的 Cache Source 节点来吐出缓存数据，会导致查询结果静默丢失（Silently Drop Data）。这里通过 Status::InternalError 快速失败，防止出现严重的正确性 Bug。
     case TPlanNodeType::OLAP_SCAN_NODE: {
         if (enable_query_cache) {
             if (_query_cache_runtime == nullptr) {
@@ -1537,6 +1649,8 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                         "cache node_id={}",
                         tnode.node_id, _params.fragment.query_cache_param.node_id);
             }
+            // 如果当前 Olap Scan 被标记为读取 Row Binlog（如 CDC 数据变更捕获或主备同步场景），将调用 disable_for_binlog_scan() 禁用 Query Cache。
+            // Binlog 扫描读取的是底层的变更日志流（Row-level Changes），其数据流形态和普通 SQL 查询的 Snapshot 扫描完全不同，既不能使用已有的 Query Cache，也不能将其扫描结果写入 Cache 覆盖正常的 Query 数据。
             if (tnode.olap_scan_node.__isset.read_row_binlog &&
                 tnode.olap_scan_node.read_row_binlog) {
                 // Row-binlog scans read a different data stream: they must
@@ -1544,6 +1658,7 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                 _query_cache_runtime->disable_for_binlog_scan();
             }
         }
+        // 创建物理算子 OlapScanOperatorX，并将 TQueryCacheParam 参数和刚才校验过的 _query_cache_runtime 指针透传给算子内部。
         op = std::make_shared<OlapScanOperatorX>(
                 pool, tnode, next_operator_id(), descs, _num_instances,
                 enable_query_cache ? _params.fragment.query_cache_param : TQueryCacheParam {},
@@ -1552,16 +1667,27 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         fe_with_old_version = !tnode.__isset.is_serial_operator;
         break;
     }
+    // GROUP_COMMIT_SCAN_NODE（Group Commit 组提交导入节点） 在 Pipeline 执行引擎中构建物理算子 GroupCommitOperatorX 的入口
+    // 与普通的 OLAP_SCAN_NODE 相比，GROUP_COMMIT_SCAN_NODE 的核心差异在于它并非用于普通的 SQL SELECT 查询，而是用于 Group Commit 导入模式（通过将多个小批量的 Stream Load / Insert 写入合并为一次大提交，大幅提升高并发小写场景下的吞吐量并减少 Tablet Header 版本分裂）。
     case TPlanNodeType::GROUP_COMMIT_SCAN_NODE: {
         DCHECK(_query_ctx != nullptr);
+        // 标记 Query 内存跟踪器（MemTracker）的 Group Commit 属性
+        // 将当前 Query 上下文（_query_ctx）对应的内存跟踪器（query_mem_tracker）标记为 is_group_commit_load = true。
+        // 内存管控与 GC 策略隔离：Group Commit 导入涉及将数据在 BE 内存的 Block Queue 中暂存和攒批。内存管理器（MemTracker）在触发 Memory Limit 限制或系统 OOM 刷盘/Kill 查询时，需要识别出此类 Query 并应用特定的内存管控逻辑（如优先触发 Block 刷盘而非直接杀掉 Load Query）
         _query_ctx->query_mem_tracker()->is_group_commit_load = true;
+        // 算子创建：创建物理算子 GroupCommitOperatorX。其内部不直接去存储引擎（OlapTable）中读 Tablet 数据，而是作为 Source 算子，从 FE / BE 预先分配好的 Group Commit 内存队列（GroupCommitBlockBuffer / LoadStream） 中消费攒批好的 RowBatch / Block 数据。
         op = std::make_shared<GroupCommitOperatorX>(pool, tnode, next_operator_id(), descs,
                                                     _num_instances);
         RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
         fe_with_old_version = !tnode.__isset.is_serial_operator;
         break;
     }
+    // JDBC_SCAN_NODE（JDBC 外部表扫描节点） 在 Pipeline 执行引擎中构建物理算子 JDBCScanOperatorX 的入口
+    // 主要负责处理外围异构数据库（如 MySQL、PostgreSQL、Oracle、SQL Server 等）的联邦查询/外表读取，核心逻辑聚焦于 Java 运行时（JNI / JVM）依赖的硬检查与拦截。
     case TPlanNodeType::JDBC_SCAN_NODE: {
+        // Java 运行时支持校验 (config::enable_java_support)
+        // 核心背景：Doris 的 BE 是基于 C++ 编写的，但 JDBC 驱动（JDBC Driver）及其生态是标准 Java 实现。因此，BE 读取 JDBC 外部表时，需要通过 JNI（Java Native Interface） 启动嵌入式 JVM，并在 JVM 中加载对应数据库的 .jar 包驱动来拉取数据。
+        // 开启状态 (enable_java_support = true)：允许创建 JDBCScanOperatorX，并将算子加入当前 Pipeline。
         if (config::enable_java_support) {
             op = std::make_shared<JDBCScanOperatorX>(pool, tnode, next_operator_id(), descs,
                                                      _num_instances);
@@ -1574,20 +1700,34 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         fe_with_old_version = !tnode.__isset.is_serial_operator;
         break;
     }
+    // FILE_SCAN_NODE（外表/文件系统扫描节点） 在 Pipeline 执行引擎中构建物理算子 FileScanOperatorX 的入口。
+    // 用于解析与读取外部存储及湖仓架构中的数据文件（如 S3、HDFS、NAS/Local File 以及 Iceberg、Paimon、Hudi、Hive 等 Table Format），是 Doris 数据湖联邦查询（Data Lake Federation Query） 的核心 Source 算子。
     case TPlanNodeType::FILE_SCAN_NODE: {
+        // 1. 实例化 FileScanOperatorX 物理算子
         op = std::make_shared<FileScanOperatorX>(pool, tnode, next_operator_id(), descs,
                                                  _num_instances);
         RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
         fe_with_old_version = !tnode.__isset.is_serial_operator;
         break;
     }
+    // EXCHANGE_NODE（数据交换/网络接收节点） 在 Pipeline 执行引擎中构建物理算子 ExchangeSourceOperatorX 的入口。
+    // 在 Doris 的分布式 MPR（Massively Parallel Processing）执行架构中，EXCHANGE_NODE 充当跨 BE 节点或跨 Fragment 数据传输的接收端（Receiver/DataStreamRecvr）。它负责从网络层接收上游上报的 DataStreamSender 发送过来的数据 Block，并向当前 Pipeline 吐出数据。
     case TPlanNodeType::EXCHANGE_NODE: {
+        // 1. 计算与校验 Sender 数量
+        // 从 Fragment 执行参数 _params.per_exch_num_senders 中，查找当前 EXCHANGE_NODE 节点对应的上游数据发送方（Sender Instance）的总数量。
         int num_senders = _params.per_exch_num_senders.contains(tnode.node_id)
                                   ? _params.per_exch_num_senders.find(tnode.node_id)->second
                                   : 0;
+        // 校验：通过 DCHECK_GT(num_senders, 0) 确保必须存在至少一个 Sender。只有知道了 Sender 的确切数量，接收端的引用计数/状态机（EOS 机制）才知道需要等待多少个 Sender 发送结束标志，才能安全关闭当前 Recvr。
         DCHECK_GT(num_senders, 0);
+        // 算子创建：创建 ExchangeSourceOperatorX 实例，将 num_senders 传入其内部。
         auto exchange_op = std::make_shared<ExchangeSourceOperatorX>(
                 pool, tnode, next_operator_id(), descs, num_senders);
+        // Bucket Shuffle 下的“孤立实例（Orphan Instance）”防死锁处理
+        // 在按 Bucket（分桶路由） 进行 Shuffle 数据传输的场景下，FE 会根据 Bucket 的路由规则把 Bucket 分配给特定的 BE 实例。但可能会出现某种边界情况：某个 Receiver 实例（Instance/Task）没有被分配到任何一个 Bucket。这种实例被称为 Orphan Instance（孤立实例）。
+        // 如果一个 Receiver 实例不拥有任何 Bucket，上游的 Sender 在根据 bucket_id 分发数据时，永远不会向该 Receiver 所在的 Channel 发送任何数据或 EOS（End Of Stream）信号。
+        // 这会导致这个孤立的 Receiver 实例一直阻塞等待上游的 EOS，造成整个查询死锁（Deadlock）或超时挂起。
+        // 通过 set_bucket_dest_instances 传入全局的 Bucket 到 Instance 的映射表。ExchangeSourceOperatorX 在初始化时会检查“自己是否拥有 Bucket”；如果不拥有，立刻将自己的 Receiver 状态直接设为 EOS（End Of Stream），不进行无意义的等待，从而安全地跳过执行。
         if (!_params.bucket_seq_to_instance_idx.empty()) {
             // Lets bucket-routed exchanges detect orphan instances (owning no bucket) that
             // no sender channel will ever address — their receivers must start at EOS.
@@ -1598,12 +1738,15 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         fe_with_old_version = !tnode.__isset.is_serial_operator;
         break;
     }
+    // 聚合算子是 OLAP 查询中最复杂的核心算子之一。这段代码体现了 Doris 在聚合计算上的四大核心机制：策略判定（Spill / Streaming）、Query Cache 动态插入、Pipeline 阻塞切分（Sink/Source 拆分） 以及 向量化优化（Distinct Streaming Agg）。
     case TPlanNodeType::AGGREGATION_NODE: {
+        // 校验聚合节点合法性：GROUP BY 列和输出 Slot 不能同时为空（无基准无输出的非合法算子直接抛错）。
         if (tnode.agg_node.grouping_exprs.empty() &&
             descs.get_tuple_descriptor(tnode.agg_node.output_tuple_id)->slots().empty()) {
             return Status::InternalError("Illegal aggregate node " + std::to_string(tnode.node_id) +
                                          ": group by and output is empty");
         }
+
         bool need_create_cache_op =
                 enable_query_cache && tnode.node_id == _params.fragment.query_cache_param.node_id;
         auto create_query_cache_operator = [&](PipelinePtr& new_pipe) {
@@ -1630,23 +1773,30 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             RETURN_IF_ERROR(new_pipe->set_sink(cache_sink));
             return Status::OK();
         };
+        // Group By Limit 优化 (group_by_limit_opt)：当存在 GROUP BY、按 Group Key 排序且带有 LIMIT 时，算子可以在 Hash 表达到 limit 数量后停止接收新 Key，大幅提速。
         const bool group_by_limit_opt =
                 tnode.agg_node.__isset.agg_sort_info_by_group_key && tnode.limit > 0;
 
         /// PartitionedAggSourceOperatorX does not support "group by limit opt(#29641)" yet.
         /// If `group_by_limit_opt` is true, then it might not need to spill at all.
+        // 溢写/落盘开关 (enable_spill)：当启用 Spill、且存在 GROUP BY 列、且未触发 group_by_limit_opt 时开启。因为 Group By Limit 优化通常内存占用极小，不需要落盘。
         const bool enable_spill = _runtime_state->enable_spill() &&
                                   !tnode.agg_node.grouping_exprs.empty() && !group_by_limit_opt;
+        // 流式预聚合 (is_streaming_agg)：在两阶段聚合（Two-Phase Aggregation）的第一阶段，当数据 Hash 分布不均匀时，使用 Hash 表维护局部聚合会导致 Hash 表无限膨胀。
+        // StreamingAgg 可以以较低内存开销将数据“流式”推向下游 Exchange 节点。
         const bool is_streaming_agg = tnode.agg_node.__isset.use_streaming_preaggregation &&
                                       tnode.agg_node.use_streaming_preaggregation &&
                                       !tnode.agg_node.grouping_exprs.empty();
         // TODO: distinct streaming agg does not support spill.
+        // Distinct Streaming Agg (can_use_distinct_streaming_agg)：针对 SELECT DISTINCT x, y（无聚合函数 agg_functions.empty()）的场景进行极致优化的专有流式去重算子。
         const bool can_use_distinct_streaming_agg =
                 (!enable_spill || is_streaming_agg) && tnode.agg_node.aggregate_functions.empty() &&
                 !tnode.agg_node.__isset.agg_sort_info_by_group_key &&
                 _params.query_options.__isset.enable_distinct_streaming_aggregation &&
                 _params.query_options.enable_distinct_streaming_aggregation;
-
+        // 分支 1：can_use_distinct_streaming_agg（Distinct 流式去重）
+        // 原理：专用于无聚合函数的 DISTINCT 语句。算子维持一个固定大小的轻量 HashTable / Set，匹配到的新 Key 向上游吐出，过挤时直接流式 Bypass 吐出给二阶段处理。
+        // 特点：非阻塞算子，数据随到随走，直接塞入当前 cur_pipe，无需切分 Pipeline。
         if (can_use_distinct_streaming_agg) {
             if (need_create_cache_op) {
                 PipelinePtr new_pipe;
@@ -1663,6 +1813,9 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                                                                      tnode, descs);
                 RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
             }
+        // 分支 2：is_streaming_agg（常规流式预聚合）
+        // 原理：第一阶段 Pre-Aggregation 的流式模式。
+        // 特点：非阻塞算子，实例化 StreamingAggOperatorX 直接放入 cur_pipe，不打断流水线。
         } else if (is_streaming_agg) {
             if (need_create_cache_op) {
                 PipelinePtr new_pipe;
@@ -1678,6 +1831,8 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                                                              descs);
                 RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
             }
+        // 分支 3：Blocking Agg（阻塞式全量聚合 —— 最核心分支）
+        // 当无法使用流式聚合时，聚合算子变成完全阻塞算子（Data-Blocking Operator）：必须等到上游所有数据全部写入 Hash 表（Sink 完成），才能开始向下游输出聚合结果（Source 读取）。
         } else {
             // create new pipeline to add query cache operator
             PipelinePtr new_pipe;
@@ -1685,7 +1840,8 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
                 RETURN_IF_ERROR(create_query_cache_operator(new_pipe));
                 cache_op = op;
             }
-
+            // 创建 Source 算子：
+            // 根据 enable_spill 实例化 PartitionedAggSourceOperatorX 或 AggSourceOperatorX，加入下游 Pipeline（当前 cur_pipe）。
             if (enable_spill) {
                 op = std::make_shared<PartitionedAggSourceOperatorX>(pool, tnode,
                                                                      next_operator_id(), descs);
@@ -1699,14 +1855,15 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             } else {
                 RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
             }
-
+            // 切分并建立 DAG 依赖：
             const auto downstream_pipeline_id = cur_pipe->id();
             if (!_dag.contains(downstream_pipeline_id)) {
                 _dag.insert({downstream_pipeline_id, {}});
             }
             cur_pipe = add_pipeline(cur_pipe);
             _dag[downstream_pipeline_id].push_back(cur_pipe->id());
-
+            // 挂载 Sink 算子：
+            // 根据 enable_spill 实例化 PartitionedAggSinkOperatorX 或 AggSinkOperatorX，作为新建上游 Pipeline 的 Sink 算子。
             if (enable_spill) {
                 sink_ops.push_back(std::make_shared<PartitionedAggSinkOperatorX>(
                         pool, next_sink_operator_id(), op->operator_id(), tnode, descs));
@@ -1719,7 +1876,10 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         }
         break;
     }
+    // BUCKETED_AGGREGATION_NODE（分桶/桶粒度并行聚合节点） 在 Pipeline 执行引擎中构建物理算子及其执行依赖的核心实现。
+    // BUCKETED_AGGREGATION_NODE 是 Doris 针对按 Bucket Shuffle / 分桶数据分布的聚合场景推出的一项专有优化。它的核心思想是：充分利用数据在各个 Bucket 上的天然隔离/局部 Hash 特性，在多 Instance 节点间实现低锁竞争、高并发的分桶数据聚合与合并。
     case TPlanNodeType::BUCKETED_AGGREGATION_NODE: {
+        // 核心语义：分桶聚合（Bucketed Aggregation）的前提是必须存在 GROUP BY Key，因为数据是依据 Key 的 Hash/Bucket 物理分布在不同的分桶或 Instance 中的。如果没有 GROUP BY（如标量聚合 COUNT(*)），则无法按照桶维度切分，属于 FE 优化的非合法状态，直接强拦截抛错
         if (tnode.bucketed_agg_node.grouping_exprs.empty()) {
             return Status::InternalError(
                     "Bucketed aggregation node {} should not be used without group by keys",
@@ -1727,10 +1887,12 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         }
 
         // Create source operator (goes on the current / downstream pipeline).
+        // 1. 创建 Source 算子，挂载到当前（下游）Pipeline
         op = std::make_shared<BucketedAggSourceOperatorX>(pool, tnode, next_operator_id(), descs);
         RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
 
         // Create a new pipeline for the sink side.
+        // 2. 切分 Pipeline：创建上游 Sink 侧管道并构建 DAG 依赖关系
         const auto downstream_pipeline_id = cur_pipe->id();
         if (!_dag.contains(downstream_pipeline_id)) {
             _dag.insert({downstream_pipeline_id, {}});
@@ -1739,6 +1901,9 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         _dag[downstream_pipeline_id].push_back(cur_pipe->id());
 
         // Create sink operator.
+        // 3. 创建 Sink 算子并挂载到新建的上游 Pipeline
+        // Pipeline 拆分：分桶聚合依然属于 Blocking（全阻塞）算子，因此被拆分为成对的 BucketedAggSinkOperatorX（负责攒批写 Hash 表）与 BucketedAggSourceOperatorX（负责读取合并结果吐给下游）。
+        // DAG 拓扑：下游 Pipeline 依赖上游 Build Pipeline，只有上游所有的 Sink Task 全部完成后，下游 Source 才能解阻塞并开始读数据。
         sink_ops.push_back(std::make_shared<BucketedAggSinkOperatorX>(
                 pool, next_sink_operator_id(), op->operator_id(), tnode, descs));
         RETURN_IF_ERROR(cur_pipe->set_sink(sink_ops.back()));
@@ -1748,28 +1913,36 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         // sink instance writes its per-instance hash table into the same
         // BucketedAggSharedState and every source instance can merge across
         // all of them.
+        // 核心机制：共享状态 (BucketedAggSharedState) 与 Dependency 依赖预注册
         {
+            // 1. 全局单例 SharedState：供当前 Fragment 下所有 Instance 共享
             auto shared_state = BucketedAggSharedState::create_shared();
             shared_state->id = op->operator_id();
             shared_state->related_op_ids.insert(op->operator_id());
-
+            // 2. 为每个 Sink Instance 绑定对应的 Sink Dependency
             for (int i = 0; i < _num_instances; i++) {
                 auto sink_dep = std::make_shared<Dependency>(op->operator_id(), op->node_id(),
                                                              "BUCKETED_AGG_SINK_DEPENDENCY");
                 sink_dep->set_shared_state(shared_state.get());
                 shared_state->sink_deps.push_back(sink_dep);
             }
+            // 3. 为每个 Source Instance 创建对应的 Source Dependency 依赖
             shared_state->create_source_dependencies(_num_instances, op->operator_id(),
                                                      op->node_id(), "BUCKETED_AGG_SOURCE");
+            // 4. 将 Shared State 注册到全局映射表，供 Runtime 调度引擎查询与状态变更通知
             _op_id_to_shared_state.insert(
                     {op->operator_id(), {shared_state, shared_state->sink_deps}});
         }
         break;
     }
+    // 解析 Join 物理节点，区分 Spill（落盘/溢写）与内存执行模式，创建 Build 侧（Sink）和 Probe 侧（Source）物理算子，并配置 Broadcast Join 的跨 Instance 共享 Hash 表（SharedState）依赖。
+    // 代码主要分为两个核心分支：Spill 分支（PartitionedHashJoin） 与 非 Spill 内存分支（HashJoin），并在最后统一处理 Broadcast Join 的内存共享机制。
     case TPlanNodeType::HASH_JOIN_NODE: {
         const auto is_broadcast_join = tnode.hash_join_node.__isset.is_broadcast_join &&
                                        tnode.hash_join_node.is_broadcast_join;
         const auto enable_spill = _runtime_state->enable_spill();
+        // 1. Spill 溢写分支：PartitionedHashJoin
+        // 为什么 Broadcast Join 不支持 Spill？ Broadcast Join 数据的 Build 侧通常小到可以完全放进内存，溢写开销反而远大于内存开销；此外 Broadcast 共享 Hash 表的结构难以进行 Partitioned Spill。
         if (enable_spill && !is_broadcast_join) {
             auto tnode_ = tnode;
             tnode_.runtime_filters.clear();
@@ -1811,6 +1984,8 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
 
             _pipeline_parent_map.push(op->node_id(), cur_pipe);
             _pipeline_parent_map.push(op->node_id(), build_side_pipe);
+        // 2. 非 Spill 内存分支：标准 Pipeline Hash Join
+        // Pipeline 打断机制：Hash Join 是典型的 Data-Blocking（数据阻塞） 算子。Probe 侧（下游 Pipeline）必须等待 Build 侧（上游 Pipeline）将右表数据全量读取并成功构建 Hash 表（Sink 完成）后才能开始 Probe。
         } else {
             op = std::make_shared<HashJoinProbeOperatorX>(pool, tnode, next_operator_id(), descs);
             RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
@@ -1830,6 +2005,9 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
             _pipeline_parent_map.push(op->node_id(), cur_pipe);
             _pipeline_parent_map.push(op->node_id(), build_side_pipe);
         }
+        // 3. Broadcast Join 内存共享机制 (HashJoinSharedState)
+        // 核心价值：在 Broadcast Join 场景下，同一个 BE 节点上的所有并发 Pipeline Instance 接收到的 Build 侧（右表）数据完全相同。
+        // 共享机制：如果不做优化，每个 Instance 会各自构建一份一模一样的 Hash 表，造成严重内存浪费与 CPU 重复计算。
         if (is_broadcast_join && _runtime_state->enable_share_hash_table_for_broadcast_join()) {
             std::shared_ptr<HashJoinSharedState> shared_state =
                     HashJoinSharedState::create_shared(_num_instances);
@@ -1846,17 +2024,20 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         }
         break;
     }
+    // 执行引擎中解析与构建 CROSS_JOIN_NODE（交叉连接 / 笛卡尔积节点，以及带有非等值 Join 条件的 Nested Loop Join） 物理算子树的入口实现
     case TPlanNodeType::CROSS_JOIN_NODE: {
+        // 1. 创建 Probe 侧算子并装载至当前 Pipeline
+        // 算子选型：Doris 物理执行引擎将 CROSS_JOIN_NODE 实现为 NestedLoopJoin（嵌套循环连接）。
         op = std::make_shared<NestedLoopJoinProbeOperatorX>(pool, tnode, next_operator_id(), descs);
         RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
-
+        // 2. 切分 Pipeline 并建立 DAG 依赖拓扑
         const auto downstream_pipeline_id = cur_pipe->id();
         if (!_dag.contains(downstream_pipeline_id)) {
             _dag.insert({downstream_pipeline_id, {}});
         }
         PipelinePtr build_side_pipe = add_pipeline(cur_pipe);
         _dag[downstream_pipeline_id].push_back(build_side_pipe->id());
-
+        // 3. 创建 Build 侧 Sink 算子并挂载到新建 Pipeline
         sink_ops.push_back(std::make_shared<NestedLoopJoinBuildSinkOperatorX>(
                 pool, next_sink_operator_id(), op->operator_id(), tnode, descs));
         RETURN_IF_ERROR(build_side_pipe->set_sink(sink_ops.back()));
@@ -1865,8 +2046,12 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         _pipeline_parent_map.push(op->node_id(), build_side_pipe);
         break;
     }
+    // UNION_NODE（Union / 集合合并节点，通常对应 UNION ALL） 在 Pipeline 执行引擎中构建物理算子树及 N 选 1 多分支 DAG 拓扑的核心实现。
     case TPlanNodeType::UNION_NODE: {
         int child_count = tnode.num_children;
+        // 1. 实例化 UnionSourceOperatorX 汇聚 Source
+        // 算子职责：UnionSourceOperatorX 作为下游 Pipeline 的 Source 算子。
+        // 数据流向：它的任务不是去存储引擎读数据，而是作为一个 M:N 共享 Buffer/队列的消费者，不断从中拉取各个上游分支 UnionSinkOperatorX 写入的数据块（Block），并吐给下游 Pipeline。
         op = std::make_shared<UnionSourceOperatorX>(pool, tnode, next_operator_id(), descs);
         RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));
 
@@ -1874,14 +2059,18 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         if (!_dag.contains(downstream_pipeline_id)) {
             _dag.insert({downstream_pipeline_id, {}});
         }
+        // 2. 循环构建 $N$ 个上游分支 Pipeline 与 Sink 算子
         for (int i = 0; i < child_count; i++) {
+            //  1. 为第 i 个子分支创建独立的上游 Pipeline
             PipelinePtr build_side_pipe = add_pipeline(cur_pipe);
             _dag[downstream_pipeline_id].push_back(build_side_pipe->id());
+            // 2. 为该 Pipeline 挂载 UnionSinkOperatorX
             sink_ops.push_back(std::make_shared<UnionSinkOperatorX>(
                     i, next_sink_operator_id(), op->operator_id(), pool, tnode, descs));
             RETURN_IF_ERROR(build_side_pipe->set_sink(sink_ops.back()));
             RETURN_IF_ERROR(build_side_pipe->sink()->init(tnode, _runtime_state.get()));
             // preset children pipelines. if any pipeline found this as its father, will use the prepared pipeline to build.
+            // 3. 预先将创建好的子分支 Pipeline 注册到 _pipeline_parent_map
             _pipeline_parent_map.push(op->node_id(), build_side_pipe);
         }
         break;
@@ -1953,6 +2142,8 @@ Status PipelineFragmentContext::_create_operator(ObjectPool* pool, const TPlanNo
         RETURN_IF_ERROR(cur_pipe->sink()->init(tnode, _runtime_state.get()));
         break;
     }
+    // MATERIALIZATION_NODE（物化/延迟物化节点） 在 Pipeline 执行引擎中构建物理算子 MaterializationOperator 的入口。
+    // 它主要用于 Late Materialization（延迟物化） 优化技术，即在查询早期（如 Scan / Filter 阶段）只读取并传递行号（RowId）或少量的 Filter 列，待高选择性的过滤条件执行完毕后，再通过物化节点将需要的其余列数据拉取并拼接拼装出来，从而大幅减少昂贵的 I/O 和内存反序列化开销。
     case TPlanNodeType::MATERIALIZATION_NODE: {
         op = std::make_shared<MaterializationOperator>(pool, tnode, next_operator_id(), descs);
         RETURN_IF_ERROR(cur_pipe->add_operator(op, _parallel_instances));

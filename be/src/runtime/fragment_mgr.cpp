@@ -463,11 +463,13 @@ std::shared_ptr<QueryContext> FragmentMgr::get_query_ctx(const TUniqueId& query_
     }
     return nullptr;
 }
-
+// 承担着查询上下文（QueryContext）的初始化与生命周期管理职责
+// 当 FE (Frontend) 触发某个 Fragment 到当前 BE 节点时，该方法负责获取已有上下文或在第一次收到请求时高效、线程安全地构建上下文。
 Status FragmentMgr::_get_or_create_query_ctx(const TPipelineFragmentParams& params,
                                              const TPipelineFragmentParamsList& parent,
                                              QuerySource query_source,
                                              std::shared_ptr<QueryContext>& query_ctx) {
+    // 首先从 params 提出当前查询的 query_id。
     auto query_id = params.query_id;
     DBUG_EXECUTE_IF("FragmentMgr._get_query_ctx.failed", {
         return Status::InternalError("FragmentMgr._get_query_ctx.failed, query id {}",
@@ -476,7 +478,10 @@ Status FragmentMgr::_get_or_create_query_ctx(const TPipelineFragmentParams& para
 
     // Find _query_ctx_map, in case some other request has already
     // create the query fragments context.
+    // 检查全局 Map 是否已存在 Context
+    // 一个 Query 可能由多个 Fragment 组成，或者同一 Fragment 存在并发传输。此处先调用 get_query_ctx(query_id) 查询全局的 _query_ctx_map，看其他线程/RPC 是否已经创建好了该 Query 的 QueryContext。
     query_ctx = get_query_ctx(query_id);
+    // 为了减少 FE 与 BE 传输元数据的网络开销，Doris 做了 RPC 参数精简优化。首个 RPC 会带上全量元数据（desc_tbl 等），后续 RPC（is_simplified_param == true）仅带精简参数，复用第一次建好的 QueryContext。
     if (params.is_simplified_param) {
         // Get common components from _query_ctx_map
         if (!query_ctx) {
@@ -486,6 +491,7 @@ Status FragmentMgr::_get_or_create_query_ctx(const TPipelineFragmentParams& para
                     print_id(query_id), BackendOptions::get_localhost());
         }
     } else {
+    // 主流程：原子化检查并创建 QueryContext
         if (!query_ctx) {
             RETURN_IF_ERROR(_query_ctx_map.apply_if_not_exists(
                     query_id, query_ctx,
@@ -493,6 +499,8 @@ Status FragmentMgr::_get_or_create_query_ctx(const TPipelineFragmentParams& para
                             -> Status {
                         WorkloadGroupPtr workload_group_ptr = nullptr;
                         std::vector<uint64_t> wg_id_set;
+                        // 提取 params 中的资源组 ID 集合。
+                        // 通过全局环境 ExecEnv 中的 WorkloadGroupMgr 获取该查询应该使用的资源组（用于 CPU/内存等软硬限额调度）。
                         if (params.__isset.workload_groups && !params.workload_groups.empty()) {
                             for (auto& wg : params.workload_groups) {
                                 wg_id_set.push_back(wg.id);
@@ -516,17 +524,22 @@ Status FragmentMgr::_get_or_create_query_ctx(const TPipelineFragmentParams& para
                         // Cross-cluster query: coordinator FE may not belong to local cluster.
                         // In that case, cancel_worker() should not cancel it based on local FE liveness.
                         QuerySource actual_query_source = query_source;
+                        // 如果原本标记为内部 FE（INTERNAL_FRONTEND），但检查发现发起查询的 Coordinator 地址不在当前 BE 识别的本地集群运行中 FE 列表中（get_running_frontends()），说明是跨集群/外部 FE 查询。将其修正为 EXTERNAL_FRONTEND，防止 BE 的心跳存活检查机制误将其取消。
                         if (query_source == QuerySource::INTERNAL_FRONTEND &&
                             !_exec_env->get_running_frontends().contains(params.coord)) {
                             actual_query_source = QuerySource::EXTERNAL_FRONTEND;
                         }
+                        // 调用工厂方法 QueryContext::create 正式实例化 QueryContext 对象。
                         query_ctx = QueryContext::create(
                                 query_id, _exec_env, params.query_options, params.coord,
                                 params.is_nereids, params.current_connect_fe, actual_query_source);
+                        // 利用 RAII 将当前线程的内存分配统计临时切换到新创建的 query_mem_tracker() 上，后续反序列化元数据等内存开销都会计入该查询的内存用量中。
                         SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(query_ctx->query_mem_tracker());
+                        // 反序列化 Thrift 格式的 desc_tbl，在 query_ctx->obj_pool 内存池中构建 Tuple/Slot/Table 描述符表（物理执行算子计算依赖的核心元数据）。
                         RETURN_IF_ERROR(DescriptorTbl::create(
                                 &(query_ctx->obj_pool), params.desc_tbl, &(query_ctx->desc_tbl)));
                         // set file scan range params
+                        // 填充通用配置（File Scan / Query Globals / Resource / AI Resources）
                         if (params.__isset.file_scan_params) {
                             query_ctx->file_scan_range_params_map = params.file_scan_params;
                         }
@@ -567,6 +580,7 @@ Status FragmentMgr::_get_or_create_query_ctx(const TPipelineFragmentParams& para
 
                         // There is some logic in query ctx's dctor, we could not check if exists and delete the
                         // temp query ctx now. For example, the query id maybe removed from workload group's queryset.
+                        // 注册至全局 Map 并返回
                         map.insert({query_id, query_ctx});
                         return Status::OK();
                     }));
@@ -633,30 +647,48 @@ std::string FragmentMgr::dump_pipeline_tasks(TUniqueId& query_id) {
                 print_id(query_id));
     }
 }
-
+// 在 Apache Doris 的 Backend（BE）架构中，FragmentMgr::exec_plan_fragment 是执行计划管理器（FragmentMgr）接管并构建物理执行 Pipeline 的真正落地入口。
+// PInternalService 完成了网络 RPC 解包与参数准备后，调用该方法将 Thrift 格式的 Fragment 参数正式转化为 BE 引擎内部的 PipelineFragmentContext，
+// 完成资源绑定、上下文构建、Prepare 初始化、Map 注册，并提交至 Pipeline 调度器（TaskScheduler）开始运行。
+// const TPipelineFragmentParams& params  当前要执行的单个 Pipeline Fragment 的完整参数（Thrift 结构），包含 Query ID、Fragment ID、数据源 Scan Ranges、Exec Nodes（执行节点树）、Data Sink（数据下发目标）等。
+// QuerySource query_source  查询来源枚举类型（如 INTERNAL_FRONTEND、GROUP_COMMIT 等）。标识该查询是由 FE 下发、内部后台任务还是 Group Commit 触发，用于资源隔离、内存追踪（MemTracker）以及统计分类。
+// const FinishCallback& cb  Fragment 运行终结时的回调函数（Finish Callback）。当当前 Fragment 执行完毕（无论是成功还是失败退出）时触发，用于向上层（如 FE 或事务管理器）上报执行状态、结果统计信息或释放关联资源。
+// const TPipelineFragmentParamsList& parent  整个查询在当前 BE 节点上的全局打包参数列表。
+// std::shared_ptr<bool> is_prepare_success  如果外部传入了有效指针，当 Fragment 成功完成 Prepare 阶段并提交后，函数会将其置为 true，供上层调用方感知 Prepare 状态。
 Status FragmentMgr::exec_plan_fragment(const TPipelineFragmentParams& params,
                                        QuerySource query_source, const FinishCallback& cb,
                                        const TPipelineFragmentParamsList& parent,
                                        std::shared_ptr<bool> is_prepare_success) {
+	// 以详细日志（VLOG_ROW 级别）输出当前 Fragment 的 Thrift 文本格式参数。
     VLOG_ROW << "Query: " << print_id(params.query_id) << " exec_plan_fragment params is "
              << apache::thrift::ThriftDebugString(params).c_str();
     // sometimes TPipelineFragmentParams debug string is too long and glog
     // will truncate the log line, so print query options seperately for debuggin purpose
     VLOG_ROW << "Query: " << print_id(params.query_id) << "query options is "
              << apache::thrift::ThriftDebugString(params.query_options).c_str();
-
+	// 获取或创建 Query 上下文并绑定资源
+	// 获取或创建该查询在当前 BE 节点上的全局唯一上下文 QueryContext。
+	// 一个 Query 可能包含多个分发到同一个 BE 上的 Fragment。_get_or_create_query_ctx 保证了同一个 Query 在同一个 BE 上只存在一个 QueryContext，
+	// 统一管理该 Query 的内存 Tracker、资源组（Resource Group）、Runtime Filter 句柄以及整体取消状态。
     std::shared_ptr<QueryContext> query_ctx;
     RETURN_IF_ERROR(_get_or_create_query_ctx(params, parent, query_source, query_ctx));
+	// 利用 RAII 机制，将当前线程的资源上下文（ResourceContext / ThreadContext）绑定至 query_ctx 的资源上下文。
     SCOPED_ATTACH_TASK(query_ctx.get()->resource_ctx());
     // Set single_backend_query before prepare() so that pipeline local states
     // (e.g. StreamingAggLocalState) can read the correct value in their constructors.
+	// 解析并标记当前查询是否为“单 BE 节点查询（Single Backend Query）”。
+	// 必须在 prepare() 之前设置。很多算子的 LocalState（例如 StreamingAggLocalState 聚合本地状态）在构造时会读取此标记，
+	// 如果是单节点查询，可以跳过很多分布式 Shuffle 数据的网络通信初始化，优化执行性能。
     query_ctx->set_single_backend_query(params.__isset.query_options &&
                                         params.query_options.__isset.single_backend_query &&
                                         params.query_options.single_backend_query);
     int64_t duration_ns = 0;
+	// 构建并 Prepare 初始化 Pipeline Fragment 上下文
     std::shared_ptr<PipelineFragmentContext> context = std::make_shared<PipelineFragmentContext>(
             query_ctx->query_id(), params, query_ctx, _exec_env, cb);
     {
+	// 计时并调用 context->prepare() 将逻辑执行节点树转化为物理 Pipeline 管道与 PipelineTask。
+	// prepare() 内部会完成算子构建、数据源（ScanNode）的分片分配、表达式编译（Expr Prepare）以及内存申请。
         SCOPED_RAW_TIMER(&duration_ns);
         Status prepare_st = Status::OK();
         ASSIGN_STATUS_IF_CATCH_EXCEPTION(prepare_st = context->prepare(_thread_pool.get()),
@@ -664,6 +696,7 @@ Status FragmentMgr::exec_plan_fragment(const TPipelineFragmentParams& params,
         DBUG_EXECUTE_IF("FragmentMgr.exec_plan_fragment.prepare_failed", {
             prepare_st = Status::Aborted("FragmentMgr.exec_plan_fragment.prepare_failed");
         });
+		// 错误处理：如果 Prepare 失败（如内存不足、表达式编译错误等），立即调用 query_ctx->cancel(...) 终止整条 Query 并返回错误。
         if (!prepare_st.ok()) {
             query_ctx->cancel(prepare_st, params.fragment_id);
             return prepare_st;
@@ -674,6 +707,7 @@ Status FragmentMgr::exec_plan_fragment(const TPipelineFragmentParams& params,
     DBUG_EXECUTE_IF("FragmentMgr.exec_plan_fragment.failed",
                     { return Status::Aborted("FragmentMgr.exec_plan_fragment.failed"); });
     {
+	// 更新系统全局监控指标：正在执行的 Fragment 计数器 g_fragment_executing_count 加 1；更新节点最后活跃时间 g_fragment_last_active_time 为当前毫秒时间戳。
         int64_t now = duration_cast<std::chrono::milliseconds>(
                               std::chrono::system_clock::now().time_since_epoch())
                               .count();
@@ -681,6 +715,8 @@ Status FragmentMgr::exec_plan_fragment(const TPipelineFragmentParams& params,
         g_fragment_last_active_time.set_value(now);
 
         // (query_id, fragment_id) is executed only on one BE, locks _pipeline_map.
+		// 将当前 Fragment 注册到 FragmentMgr 全局维护的并发安全的哈希表 _pipeline_map 中。
+		// 防止重复执行：检查 {query_id, fragment_id} 是否已经在运行。如果已存在，说明网络重发或 FE 分发逻辑存在重复，抛出 duplicated fragment_id 内部错误。
         auto res = _pipeline_map.find({params.query_id, params.fragment_id});
         if (res != nullptr) {
             return Status::InternalError(
@@ -693,6 +729,9 @@ Status FragmentMgr::exec_plan_fragment(const TPipelineFragmentParams& params,
     // Save params for recursive CTE child fragments so we can recreate the PFC later.
     // For recursive CTE, the child fragment needs to be destroyed and rebuilt between rounds,
     // so we save the original params here and use them in rerun_fragment(rebuild).
+	// 为支持递归 CTE（如树形结构递归查询）保存必要的重启参数。
+	// 设计意图：在递归 CTE 查询中，子 Fragment 需要在每一轮迭代间被销毁并重新重建（Rebuild）。
+	// 因此将初始参数、回调函数与 query_ctx 缓存到 _rerunnable_params_map 中，后续调用 rerun_fragment 即可直接复用这些参数重新创建 PipelineFragmentContext。
     if (params.__isset.need_notify_close && params.need_notify_close) {
         std::lock_guard<std::mutex> lk(_rerunnable_params_lock);
         _rerunnable_params_map[{params.query_id, params.fragment_id}] = {
@@ -702,13 +741,14 @@ Status FragmentMgr::exec_plan_fragment(const TPipelineFragmentParams& params,
                 .finish_callback = cb,
                 .query_ctx = query_ctx};
     }
-
+	// 设计意图：如果当前 Fragment 不需要等待 FE 的“两阶段启动触发信号（Execution Trigger）”，直接将 QueryContext 标记为 ready_to_execute（即可立即开始调度）。
     if (!params.__isset.need_wait_execution_trigger || !params.need_wait_execution_trigger) {
         query_ctx->set_ready_to_execute_only();
     }
-
+	// 将 context（PipelineFragmentContext）关联登记到 QueryContext 内部，方便 Query 级别的统一管理与协同。
     query_ctx->set_pipeline_context(params.fragment_id, context);
-
+	// 正式提交 Fragment 执行。
+	// 将 context 内部在 prepare() 阶段构建出来的所有 PipelineTask（流水线任务）推入 BE 的全局 Pipeline 调度器（TaskScheduler）的任务队列中，正式开始占用 CPU 线程池调度运行。
     RETURN_IF_ERROR(context->submit());
     if (is_prepare_success != nullptr) {
         *is_prepare_success = true;

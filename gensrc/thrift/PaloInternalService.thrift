@@ -705,61 +705,153 @@ struct TPipelineInstanceParams {
   8: optional list<i32> topn_filter_source_node_ids // deprecated after we set topn_filter_descs
   9: optional list<PlanNodes.TTopnFilterDesc> topn_filter_descs
 }
-
+// 在 FE（Frontend）生成物理查询计划后，它会通过 bRPC 将这个结构体序列化传输给 BE（Backend）。
+// BE 收到后，正是凭借该结构体中的元数据与具体指令，在 Pipeline 执行引擎（FragmentMgr / PipelineFragmentContext）中构建并调度运行真实的流水线任务。
+// 分布式计划下发的元数据载体：它是 FE 向 BE 发送物理 Pipeline 片段的“总指挥图纸”，包含要执行的算子树（Plan Fragment）、数据源（Scan Range）、数据去向（Data Sink Dest Formation）等。
+// 多 Pipeline Instance 并行构建凭证：在 Doris 新一代 Pipeline 执行引擎中，一个 Fragment 会根据并行度（Parallelism）拆分为多个 PipelineInstance。该结构体包含全局配置以及一个 local_params 列表（每个 Instance 的私有参数）。
+// 资源、上下文与控制信令集锦：封装了查询的 Memory/Resource Group 限额、事务控制（Txn Conf）、动态过滤器信息（Runtime Filter/TopN Filter）、Group Commit 机制以及云原生/MOW（Merge-On-Write）特定标记。
 // ExecPlanFragment
 struct TPipelineFragmentParams {
+  //服务内部协议版本。
   1: required PaloInternalServiceVersion protocol_version
+  // 查询全局唯一标识（128 位 UUID）。
   2: required Types.TUniqueId query_id
+  // 当前 Fragment 的 ID。
+  // 在整棵查询树（Execution Tree）中唯一标识一个物理片段（如 HashJoin 节点所在的 Fragment）。
   3: optional i32 fragment_id
+  // ** Exchange 接收节点的上游 Sender 数量映射表**。
+  // Key 为 PlanNodeId（ExchangeNode），Value 为上游有多少个发送端 BE/Instance。ExchangeNode 靠此计数值判断何时接收完所有上游数据。
   4: required map<Types.TPlanNodeId, i32> per_exch_num_senders
+  //** Descriptor 描述符表**。
+  // 包含该 Fragment 运行所需的 TupleDescriptor、SlotDescriptor 和 TableDescriptor，定义了所有 Slot/Column 的内存数据类型、Nullability 及布局。
   5: optional Descriptors.TDescriptorTable desc_tbl
   // Deprecated
+  // 早期用于 Yarn/CGroup 资源隔离，已被 Workload Group（ID 26）替代。
   6: optional Types.TResourceInfo resource_info
+  // 数据下发的目标 BE/Instance 列表。
+  // 定义当前 Fragment 处理完数据后，将数据发送（Data Stream Sink / Exchange Sender）至下游哪些 BE 节点的哪个 Exchange Node。
   7: list<DataSinks.TPlanFragmentDestination> destinations
+  // 当前 Fragment 的 Sender 总数。
+  // 标识当前物理片段共有多少个并发发送端 Instance。
   8: optional i32 num_senders
+  // 是否随每个 Data Batch 附带 Query 统计信息。
+  // 用于实时上报当前 Fragment 扫描的行数、CPU 耗时等 Profile 统计数据。
   9: optional bool send_query_statistics_with_every_batch
+  // ** Coordinator（协调者节点，通常为 FE）的网络地址**。
+  // 指示当前 BE 节点在查询结束或报错时，应向哪个 IP:Port 上报 Runtime Profile 和最终执行状态。
   10: optional Types.TNetworkAddress coord
+  // 查询全局变量。
+  // 包含当前 SQL 执行的系统时间（now()）、时区（Timezone）、Session ID 等所有算子共享的静态全局元数据。
   11: optional TQueryGlobals query_globals
+  // 查询控制选项。
+  // 封装了 SQL Session 级别的控制参数（如 exec_mem_limit、parallel_pipeline_task_num、query_timeout、enable_vectorized_engine 等）。
   12: optional TQueryOptions query_options
   // load job related
+  // 导入任务 Label（仅导入/Stream Load 场景）。
+  // 标识当前 Load Job 的用户唯一 Label，用于事务状态跟踪与幂等性保证。
   13: optional string import_label
+  // 数据库名称。
+  // 当前查询或导入操作目标表所属的 Database 名称。
   14: optional string db_name
+  // 导入任务 Job ID。
+  // FE 分配给当前 Broker Load / Routine Load / Stream Load 的唯一长整型 ID。
   15: optional i64 load_job_id
+  // 导入错误 Hub 收集信息。
+  // 当导入出现错误行（Error Rows）时，指定将错误数据写入外部存储（如 HDFS/S3/MySQL）配置。
   16: optional TLoadErrorHubInfo load_error_hub_info
+  // 当前 BE 宿主机上运行的 Fragment 数量。
+  // 用于调度器估算当前节点的负载压力与并发度。
   17: optional i32 fragment_num_on_host
+  // 当前 BE 节点的唯一 Backend ID。
+  // FE 节点元数据中记录的该 BE 的全局长整型编号。
   18: optional i64 backend_id
+  // 是否需要等待两阶段执行触发信号。
+  // 默认 false。若为 true，BE 在 Prepare 完毕后会挂起等待 FE 下发 Start 信号才开始实际计算，用于解决大型分布式 Join 的死锁问题。
   19: optional bool need_wait_execution_trigger = false
+  // 共享 Hash Table 的 Instance ID 列表。
+  // 在管道并行引擎中，同节点上的多个 Instance 可以共享同一个 Broadcast Hash Join 的 Build 侧哈希表以大幅节省内存。
   20: optional list<Types.TUniqueId> instances_sharing_hash_table
+  // 精简参数裁剪标记。
+  // 默认 false。标识当前 Thrift 结构是否经过裁剪瘦身，用于减少分布式网络传输开销。
   21: optional bool is_simplified_param = false;
+  // 全局字典元数据。
+  // 用于低基数字符串列（Low-Cardinality String）的全局字典优化。Scan Node 可以直接读取整数编码而非字符串，提升计算与传输性能。
   22: optional TGlobalDict global_dict  // scan node could use the global dict to encode the string value to an integer
+  // 物理执行片段（算子树）。
+  // 包含当前 Fragment 内所有的 TPlanNode（如 HashJoinNode、AggregateNode、OlapScanNode），构成真实的算子执行逻辑。 
   23: optional Planner.TPlanFragment fragment
+  // 各 Pipeline Instance 的私有参数列表。
+  // 每一个元素对应一个 PipelineInstance，里面包含了该 Instance 专属的 instance_id、扫描的具体 scan_ranges 等。
   24: list<TPipelineInstanceParams> local_params
+  // ** Workload Group（资源组）配置**。
+  // 指定该 Fragment 绑定的资源组，用于 BE 侧硬/软限制 CPU 线程配额、内存上限及查询排队。
   26: optional list<TPipelineWorkloadGroup> workload_groups
+  // 事务配置参数。
+  // 在 Stream Load 或两阶段提交写数据时，封装关联的 Transaction ID、Commit 状态及锁元数据。
   27: optional TTxnParams txn_conf
+  // 目标表名称。
+  // 当前写入或查询的主表表名。
   28: optional string table_name
   // scan node id -> scan range params, only for external file scan
+  // 外表文件扫描参数映射。
+  // 专用于外表（Hive/Iceberg/Hudi/S3/HDFS）。Key 为 ScanNodeId，Value 包含文件 Schema、压缩格式、列映射等。
   29: optional map<Types.TPlanNodeId, PlanNodes.TFileScanRangeParams> file_scan_params
+  // 是否开启 Group Commit（组提交）。
+  // 默认 false。标识当前导入任务是否走 Group Commit 管道以提高高频小批量导入的吞吐量。
   30: optional bool group_commit = false;
+  // 单节点 Load Stream 连接管道数。
+  // 在 Stream Load/数据导入 Pipeline 中，指定向下游每个 BE 建立的数据传输流通道数量。
   31: optional i32 load_stream_per_node // num load stream for each sink backend
+  // 下游可见的 Load Stream 总管道数。
+  // 下游接收端节点根据此总数来初始化 Data Stream Receiver 的配额。
   32: optional i32 total_load_streams // total num of load streams the downstream backend will see
+  // 本地 Sink（Local Data Sink）数量。
+  // 标识在当前 BE 节点内部通过进程内内存队列传输数据的 Sink 实例个数（规避网络序列化）。
   33: optional i32 num_local_sink
+  // 分桶（Bucket）总数。
+  // 针对 Bucket Shuffle Join 或分桶表扫描，记录当前表或者数据分布的 Hash 分桶总个数。
   34: optional i32 num_buckets
+  // ** Bucket 序号到 Instance 索引的映射表**。
+  // Key 为分桶序号（Bucket Seq），Value 为负责处理该分桶的 local_params 中的 Instance 索引。
   35: optional map<i32, i32> bucket_seq_to_instance_idx
+  // 早期用于多 Instance 共享 Scan 句柄，现已重构成 Pipeline 引擎内部的统一异步 Scan 调度。
   36: optional map<Types.TPlanNodeId, bool> per_node_shared_scans // deprecated
+  // 当前 BE 节点上的并发 Instance 数量。
+  // 即该 Fragment 在当前 BE 上拆分出的 Pipeline 实例并行度（通常等于 parallel_pipeline_task_num）。
   37: optional i32 parallel_instances
+  // 全集群当前 Fragment 的 Instance 总数。
+  // 记录所有 BE 节点上该 Fragment 的并发 Instance 累加总和。
   38: optional i32 total_instances
+  // ** Shuffle 索引到 Instance 索引的映射表**。
+  // 用于 Bucket/Hash Shuffle 传输时，将数据 Hash 值精准路由到目标 Instance。
   39: optional map<i32, i32> shuffle_idx_to_instance_idx
+  // 是否由 Nereids 新优化器生成。
+  // 默认 true。标识该执行计划是否来源于 Doris 新一代现代架构优化器（Nereids），用于 BE 区分某些语法/类型行为。
   40: optional bool is_nereids = true;
+  // WAL（Write-Ahead Log）日志 ID。
+  // 在 Group Commit 或短事务写入开启时，对应存储引擎写入预写日志的唯一 WAL ID。
   41: optional i64 wal_id
+  // 数据内容总长度。
+  // 导入任务或数据传输时预估/确切的数据字节大小，用于内存预配。
   42: optional i64 content_length
+  // 客户端直接连接的 FE 地址。
+  // 记录用户发起 SQL 的原始 Master/Observer FE 网络地址，用于日志追溯与 Callback 上报。
   43: optional Types.TNetworkAddress current_connect_fe
   // Used by 2.1
+  // 针对 Runtime TopN 动态过滤优化，指定产生 TopN 过滤条件的 Sort/Node ID。
   44: optional list<i32> topn_filter_source_node_ids
+  // ** AI/LLM 扩展资源字典**。
+  // 用于 Doris 集成内置 AI/向量函数/模型推理服务时的 AI 资源连接句柄。
   45: optional map<string, TAIResource> ai_resources
+  // 是否需要在关闭时通知（用于递归 CTE）。
   46: optional bool need_notify_close
 
   // For cloud
+  // （云原生/存储层）是否为 Unique Key MOW 表。
+  // 标识目标表是否为 Merge-On-Write（写时合并）主键模型表，影响 Delete Bitmap 的生成策略。
   1000: optional bool is_mow_table;
+  // （云原生/存储层）是否开启 TSO 检查。
+  // 标识存算分离模式下是否使能 Timestamp Oracle 事务时间戳检查。
   1001: optional bool enable_tso;
 }
 
@@ -770,9 +862,17 @@ struct TRuntimeFilterInfo {
   // for topn runtime filter
   2: optional list<PlanNodes.TTopnFilterDesc> topn_filter_descs
 }
-
+// 多 Fragment 批量打包传输（RPC 优化）：
+// 在一个复杂的 SQL 查询中，FE 可能会将属于同一个 Query 的多个物理 Fragment 同时调度给同一个 BE 节点执行。如果为每个 Fragment 都发送一次单独的 RPC，会导致大量的网络开销。TPipelineFragmentParamsList 允许 FE 将这些 Fragment 打包在 params_list 中一次性 RPC 发送给 BE。
+// 跨 Fragment 公共元数据解耦与复用（网络带宽与内存优化）：
+// 在单 Fragment 参数 TPipelineFragmentParams 中，包含了大量的全局元数据（如描述符表 desc_tbl、文件扫描参数 file_scan_params、查询选项 query_options、Runtime Filter 路由信息等）。如果每个 Fragment 都带有一份完整的元数据，序列化体积会极大膨胀。
+// TPipelineFragmentParamsList 将整个 Query 在当前 BE 节点共享的元数据提取到外层顶层。当 BE 接收并处理请求时（例如在前述 exec_plan_fragment 方法传入的 parent 参数），会直接从该外层结构体中共享这些全局信息，从而大幅降低 bRPC 的网络传输带宽与内存开销。
 struct TPipelineFragmentParamsList {
+  // Pipeline Fragment 参数列表。
+  // 包含当前 BE 节点需要构建并执行的所有 TPipelineFragmentParams 结构体列表。每个元素代表一个具体的物理 Fragment 实例。
   1: optional list<TPipelineFragmentParams> params_list;
+  // 共享描述符表（Descriptor Table）。
+  // 整个 Query 在当前 BE 上共享的元数据描述符表，包含了所有 SlotDescriptor、TupleDescriptor 和 TableDescriptor。内层 Fragment 可直接共享此表，避免重复传输。
   2: optional Descriptors.TDescriptorTable desc_tbl;
   // scan node id -> scan range params, only for external file scan
   3: optional map<Types.TPlanNodeId, PlanNodes.TFileScanRangeParams> file_scan_params;

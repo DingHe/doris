@@ -114,14 +114,20 @@ struct BasicSharedState {
         return {source_deps[channel_id]};
     }
 };
-
+// Dependency 类是 Pipeline 执行引擎（Pipeline Execution Engine）中用于异步调度与任务阻塞控制的核心抽象基类。
+// 在 Apache Doris 的 Pipeline 执行模型中，PipelineTask（管道任务）是由线程池异步调度的。Task 不能一直占用线程做无意义的轮询或阻塞等待（例如等待 Hash Join 的 Build 端构建完成、等待 Data Stream Receiver 接收到数据等）。
+// Dependency（依赖项）就是为了解决非阻塞调度而设计的：
+// 控制 Task 状态：表示某个 Task 执行所依赖的外部条件（数据准备就绪、内存资源就绪、上游算子就绪等）。
+// 解除与重新唤醒（Block & Wake-up）：当条件不满足时，Dependency 将 Task 设为阻塞状态（block），并将 Task 注册到内部等待队列；当条件满足时（set_ready），依赖项负责通知并唤醒被阻塞的 Downstream PipelineTask，让它们重新进入可调度队列。
+// 指标监控：记录 Task 被依赖项阻塞的时间成本，用于 Query Profile 性能分析。
 class Dependency : public std::enable_shared_from_this<Dependency> {
 public:
     ENABLE_FACTORY_CREATOR(Dependency);
+    // 构造函数。初始化依赖项的 ID、关联节点 ID、名称以及初始的就绪状态（默认不就绪 false）。
     Dependency(int id, int node_id, std::string name, bool ready = false)
             : _id(id), _node_id(node_id), _name(std::move(name)), _ready(ready) {}
     virtual ~Dependency() = default;
-
+    // 返回当前 Dependency 的唯一标识 _id。[[nodiscard]] 提醒调用者不应忽略返回值。
     [[nodiscard]] int id() const { return _id; }
     [[nodiscard]] virtual std::string name() const { return _name; }
     BasicSharedState* shared_state() { return _shared_state; }
@@ -147,6 +153,7 @@ public:
     }
 
     // Notify downstream pipeline tasks this dependency is blocked.
+    // 将依赖项状态置为阻塞（_ready = false）。
     void block() {
         if (_always_ready) {
             return;
@@ -171,21 +178,29 @@ public:
     }
 
 protected:
+    // 将传入的 task 转换成 std::weak_ptr 后追加到 _blocked_task 向量中，用于后续在 set_ready() 时进行通知。
     void _add_block_task(std::shared_ptr<PipelineTask> task);
-
+    // 当前 Dependency 实例的唯一标识符（ID），用于区分不同的依赖项对象。
     const int _id;
+    // 与该依赖项相关联的 Plan Node（查询执行计划节点）的 ID（例如某个 HashJoinNode 或 AggregationNode 的 node_id）。
     const int _node_id;
+    // 依赖项的名称，如 HashJoinBuildDependency、DataBufferDependency 等，主要用于日志打印、调试和 Profile 显示。
     const std::string _name;
+    // 当前依赖项的状态标志。true 表示依赖就绪，关联的 Task 可以继续执行；false 表示依赖阻塞，Task 需要等待。使用原子变量保证多线程并发读写的线程安全。
     std::atomic<bool> _ready;
-
+    // 指向上下游算子共享的状态对象（Shared State）。用于在 Pipeline 算子之间共享 Pipeline 依赖（如 Sink 端与 Source 端之间的通信状态）。
     BasicSharedState* _shared_state = nullptr;
+    // 单调递增计时器。用于精确统计当前依赖项导致 Task 阻塞累计消耗的时间（Elapse Time），辅助性能调优。
     MonotonicStopWatch _watcher;
-
+    // 用于保护内部阻塞任务列表 _blocked_task 的并发访问（添加任务、清空/唤醒任务）。
     std::mutex _task_lock;
+    // 保存所有由于当前依赖项未就绪而被阻塞的 PipelineTask 集合。使用 std::weak_ptr 可以避免依赖项与 Task 之间产生循环引用（Circular Dependency）导致内存泄漏。
     std::vector<std::weak_ptr<PipelineTask>> _blocked_task;
 
     // If `_always_ready` is true, `block()` will never block tasks.
+    // 永久就绪标志。如果设为 true，表示该依赖项进入“恒就绪”状态，后续任何调用 block() 的尝试都将被忽略，不再阻塞任何 Task。
     std::atomic<bool> _always_ready = false;
+    // 专门配合 _always_ready 使用的互斥锁，确保在将状态切换至恒就绪或重新 Block 时的双重检查（Double-Checked Locking）并发安全性。
     std::mutex _always_ready_lock;
 };
 
