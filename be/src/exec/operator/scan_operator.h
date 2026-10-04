@@ -55,13 +55,19 @@ enum class PushDownType {
     // but the data source can not fully evaluate it.
     PARTIAL_ACCEPTABLE
 };
-
+// ScanLocalStateBase 是 Apache Doris 执行引擎（ PipelineX 架构）中所有 Scan 算子（如 Hive Scan、Olap Scan、JDBC Scan、File Scan 等）的线程本地执行状态（Local State）基类。
+// 在 Doris 的 PipelineX 执行引擎中，算子分为全局的 OperatorX（元数据/无状态）和运行在每个执行线程/PipelineTask 上的 PipelineXLocalState（本地运行状态）。
+// 主要作用包括：
+// 统一 Scan 算子的 LocalState 基类框架：提取所有存储介质/源表扫描共有的状态管理、Runtime Profile 统计指标、线程并发度控制与调度器策略。
+// 谓词下推与规格化（Predicate Pushdown & Normalization）：提供一套统一且非模板化的谓词分析逻辑（如将 Expression AST 转换为 ColumnValueRange 或 ColumnPredicate），下推到底层存储引擎（如 Segment / Parquet reader）过滤数据。
+// 动态 Runtime Filter 处理：支持运行期 Late-Arrival Runtime Filter 的接收、应用以及基于 Runtime Filter 的分区剪枝（Partition Pruning）。
+// 降低模板编译膨胀（Code Bloat Reduction）：将不需要依赖特定模板参数 Derived 的公共成员变量与方法（尤其是复杂谓词处理和模板类型转换）从 ScanLocalState<Derived> 下移到基类 ScanLocalStateBase 中，大幅减少 C++ 模板实例化编译时间和生成的二进制文件体积。
 class ScanLocalStateBase : public PipelineXLocalState<> {
 public:
     ScanLocalStateBase(RuntimeState* state, OperatorXBase* parent)
             : PipelineXLocalState<>(state, parent), _helper(parent->runtime_filter_descs()) {}
     ~ScanLocalStateBase() override = default;
-
+    // 返回当前 Scan 算子是否必须串行（单线程）运行（例如带有 TopN limit 的场景或极小表扫描）
     [[nodiscard]] virtual bool should_run_serial() const = 0;
 
     virtual RuntimeProfile* scanner_profile() = 0;
@@ -70,10 +76,12 @@ public:
 
     virtual int64_t limit_per_scanner() = 0;
     virtual std::atomic<int64_t>* shared_scan_limit_ptr() = 0;
-
+    // 为该 Scan 算子设置具体的分片/扫描范围数据（Scan Ranges）
     virtual void set_scan_ranges(RuntimeState* state,
                                  const std::vector<TScanRangeParams>& scan_ranges) = 0;
+    // 获取下推到 Scan 阶段的聚合操作类型（例如 COUNT / MIN / MAX 的下推）。
     virtual TPushAggOp::type get_push_down_agg_type() = 0;
+    // 获取下推的 COUNT(*) 或 COUNT(col) 操作对应的 Slot ID 集合。
     virtual const std::optional<std::vector<int32_t>>& get_push_down_count_slot_ids() const = 0;
 
     // If scan operator is serial operator(like topn), its real parallelism is 1.
@@ -83,18 +91,22 @@ public:
     // Related pr:
     // https://github.com/apache/doris/pull/42460
     // https://github.com/apache/doris/pull/44635
+    // 计算并返回当前 Scan 算子的最大允许并发 Scanner 线程数（依据并行 Task 数、Batch 模式状态、Serial 属性等综合决定）
     [[nodiscard]] virtual int max_scanners_concurrency(RuntimeState* state) const;
+    // 计算并返回保证当前 Scan 算子能够正常推进所需的最小并发 Scanner 线程数。
     [[nodiscard]] virtual int min_scanners_concurrency(RuntimeState* state) const;
+    // 获取用于调度和执行当前 Scan 算子中 Scanner 任务的线程池调度器（ScannerScheduler）。
     [[nodiscard]] virtual ScannerScheduler* scan_scheduler(RuntimeState* state) const;
 
     // Thread-safe check whether a partition has been pruned by runtime filter.
     // Callable from any scan type's scanner in scheduling threads.
+    // 线程安全地检查给定的 partition_id 是否已经被 Runtime Filter 成功剪枝。供各并发 Scanner 线程在调度时调用，避免读取无关分区。
     bool is_partition_pruned(int64_t partition_id) const;
 
     [[nodiscard]] std::string get_name() { return _parent->get_name(); }
 
     uint64_t get_condition_cache_digest() const { return _condition_cache_digest; }
-
+    // 在查询执行过程中，检查并尝试更新迟到的（Late-Arrival）Runtime Filter，将最新到达的 RF 注入到当前 Scan 算子的表达式中，并触发新的分区剪枝。
     Status update_late_arrival_runtime_filter(RuntimeState* state, int& arrived_rf_num);
 
     Status clone_conjunct_ctxs(VExprContextSPtrs& scanner_conjuncts);
@@ -111,9 +123,9 @@ protected:
     virtual Status _on_runtime_filter_update();
 
     Status _do_partition_pruning_by_rf();
-
+    // 标记该 Scan 算子的 Local State 是否已经完成 open() 初始化，保证线程安全与幂等。
     std::atomic<bool> _opened {false};
-
+    // Pipeline 引擎中的依赖对象（如等待 Runtime Filter 准备就绪的 Dependency），用于异步阻塞/唤醒 Pipeline 任务。
     DependencySPtr _scan_dependency = nullptr;
 
     std::shared_ptr<RuntimeProfile> _scanner_profile;
@@ -138,13 +150,17 @@ protected:
 
     RuntimeProfile::Counter* _scan_rows = nullptr;
     RuntimeProfile::Counter* _scan_bytes = nullptr;
-
+    // 互斥锁，用于保护谓词表达式（Conjuncts）在运行时被 Late-Arrival Runtime Filter 动态更新时的并发安全。
     AnnotatedMutex _conjuncts_lock;
+    // 管理 Runtime Filter 消费的辅助类，负责注册和提取分配给当前算子的 Runtime Filter。
     RuntimeFilterConsumerHelper _helper;
     // magic number as seed to generate hash value for condition cache
+    // 条件缓存的哈希摘要种子/Key，用于标识当前查询条件下下推谓词组合的唯一性。
     uint64_t _condition_cache_digest = 0;
     // condition cache filter stats
+    // 条件缓存（Condition Cache）命中的次数统计。
     RuntimeProfile::Counter* _condition_cache_hit_counter = nullptr;
+    // 通过条件缓存过滤掉的行数统计。
     RuntimeProfile::Counter* _condition_cache_filtered_rows_counter = nullptr;
 
     // ---- Runtime-filter partition pruning (scan-agnostic) ----
@@ -153,9 +169,12 @@ protected:
     RuntimeProfile::Counter* _total_partitions_rf_counter = nullptr;
 
     // Moved from ScanLocalState<Derived> to avoid re-instantiation for each Derived type.
+    // 标记该 Scan 算子数据流是否已经全部读取完毕（End Of Stream）。
     std::atomic<bool> _eos = false;
+    // 单列支持下推的最大条件表达式个数（默认 1024），超过此阈值后不再继续下推该列的条件，防止生成过大的过滤条件（如极其庞大的 IN List）。
     int _max_pushdown_conditions_per_column = 1024;
     // Save all function predicates which may be pushed down to data source.
+    // 收集并保存允许下推到底层数据源（如 External Storage/Lucene）执行的函数谓词列表（例如字符串 LIKE 或特定标量函数）。
     std::vector<FunctionFilter> _push_down_functions;
 
     // Virtual methods with default implementations; overridden by subclasses when supported.
@@ -353,9 +372,17 @@ protected:
     int _instance_idx = 0;
 };
 
+// 在 Apache Doris 的 Backend (BE) 执行引擎中，ScanOperatorX 是所有数据扫描类算子（Scan Operator，如 OlapScanOperatorX、FileScanOperatorX、JdbcScanOperatorX 等）的通用抽象模板基类。它继承自 OperatorX<LocalStateType>，专门针对数据源（Data Source）端的读取与下推优化（Push-down Optimization）进行了封装。
+// 作为 Pipeline 框架中所有数据扫描源头算子的基类，ScanOperatorX 承担了以下核心职责：
+// 定义数据源头（Source Operator）语义：重写 is_source() = true，标记该算子为 Pipeline 管道的最上游节点（不依赖上游输入算子，主动从存储引擎/外部数据源拉取数据）。
+// 下推谓词与聚合管理（Push-down Management）：存储和管理从 FE（Frontend）下推到存储层/扫描层的各种优化条件（如下推谓词 _common_expr_ctxs_push_down、聚合下推类型 _push_down_agg_type、下推的 COUNT Slot ID 等）。
+// 共享 Limit 与扫描并发控制：维护跨并发 Task 实例共享的剩余 Limit 行数（_shared_scan_limit）以及单 Scanner 的 Limit（_limit_per_scanner），实现高效的全局提前终止（Early Exit）。
+// Runtime Filter 与分区剪枝：存储与该扫描算子相关的 Runtime Filter 描述符，并管理用于动态分区剪枝的边界解析数据（_parsed_partition_boundaries）。
+// 内存感知与低内存模式（Low Memory Mode）：支持动态内存策略，响应系统的内存压力，提供在内存紧张时清理释放 Scanner 缓存 Block（clear_free_blocks）的机制。
 template <typename LocalStateType>
 class ScanOperatorX : public OperatorX<LocalStateType> {
 public:
+    // 基于 Thrift 结构 tnode（对应 TScanNode）初始化该扫描算子。
     Status init(const TPlanNode& tnode, RuntimeState* state) override;
     Status prepare(RuntimeState* state) override;
     Status get_block_impl(RuntimeState* state, Block* block, bool* eos) override;
@@ -428,32 +455,41 @@ protected:
 
     // For load scan node, there should be both input and output tuple descriptor.
     // For query scan node, there is only output_tuple_desc.
+    // 数据导入（Load Scan）场景下的输入 Tuple ID。在普通 Query 扫描中通常不使用（保持为 -1）。
     TupleId _input_tuple_id = -1;
+    // 该扫描算子输出数据对应的 Tuple ID（在 FE 逻辑执行计划中定义）。
     TupleId _output_tuple_id = -1;
+    // 输出 Tuple 的描述符指针，包含了该算子需要扫描并填充的所有列（Slot）元数据信息。
     const TupleDescriptor* _output_tuple_desc = nullptr;
-
+    // 从 Slot ID 到其对应的 SlotDescriptor 指针的高效哈希映射表，用于快速根据 ID 查找列元数据。
     phmap::flat_hash_map<int, SlotDescriptor*> _slot_id_to_slot_desc;
+    // 从列名（Column Name）到 Slot ID 的哈希映射表，用于根据列名查找对应的 Slot ID。
     std::unordered_map<std::string, int> _colname_to_slot_id;
 
     // These two values are from query_options
+    // 从 FE 的 query_options 中获取的构建 Scan Key（主键/前缀索引查询条件）的最大数量限制，默认 48。
     int _max_scan_key_num = 48;
+    // 从 FE 获得的单列允许下推的最大谓词条件/表达式数量限制，默认 1024。
     int _max_pushdown_conditions_per_column = 1024;
 
     // If the query like select * from table limit 10; then the query should run in
     // single scanner to avoid too many scanners which will cause lots of useless read.
+    // 标记是否应当强制串行单线程运行。例如对于 SELECT * FROM table LIMIT 10 这类小 Limit 查询，设置为 true 可以避免启动过多并发 Scanner 造成无用的存储 IO 浪费。
     bool _should_run_serial = false;
-
+    // 已成功下推到存储层/Scanner 层的普通表达式/谓词上下文列表。
     VExprContextSPtrs _common_expr_ctxs_push_down;
 
     // If sort info is set, push limit to each scanner;
+    // 当下推了 TopN/Sort 信息时，下推给每个独立 Scanner 的 Limit 行数限制（-1 表示无限制）。
     int64_t _limit_per_scanner = -1;
 
     // Shared remaining limit across all parallel instances and their scanners.
     // Initialized to _limit (SQL LIMIT); -1 means no limit.
+    // 跨所有并发 Pipeline Task 实例及其下属 Scanner 共享的全局剩余 Limit 计数器（原子变量）。初始化为 SQL 中的 LIMIT 值，每当有 Scanner 读取到 Block 时会原子扣减，降至 0 时通知所有并发 Scanner 快速结束。
     std::atomic<int64_t> _shared_scan_limit {-1};
-
+    // 分配并下推到当前 Scan 节点上的所有 Runtime Filter 的 Thrift 描述符集合。
     std::vector<TRuntimeFilterDesc> _runtime_filter_descs;
-
+    // 下推到扫描层的聚合函数类型（例如 COUNT、MIN、MAX、COUNT_ON_INDEX 等）。
     TPushAggOp::type _push_down_agg_type;
 
     // Semantic arguments of a pushed-down COUNT. This is deliberately optional because absence
@@ -464,21 +500,27 @@ protected:
     //  - non-empty: the new FE explicitly planned COUNT(col).
     //
     // Treating nullopt as empty would silently reinterpret an old plan as COUNT(*).
+    // 下推的 COUNT(...) 聚合函数对应的输入列 Slot ID 集合。
+    // 使用 std::optional 是为了兼容 FE 与 BE 跨版本滚动升级：nullopt 代表旧版 FE 未发送该字段（需回退到普通扫描）；empty（空向量）代表显式下推了 COUNT(*) 或 COUNT(1)；non-empty 代表显式下推了 COUNT(col)。
     std::optional<std::vector<int32_t>> _push_down_count_slot_ids;
 
     // Record the value of the aggregate function 'count' from doris's be
+    // 若整个 COUNT(*) 能够完全通过存储层索引/元数据直接计算得出，则记录该预计算的行数结果（-1 代表未下推优化）。
     int64_t _push_down_count = -1;
+    // 当前扫描算子的并行任务/实例数量。
     const int _parallel_tasks = 0;
-
+    // 产生下推到当前 Scan 节点的 TopN 动态 Filter 的源节点 ID 列表。
     std::vector<int> _topn_filter_source_node_ids;
-
+    // 多 Scanner 之间用于共享/仲裁内存配额的仲裁器指针。
     std::shared_ptr<MemShareArbitrator> _mem_arb = nullptr;
+    // 当前扫描算子使用的内存限制器指针，用于跟踪与控制 Scanner 的内存申请。
     std::shared_ptr<MemLimiter> _mem_limiter = nullptr;
 
     // Shared parse result of partition boundaries for runtime-filter partition
     // pruning. Lives here (rather than on the Olap-specific subclass) so any
     // future scan type can populate it in its `prepare()` override and reuse
     // the generic pruning machinery in ScanLocalStateBase.
+    // 当前 Fragment 内部共享的已解析分区边界信息，供非模板基类 ScanLocalStateBase 执行 Runtime Filter 动态分区剪枝使用。
     ParsedPartitionBoundaries _parsed_partition_boundaries;
 };
 

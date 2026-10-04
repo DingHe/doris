@@ -278,10 +278,22 @@ struct TSearchParam {
 }
 
 // This is essentially a union over the subclasses of Expr.
+// TExprNode 的作用
+// 表达式树中的单节点载体（Tree Node Variant）：
+// 注释明确指出：“This is essentially a union over the subclasses of Expr.”
+// 在 Doris 中，上一问介绍的 TExpr（表达式树）是由展平的 TExprNode 列表组成的。每一个 TExprNode 代表表达式树中的一个具体节点（如：属性列引用 SlotRef、字面量常量 Literal、函数调用 FunctionCall、谓词条件 Predicat// e、分支判断 CaseExpr 等）。
+// 离散联合（Tagged Union）设计：
+// 由于 Thrift 不支持 C++ 风格的面向对象多态继承，TExprNode 采用了 Tagged Union 模式：所有节点共享通用元数据（节点类型 node_type、数据类型 type、子节点数量 num_children 等），同时通过 optional 字段挂载特定表达/// 式类型的私有数据（如 int_literal、fn、slot_ref 等）。
+// FE 逻辑表达式与 BE 向量化表达式（VExpr）的转换桥梁：
+// FE 优化器生成的逻辑表达式节点序列化为 TExprNode 后，通过 RPC 传输给 BE。BE 在初始化算子（如 OperatorXBase::init）时，读取 TExprNode 并调用 VExpr::create_expr_tree，将其构建为 BE 侧高效执行的向量化表达式对象（如 VSlotRef、VFunctionCall 等）。
 struct TExprNode {
+  // 表达式节点的类型枚举（如 SLOT_REF、INT_LITERAL、FUNCTION_CALL、CASE_EXPR 等）。BE 根据此属性判断当前节点属于哪种表达式，并解析对应的 optional 字段。
   1: required TExprNodeType node_type
+  // 该表达式节点输出结果的完整数据类型描述符（支持复杂类型，如 ARRAY<INT>、MAP、STRUCT 或普通标量类型）。
   2: required Types.TTypeDesc type
+  // 内置算子/表达式的操作码（Opcode），用于快速标识一元、二元运算符或特定内置函数（如 ADD、SUBTRACT、EQ、NE 等）。
   3: optional Opcodes.TExprOpcode opcode
+  // 该表达式节点在表达式树中的直接子节点数量。由于 TExpr 是按前序遍历展平的，BE 依赖 num_children 来正确重建父子节点层级关系（例如加法节点 A + B 的 num_children = 2）。
   4: required i32 num_children
 
   5: optional TAggregateExpr agg_expr
@@ -299,21 +311,27 @@ struct TExprNode {
   17: optional TTupleIsNullPredicate tuple_is_null_pred
   18: optional TInfoFunc info_func
   19: optional TDecimalLiteral decimal_literal
-
+  // 表达式计算输出结果的小数位数（Scale）。主要用于 DECIMAL 类型的数据精度控制。
   20: required i32 output_scale
   21: optional TFunctionCallExpr fn_call_expr
   22: optional TLargeIntLiteral large_int_literal
-
+  //指示该表达式计算结果输出到 Vectorized Block 中的目标列索引（Column Index）。
   23: optional i32 output_column
+  // 传统的简单类型描述（已被 2: type 进一步丰富扩展，用于向下兼容）。
   24: optional Types.TColumnType output_type
+  // 专为向量化执行引擎优化的操作码（Vectorized Opcode）
   25: optional Opcodes.TExprOpcode vector_opcode
   // The function to execute. Not set for SlotRefs and Literals.
+  // 当 node_type 为函数调用（FUNCTION_CALL）或聚合函数（AGG_EXPR）时设置。包含函数的签名、评估函数指针名、符号映射、入参/出参定义等信息。字面量（Literal）和列引用（SlotRef）不设置此字段。
   26: optional Types.TFunction fn
   // If set, child[vararg_start_idx] is the first vararg child.
+  // 对于变长参数函数（Varargs，如 concat(a, b, c...)），指定从第几个子节点开始属于变长参数部分。
   27: optional i32 vararg_start_idx
+  // 子节点的基础数据类型，早期用于类型推导，现已被统一的类型系统取代。
   28: optional Types.TPrimitiveType child_type // Deprecated
 
   // For vectorized engine
+  // 向量化引擎核心字段。标识该表达式节点的计算结果是否可能为 NULL。BE 会根据此标识提前决定是否为其创建 NullMap 向量，对执行性能至关重要。
   29: optional bool is_nullable
   
   30: optional TJsonLiteral json_literal
@@ -337,6 +355,10 @@ struct TExprNode {
 
 // A flattened representation of a tree of Expr nodes, obtained by depth-first
 // traversal.
+// 在 Doris 中，几乎所有的计算逻辑（如 WHERE 过滤条件、SELECT 中的计算列、GROUP BY/ORDER BY 表达式、聚合函数参数等）在语法解析和物理计划生成阶段，都会被抽象为一棵表达式树。TExpr 就是这棵表达式树在 FE（Frontendi// ）与 BE（Backend）之间传输时的序列化容器。
+// 在内存中，表达式本来是一棵树（例如：a + b * 2）。为了通过网络进行高效传输和序列化，Doris 将这棵树按前序遍历（Pre-order Traversal）顺序“展平”成了一个一维数组（list<TExprNode>）。
+// 列表中索引为 0 的节点是整个表达式树的根节点（Root Node）
+// 每个 TExprNode 内部都记录了它的类型、返回数据类型以及子节点数量（num_children）。BE 在拿到这个一维数组后，可以通过简单的递归或栈操作，快速重建出完整的物理表达式树（即 BE 端的 VExpr / VExprContext）
 struct TExpr {
   1: required list<TExprNode> nodes
 }

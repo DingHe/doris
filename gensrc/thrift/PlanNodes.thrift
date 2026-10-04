@@ -1674,16 +1674,26 @@ struct TGroupCommitScanNode {
 
 // This is essentially a union of all messages corresponding to subclasses
 // of PlanNode.
+// TPlanNode 的作用
+// 执行计划物理节点的通用载体：
+// 在 Apache Doris 中，FE 负责 SQL 解析、语义分析和优化，并最终生成分布式物理执行计划。分布式执行计划是以“树状结构”（Plan Tree）组织的。TPlanNode 是这棵树上每个节点的序列化/反序列化容器。
+// 变体模式（Tagged Union / Discriminated Union）： 注释明确提到 “This is essentially a union of all messages corresponding to subclasses of PlanNode”。由于 Thrift 不直接支持面向对象的多态继承，因此采用标签联合（Union）模式：所有类型的执行计划节点（如 HashJoin、OlapScan、Aggregation 等）都共享一份公共基础元数据（如节点 ID、限制条数、谓词等），同时通过 Optional 字段挂载特定节点类型的私有配置信息。
+// FE 与 BE 协议交互桥梁：
+// FE 将优化好的物理节点序列化为 Thrift 二进制数据包通过 RPC 发送给 BE。BE 在初始化算子（如您上一问看到的 OperatorXBase::init）时，读取 TPlanNode 并根据 node_type 解析具体的配置字段，从而构造具体的物理算子。
 struct TPlanNode {
   // node id, needed to reassemble tree structure
+  // 当前执行计划节点的唯一整数 ID（如 0, 1, 2...）。BE 使用它来标识节点、重建树形执行结构以及进行 Profile 统计跟踪。
   1: required Types.TPlanNodeId node_id
+  // 表示节点的物理类型枚举值（例如 HASH_JOIN_NODE、OLAP_SCAN_NODE、AGGREGATION_NODE 等）。BE 根据此类型决定实例化哪个 Backend 执行算子。
   2: required TPlanNodeType node_type
+  // 当前物理节点的子节点数量（例如 Scan 节点为 0，Filter 为 1，Join 为 2，Union 可以有多个）。用于 BE 构建 Pipeline 管道结构或 PlanNode 树。
   3: required i32 num_children
   4: required i64 limit
   5: required list<Types.TTupleId> row_tuples
 
   // Deprecated
   6: required list<bool> nullable_tuples
+  // 下推/挂载到该物理节点上的过滤谓词表达式列表（即 WHERE / HAVING 的逻辑与条件树）。算子会在输出数据前对其进行 Apply 校验过滤。
   7: optional list<Exprs.TExpr> conjuncts
 
   // Produce data in compact format.

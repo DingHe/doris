@@ -40,10 +40,20 @@ struct QueryCacheInstanceDecision;
 namespace doris {
 
 class OlapScanOperatorX;
+
+// OlapScanLocalState 是 Pipeline 执行引擎架构下，用于管理 内表（Olap Table/Doris 本地表）数据扫描算子（OlapScanOperatorX）在具体线程/执行实例（Execution Instance）级别运行时状态 的核心类
+// OlapScanLocalState 类的作用
+// 实例级状态隔离与存储：在 Pipeline 架构下，OlapScanOperatorX 作为全局共享的 Operator 模版，而 OlapScanLocalState 则存储了具体每个 Pipeline 执行线程/PipelineTask 独立的局部状态（包括分配给该实例的 scan_ranges / tablets、内部初始化产生的 Scanner 列表等）。
+// 连接下推谓词与存储引擎：负责将上层执行引擎传入的 SQL 过滤谓词（Conjuncts、Runtime Filters、TopN 谓词等）进行校验与解析，判断能否下推（Push Down），并将其转换为存储引擎（OlapTable / Segment V2）可识别的 Key Range、Column Predicates 以及 Index Filter（如 ZoneMap、BloomFilter、倒排索引、向量索引 ANN 等）。
+// 云原生/存算分离架构调度（Cloud Mode）：支持存算分离模式下的 Tablet 与 Rowset 元数据异步同步（Sync Cloud Tablets），并通过 Dependency 机制阻塞与唤醒 PipelineTask。
+// 指标与 Profiling 统计：维护了极其详尽的性能监控 Counter（IO耗时、解压耗时、各类索引过滤行数、延迟读取 Lazy Read 耗时、Variant 动态列解析耗时等），用于生成 Doris Query Profile。
 class OlapScanLocalState final : public ScanLocalState<OlapScanLocalState> {
 public:
+    // 指向其对应的全局 Pipeline Operator 类型。
     using Parent = OlapScanOperatorX;
+    // 继承自扫描基类 ScanLocalState。
     using Base = ScanLocalState<OlapScanLocalState>;
+    // Doris 内部工厂宏，用于提供安全的智能指针创建工厂方法。
     ENABLE_FACTORY_CREATOR(OlapScanLocalState);
     OlapScanLocalState(RuntimeState* state, OperatorXBase* parent) : Base(state, parent) {}
     Status init(RuntimeState* state, LocalStateInfo& info) override;
@@ -133,18 +143,28 @@ private:
     Status _init_scanners(std::list<ScannerSPtr>* scanners) override;
 
     Status _build_key_ranges_and_filters();
-
+    // 存储分配给当前 LocalState 的原始 Thrift 扫描范围列表（包含 Tablet ID、 Version 等信息）
     std::vector<std::unique_ptr<TPaloScanRange>> _scan_ranges;
+    // 存算分离下同步 Rowset 元数据的统计信息。
     std::vector<SyncRowsetStats> _sync_statistics;
+    // 用于测量异步同步 Cloud Tablet 元数据耗时的单向计时器。
     MonotonicStopWatch _sync_cloud_tablets_watcher;
+    // Pipeline 依赖项。当 Tablet 元数据尚未异步同步完成时，该 Dependency 会阻塞 Pipeline Task 的执行。
     std::shared_ptr<Dependency> _cloud_tablet_dependency;
+    // 当前正在等待异步同步完成的 Tablet 数量计数器。
     std::atomic<size_t> _pending_tablets_num = 0;
+    // 标记 LocalState 是否已准备就绪。
     bool _prepared = false;
+    // 异步获取/同步云端 Tablet 元数据的 Future 异步句柄。
     std::future<Status> _cloud_tablet_future;
+    // 标记当前 LocalState 是否正在或已触发 Cloud Tablet 同步。
     std::atomic_bool _sync_tablet = false;
+    // 根据条件下推计算出的扫描条件范围（如 key >= 100 AND key <= 200）
     std::vector<std::unique_ptr<doris::OlapScanRange>> _cond_ranges;
+    // 存储根据谓词下推构建的主键/排序键查找 Range（Key Ranges）
     OlapScanKeys _scan_keys;
     // If column id in this set, indicate that we need to read data after index filtering
+    // 需要从存储层读取并输出的 Column Unique ID 集合。
     std::set<int32_t> _output_column_ids;
 
     std::unique_ptr<RuntimeProfile> _segment_profile;
@@ -345,16 +365,18 @@ private:
 
     RuntimeProfile::Counter* _adaptive_batch_predict_min_rows_counter = nullptr;
     RuntimeProfile::Counter* _adaptive_batch_predict_max_rows_counter = nullptr;
-
+    // 解析并构建后的Tablet及其版本号集合。
     std::vector<TabletWithVersion> _tablets;
+    // 存储引擎层读取的数据源描述（封装了 Tablet、Rowset Reader 等）。
     std::vector<TabletReadSource> _read_sources;
 
     // The per-instance query cache decision shared with the cache source
     // operator of the same fragment. Null when the query cache is disabled.
     // HIT: leave _scan_ranges empty so nothing is scanned; INCREMENTAL: scan
     // only the pre-captured delta read sources in (cached, current] version.
+    // Query Cache 判定结果共享决策对象（区分全中 HIT、增量读 INCREMENTAL 或 未命中）。
     std::shared_ptr<QueryCacheInstanceDecision> _query_cache_decision;
-
+    // 虚拟列/隐藏列（如 __DORIS_ROW_STORE_COL__ 或 Variant 字段路径）对应的表达表达式上下文映射。
     std::map<SlotId, VExprContextSPtr> _slot_id_to_virtual_column_expr;
 
     // ---- Runtime-filter partition pruning ----
@@ -365,7 +387,12 @@ private:
 
     RuntimeProfile::Counter* _tablets_pruned_by_rf_counter = nullptr;
 };
-
+// OlapScanOperatorX 是专门用于扫描和读取 Doris 本地 OLAP 存储引擎（即 Segment 文件、Tablet 数据）的具体扫描算子。它继承自 ScanOperatorX<OlapScanLocalState>，且被声明为 final（不可再被继承）
+// 作为针对 Doris 自研 OLAP 存储引擎的叶子节点算子，OlapScanOperatorX 承担了以下核心职责：
+// 对接 Doris OLAP 存储元数据：解析并持有从 FE（Frontend）下发的针对 OLAP 表特有的扫描节点元数据结构（TOlapScanNode），如 Tablet 列表、读取的 Version、Key 范围等。
+// 管理 TabletSchema 列映射：持有并管理表的物理 Schema 元数据（TabletSchemaSPtr），用于将上层 SQL 逻辑列名（Column Name）精准映射为存储引擎内部的列物理索引 ID（Field Index），以支持下推谓词与索引过滤。
+// 支持 Query Cache 缓存机制：持有 Query Cache 相关的配置与运行时控制对象（TQueryCacheParam 和 QueryCacheRuntime），与同一个 Fragment 内的 Cache Source 算子协同共享缓存决策，以实现查询结果/中间 Block 的复用。
+// 准备扫描上下文（Pipeline Preparation）：重写 prepare 生命周期方法，在算子真正执行前对 OLAP 引擎专用的谓词下推、引擎配置及 Schema 进行校验和预处理。
 class OlapScanOperatorX final : public ScanOperatorX<OlapScanLocalState> {
 public:
     OlapScanOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
@@ -385,12 +412,20 @@ public:
 
 private:
     friend class OlapScanLocalState;
+    // 储存 FE 下发的 OLAP 扫描节点 Thrift 结构体。
+    // 包含了该 OLAP 表扫描所需的所有关键元数据，例如涉及的 key_ranges（查询主键区间）、olap_filter（存储层过滤条件）、is_preaggregation（是否开启前置聚合）、Tablet 分布信息以及 Schema Version 等。
     TOlapScanNode _olap_scan_node;
+    // 存储 Query Cache（查询缓存）的参数配置。
+    // 包含当前查询是否使能 Query Cache、缓存 Key、缓存切片/TTL 策略等控制信息。
     TQueryCacheParam _cache_param;
     // Shared with the cache source operator of the same fragment so both
     // consume the same per-instance cache decision (see QueryCacheRuntime).
     // Null when the query cache is disabled.
+    // 控制 Query Cache 的运行时状态共享对象。
+    // 与同一个 Fragment 中的 Cache Source 算子共享。通过该对象，OlapScanOperatorX 和 Cache 算子可以在同一个并发实例（Per-instance）内部使用相同的缓存命中判断决策（若缓存命中则直接读取缓存 Block，避开存储层 I/O 扫描；若未命中则回退到真实 OLAP 存储扫描并写回缓存）。当 Query Cache 被禁用时，该指针为 nullptr
     std::shared_ptr<QueryCacheRuntime> _query_cache_runtime;
+    // 指向当前扫描表物理元数据 Schema（TabletSchema）的共享指针。
+    // 描述了 Segment 文件中的物理列定义，包括每一列的 Unique ID、Column Name、数据类型、编码格式、索引信息等。用于在算子层将列名快速转化为存储层所需的 Field Index。
     TabletSchemaSPtr _tablet_schema;
 };
 

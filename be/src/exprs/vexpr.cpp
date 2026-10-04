@@ -476,9 +476,11 @@ void VExpr::close(VExprContext* context, FunctionContext::FunctionStateScope sco
 }
 
 // NOLINTBEGIN(readability-function-size)
+// 根据传入的单一 Thrift 节点对象 TExprNode 的类型（node_type），通过抽象工厂模式实例化对应的 VExpr 向量化表达式 C++ 类对象。
 Status VExpr::create_expr(const TExprNode& expr_node, VExprSPtr& expr) {
     try {
         switch (expr_node.node_type) {
+        // 基础标量字面量（Literal）创建
         case TExprNodeType::BOOL_LITERAL:
         case TExprNodeType::INT_LITERAL:
         case TExprNodeType::LARGE_INT_LITERAL:
@@ -492,6 +494,7 @@ Status VExpr::create_expr(const TExprNode& expr_node, VExprSPtr& expr) {
         case TExprNodeType::JSON_LITERAL:
         case TExprNodeType::VARBINARY_LITERAL:
         case TExprNodeType::NULL_LITERAL: {
+            // 匹配所有的基础数据类型常量（字面量）。使用统一的 VLiteral 类管理，调用其工厂方法 create_shared 构造共享指针并存入 expr 中。
             expr = VLiteral::create_shared(expr_node);
             break;
         }
@@ -622,65 +625,90 @@ Status VExpr::create_expr(const TExprNode& expr_node, VExprSPtr& expr) {
     return Status::OK();
 }
 // NOLINTEND(readability-function-size)
-
+// 负责利用显式栈（迭代/非递归方式）将 Thrift 中按前序遍历展平的 std::vector<TExprNode> 一维节点列表，完整还原为内存中具有层次结构的 VExpr 算子树，并挂载到 VExprContext 中
+// const std::vector<TExprNode>& nodes Thrift 节点一维数组的引用（只读）
+// int* node_idx 记录当前在 nodes 数组中解析到了哪个节点的索引位置（游标）。通过指针传递，使得函数内部更新游标后，外层调用方能够感知到实际消耗了多少个 Thrift 节点。
+// VExprSPtr& root_expr 接收并保存构建成功的表达式树根节点指针。
+// VExprContextSPtr& ctx 创建并返回包裹根节点的 VExprContext 上下文对象（用于后续在运行时执行表达式求值）。
 Status VExpr::create_tree_from_thrift(const std::vector<TExprNode>& nodes, int* node_idx,
                                       VExprSPtr& root_expr, VExprContextSPtr& ctx) {
     // propagate error case
+    // 如果传入的指针索引 *node_idx 已经超出或等于数组总长度 nodes.size()，说明数据损坏或索引异常，直接抛出 InternalError 错误。
     if (*node_idx >= nodes.size()) {
         return Status::InternalError("Failed to reconstruct expression tree from thrift.");
     }
 
     // create root expr
+    // 从第 *node_idx 个 Thrift 节点（即根节点）中提取它的直接子节点个数。
     int root_children = nodes[*node_idx].num_children;
     VExprSPtr root;
+    // 根据 TExprNode 的 node_type 实例化出对应的 VExpr 子类对象（如 VSlotRef、VFunctionCall 等）并存入 root 中。若创建失败（如类型不支持），则直接返回错误。
     RETURN_IF_ERROR(create_expr(nodes[*node_idx], root));
     DCHECK(root != nullptr);
     root_expr = root;
     ctx = std::make_shared<VExprContext>(root);
     // short path for leaf node
+    // 叶子节点快速短路返回（Short Path）
     if (root_children <= 0) {
         return Status::OK();
     }
 
     // non-recursive traversal
+    // 构建非递归遍历辅助栈
+    // 定义一个 Pair 结构别名：first 存储父节点的 VExprSPtr 指针，second 存储该父节点还剩多少个子节点等待挂载。
     using VExprSPtrCountPair = std::pair<VExprSPtr, int>;
+    // 为了防止极深的递归层次导致 C++ 函数调用栈溢出（Stack Overflow），Doris 在这里采用了显式栈 + 循环（迭代）的方式来模拟前序深度优先树重建。
     std::stack<std::shared_ptr<VExprSPtrCountPair>> s;
+    // 将根节点及其待挂载的子节点数量 root_children 封装入栈，准备进入循环。
     s.emplace(std::make_shared<VExprSPtrCountPair>(root, root_children));
     while (!s.empty()) {
         // copy the shared ptr resource to avoid dangling reference
+        // 获取当前位于栈顶的父节点信息。
         auto parent = s.top();
         // Decrement or pop
+        // 如果当前父节点还需要挂载大于 1 个子节点，则将剩余等待计数 second 减 1；
         if (parent->second > 1) {
             parent->second -= 1;
         } else {
+        // 如果 second 等于 1，说明当前处理的就是它的最后一个子节点，处理完本次循环后该父节点就没有待挂载的子节点了，因此直接将其弹出栈 s.pop()。
             s.pop();
         }
 
         DCHECK(parent->first != nullptr);
+        // 先将索引游标 *node_idx 加 1，移动指向当前要处理的子节点。如果自增后越界，说明 Thrift 数组节点数量缺失（比如父节点声明有 2 个子节点，但数组提前结束了），直接报错返回。
         if (++*node_idx >= nodes.size()) {
             return Status::InternalError("Failed to reconstruct expression tree from thrift.");
         }
 
         VExprSPtr expr;
+        // 根据当前索引 *node_idx 的 TExprNode，创建子节点对象 expr。
         RETURN_IF_ERROR(create_expr(nodes[*node_idx], expr));
         DCHECK(expr != nullptr);
+        // 将新创建的子节点 expr 追加添加到父节点 parent->first 的子节点列表（_children）中，完成树边的建立。
         parent->first->add_child(expr);
         // push to stack if has children
         int num_children = nodes[*node_idx].num_children;
+        // 检查刚刚加入的这个子节点 expr 本身是否还有子节点（num_children > 0）
         if (num_children > 0) {
             s.emplace(std::make_shared<VExprSPtrCountPair>(expr, num_children));
         }
     }
     return Status::OK();
 }
-
+// 主要负责将前端（FE）序列化发来的 Thrift 表达式结构体 TExpr（包含展平的节点数组）反序列化并重建为 Backend（BE）内存中的向量化表达式树对象，并封装在表达式执行上下文 VExprContext 中。
+// const TExpr& texpr  表示从 FE 传输过来的物理表达式，内部核心包含一个展平的 std::vector<TExprNode> nodes 数组（即我们在前面提到的前序遍历展平树）
+// VExprContextSPtr& ctx 用于接收创建好的表达式执行上下文对象（VExprContext）。VExprContext 负责包裹顶层表达式树根节点（VExprSPtr），并在运行时管理表达式的求值状态、内存分配以及错误追踪。
 Status VExpr::create_expr_tree(const TExpr& texpr, VExprContextSPtr& ctx) {
+    // 如果 texpr.nodes 为空（说明当前没有配置过滤条件或列投影表达式），则将输出上下文 ctx 重置为 nullptr，并直接返回 Status::OK() 结束流程。
     if (texpr.nodes.empty()) {
         ctx = nullptr;
         return Status::OK();
     }
+    // 初始化节点遍历索引游标（深度优先遍历的全局偏移量），从展平数组的第 0 个节点（即表达式树的根节点）开始构建。
     int node_idx = 0;
+    // 声明一个表达式节点智能指针（std::shared_ptr<VExpr>），用于接收解析出来的根表达式节点。
     VExprSPtr e;
+    // 由于 texpr.nodes 是按照前序遍历（根-左-右）展平的，create_tree_from_thrift 会根据当前节点 TExprNode 的 num_children（子节点数量），通过递增指针 node_idx 递归调用自身去解析每一个子节点，最终将展平的一维数组重新组装成一棵具有父子层级关系的向量化表达式树（VExpr 树），并同时初始化 ctx 上下文。
     Status status = create_tree_from_thrift(texpr.nodes, &node_idx, e, ctx);
     if (status.ok() && node_idx + 1 != texpr.nodes.size()) {
         status = Status::InternalError(

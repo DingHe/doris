@@ -190,14 +190,19 @@ std::string OperatorXBase::debug_string(int indentation_level) const {
 std::string OperatorXBase::debug_string(RuntimeState* state, int indentation_level) const {
     return state->get_local_state(operator_id())->debug_string(indentation_level);
 }
-
+// const TPlanNode& tnode Thrift 自动生成的结构体引用（只读）。表示 FE（Frontend）经过查询优化后发送给 BE（Backend）的物理执行计划节点数据，里面包含了该节点的类型、谓词、列投影（projections）、Nereids ID 等元数据。
+//
 Status OperatorXBase::init(const TPlanNode& tnode, RuntimeState* state) {
+    // 将 Thrift 中定义的节点类型枚举（tnode.node_type，如 AGGREGATION_NODE、HASH_JOIN_NODE）转换为可读的字符串名称（如 "AGGREGATION_NODE"）
     std::string node_name = print_plan_node_type(tnode.node_type);
     _nereids_id = tnode.nereids_id;
+    // 如果存在中间输出 Tuple ID 列表（说明执行计划包含多步投影计算）
     if (!tnode.intermediate_output_tuple_id_list.empty()) {
+        // 必须同时设置最终的输出 Tuple ID（output_tuple_id），否则抛出 InternalError；
         if (!tnode.__isset.output_tuple_id) {
             return Status::InternalError("no final output tuple id");
         }
+        // 中间 Tuple ID 的数量必须与中间投影表达式列表（intermediate_projections_list）的数量完全一致，确保每一步中间投影都有对应的元组 ID 映射。
         if (tnode.intermediate_output_tuple_id_list.size() !=
             tnode.intermediate_projections_list.size()) {
             return Status::InternalError(
@@ -207,27 +212,37 @@ Status OperatorXBase::init(const TPlanNode& tnode, RuntimeState* state) {
                     tnode.intermediate_projections_list.size());
         }
     }
+    // 规范算子的显示名称。截掉节点名称后缀 _NODE，并替换为 _OPERATOR。
     auto substr = node_name.substr(0, node_name.find("_NODE"));
     _op_name = substr + "_OPERATOR";
 
+    // 解析该算子绑定的过滤谓词（WHERE / HAVING 条件等）
     if (tnode.__isset.vconjunct) {
+        // vconjunct 是遗留或未支持的格式，若包含则直接返回错误；
         return Status::InternalError("vconjunct is not supported yet");
     } else if (tnode.__isset.conjuncts) {
+        // 若存在 conjuncts，则遍历每一个表达式结构体 conjunct；
         for (const auto& conjunct : tnode.conjuncts) {
             VExprContextSPtr context;
+            // 将 Thrift 结构的表达式树构建为 BE 向量化执行引擎的表达式树对象（VExprContext）；
             RETURN_IF_ERROR(VExpr::create_expr_tree(conjunct, context));
+            // 成功后将创建好的表达式上下文追加到算子的 _conjuncts 列表成员中
             _conjuncts.emplace_back(context);
         }
     }
 
     // create the projections expr
+    // 解析最终列投影（Projections）
     if (tnode.__isset.projections) {
         DCHECK(tnode.__isset.output_tuple_id);
+        // 调用 VExpr::create_expr_trees 将 Thrift 的投影表达式批量解析并填充到成员变量 _projections 中。
         RETURN_IF_ERROR(VExpr::create_expr_trees(tnode.projections, _projections));
     }
+    // 解析中间列投影（Intermediate Projections）
     if (!tnode.intermediate_projections_list.empty()) {
         DCHECK(tnode.__isset.projections) << "no final projections";
         _intermediate_projections.reserve(tnode.intermediate_projections_list.size());
+        // 逐层遍历 intermediate_projections_list，解析每一层的表达式列表 projections，并压入 _intermediate_projections 嵌套向量中。
         for (const auto& tnode_projections : tnode.intermediate_projections_list) {
             VExprContextSPtrs projections;
             RETURN_IF_ERROR(VExpr::create_expr_trees(tnode_projections, projections));
