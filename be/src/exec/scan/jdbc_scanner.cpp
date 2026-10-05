@@ -176,7 +176,7 @@ void JdbcScanner::_collect_profile_before_close() {
     Scanner::_collect_profile_before_close();
     _jni_reader->collect_profile_before_close();
 }
-
+  
 Status JdbcScanner::close(RuntimeState* state) {
     if (!_try_close()) {
         return Status::OK();
