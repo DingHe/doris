@@ -251,27 +251,35 @@ Status OperatorXBase::init(const TPlanNode& tnode, RuntimeState* state) {
     }
     return Status::OK();
 }
-
+// prepare 方法属于算子生命周期的预处理/准备阶段，负责在查询正式开始数据拉取与计算之前，完成表达式的准备与打开（Prepare & Open）、谓词按代价排序优化、输出 Schema 匹配校验、子算子递归初始化以及阻塞性判断等准备工作。
 Status OperatorXBase::prepare(RuntimeState* state) {
+    // 过滤谓词（Conjuncts）的表达式准备（Prepare）
+    // 遍历当前算子所持有的所有过滤谓词（_conjuncts，即 WHERE 或 HAVING 子句转换而来的谓词表达式树 VExpr）。
+    // 对每一个 conjunct 调用其 prepare 函数，传入运行时状态 state 以及当前算子的中间行描述符 intermediate_row_desc()。
+    // 这一步会完成表达式的数据类型校验、常量推导、内存分配等准备工作。若任何一个谓词准备失败，立即返回错误。
     for (auto& conjunct : _conjuncts) {
         RETURN_IF_ERROR(conjunct->prepare(state, intermediate_row_desc()));
     }
+    // 根据计算代价对过滤谓词进行静态排序（优化）
     if (state->enable_adjust_conjunct_order_by_cost()) {
         std::ranges::stable_sort(_conjuncts, [](const auto& a, const auto& b) {
             return a->execute_cost() < b->execute_cost();
         });
     };
-
+    // 中间投影（Intermediate Projections）与最终投影（Projections）的准备
+    // 中间投影：若算子存在多层级/阶段性的中间表达式计算（如多层函数嵌套计算），按层级索引 i 调用 VExpr::prepare；
     for (int i = 0; i < _intermediate_projections.size(); i++) {
         RETURN_IF_ERROR(
                 VExpr::prepare(_intermediate_projections[i], state, intermediate_row_desc(i)));
     }
+    // 最终投影：对最终需要输出给下游算子的 _projections 表达式数组，调用 VExpr::prepare 进行批量准备。
     RETURN_IF_ERROR(VExpr::prepare(_projections, state, projections_row_desc()));
-
+    // 表达式输出类型与 RowDescriptor 的模式匹配检查
     if (has_output_row_desc()) {
         RETURN_IF_ERROR(VExpr::check_expr_output_type(_projections, *_output_row_descriptor));
     }
-
+    // 表达式的资源打开与初始化（Open 阶段）
+    // 在 open 阶段，表达式会执行常量计算（Constant Folding）、加载 UDF 资源或准备复杂的函数计算上下文（如正则匹配引擎初始化等）
     for (auto& conjunct : _conjuncts) {
         RETURN_IF_ERROR(conjunct->open(state));
     }
@@ -279,10 +287,13 @@ Status OperatorXBase::prepare(RuntimeState* state) {
     for (auto& projections : _intermediate_projections) {
         RETURN_IF_ERROR(VExpr::open(projections, state));
     }
+    // 递归准备子算子（Child Operator）
+    // 如果当前算子存在子节点（_child 非空），且当前算子不是数据源头算子（!is_source()，例如 Scan 算子属于 Source 算子没有 Child），则递归调用子算子的 prepare(state) 方法，保证整条算子链/执行树从上到下全部准备完毕。
     if (_child && !is_source()) {
         RETURN_IF_ERROR(_child->prepare(state));
     }
-
+    // 用于 Pipeline 调度器识别该算子是否包含阻塞性计算。
+    // 检查谓词或投影表达式中是否包含了“阻塞性函数”（例如涉及等待 RPC、网络 IO 或阻塞式外部调用的函数）。如果包含，将标志位 _blockable 置为 true，以提醒 Pipeline 调度框架在调度此算子时采用合适的异步/阻塞线程策略。
     if (VExpr::contains_blockable_function(_conjuncts) ||
         VExpr::contains_blockable_function(_projections)) {
         _blockable = true;

@@ -174,7 +174,13 @@ io::IOContext build_score_runtime_collection_io_context(RuntimeState* state, Rea
     }
     return io_ctx;
 }
-
+// OlapScanner 在被正式打开（open）与执行（get_block）之前的核心准备函数。
+// 核心职责是：
+// 多线程上下文隔离：深克隆下推谓词和虚列表达式，确保 Scanner 线程安全。
+// 构建底层 BlockReader：设置 Batch Size 与自适应 Block 内存配额。
+// 构建与同步 TabletSchema：从 FE 下发的 Thrift 描述信息更新当前扫描所需的列结构与索引信息。
+//  捕获数据源（Capture ReadSource）：在未预分配 Rowset Split 的情况下，向 Tablet 申请指定版本的数据集句柄（RowsetReader），并加载 Delete 谓词。
+// 配置读取参数与统计收集：组装 _tablet_reader_params，并在需要打分计算（如全文检索/向量检索）时收集全表/分片的文本与向量统计信息。
 Status OlapScanner::_prepare_impl() {
     auto* local_state = static_cast<OlapScanLocalState*>(_local_state);
     auto& tablet = _tablet_reader_params.tablet;
@@ -184,41 +190,53 @@ Status OlapScanner::_prepare_impl() {
                 .tag("tablet_id", tablet->tablet_id());
         return Status::Error<false>(-230, "injected error");
     });
-
+    // 深克隆下推的公共表达式（Push-down Common Exprs）
     for (auto& ctx : local_state->_common_expr_ctxs_push_down) {
         VExprContextSPtr context;
         RETURN_IF_ERROR(ctx->clone(_state, context));
         _common_expr_ctxs_push_down.emplace_back(context);
+        // 如果表达式中包含近似最近邻（ANN）向量范围检索，基于 _vector_search_params 初始化向量搜索的参数（如距离阈值、搜索范围）。
         context->prepare_ann_range_search(_vector_search_params);
     }
-
+    // 深克隆虚列表达式（Virtual Column Exprs）
     for (auto pair : local_state->_slot_id_to_virtual_column_expr) {
         // Scanner will be executed in a different thread, so we need to clone the context.
         VExprContextSPtr context;
         RETURN_IF_ERROR(pair.second->clone(_state, context));
         _slot_id_to_virtual_column_expr[pair.first] = context;
     }
-
+    // 全文检索或匹配打分的运行时状态
     _score_runtime = local_state->_score_runtime;
     // All scanners share the same ann_topn_runtime.
+    // 所有的 Scanner 共享同一个 ann_topn_runtime，用于全局维护 TopN 向量相似度堆阈值，实现跨 Scanner 的动态裁剪。
     _ann_topn_runtime = local_state->_ann_topn_runtime;
 
     // set limit to reduce end of rowset and segment mem use
+    // 构建 BlockReader 并配置 Batch 尺寸
+    // 实例化 BlockReader：创建 Doris 存储层向量化读取核心迭代器 BlockReader。
     _tablet_reader = std::make_unique<BlockReader>();
     // batch size is passed down to segment iterator, use _state->batch_size()
     // instead of _parent->limit(), because if _parent->limit() is a very small
     // value (e.g. select a from t where a .. and b ... limit 1),
     // it will be very slow when reading data in segment iterator
+    // 设置数据块行数阈值（Batch Size）：
+    // 注释特别说明：不能因为 SQL 中包含 LIMIT 1 就把存储层迭代器的 batch_size 设为 1。如果设为 1，会导致 Segment 迭代器频繁产生微小 Block、触发大量小粒度虚函数与内存分配，造成严重性能衰退。
     _tablet_reader->set_batch_size(_state->batch_size());
     // Adaptive batch size: pass byte-budget settings to the storage reader.
     // The reader still uses batch_size() as the row ceiling.
+    // 自适应字节 Block 大小（Adaptive Batch Size）：将理想的数据块字节数配额传给 BlockReader。存储层读取时除了满足行数上限（batch_size），还会结合动态列宽控制内存 Buffer 在合理的字节范围内。
     _tablet_reader->set_preferred_block_size_bytes(_state->preferred_block_size_bytes());
     {
+        // 构建与更新 TabletSchema
+        // 获取基准 Schema：从物理 tablet 对象中获取其本地持久化的原始 TabletSchema，并深拷贝一份存入 tablet_schema。
         TOlapScanNode& olap_scan_node = local_state->olap_scan_node();
         TabletSchemaSPtr source_tablet_schema = tablet->tablet_schema();
 
         tablet_schema = std::make_shared<TabletSchema>();
         tablet_schema->copy_from(*source_tablet_schema);
+        // 重构列 Schema（适应 Schema Change / Light Schema Change）：
+        // 判断 FE 是否在 olap_scan_node 中下发了特定的列描述结构体 columns_desc
+        // 如果下发了（例如存在加减列、Schema 变更），则清空原本的列，重新根据 FE 传过来的 Thrift 定义重建列属性，并同步设置对应的 schema_version。
         if (olap_scan_node.__isset.columns_desc && !olap_scan_node.columns_desc.empty() &&
             olap_scan_node.columns_desc[0].col_unique_id >= 0) {
             tablet_schema->clear_columns();
@@ -229,22 +247,27 @@ Status OlapScanner::_prepare_impl() {
                 tablet_schema->set_schema_version(olap_scan_node.schema_version);
             }
         }
+        // 更新索引元数据：如果 Thrift 中有最新的索引描述信息（如倒排索引、Bitmap 索引等），同步更新到 tablet_schema 中。
         if (olap_scan_node.__isset.indexes_desc) {
             tablet_schema->update_indexes_from_thrift(olap_scan_node.indexes_desc);
         }
-
+        // 捕获数据源（Capture ReadSource）与 Delete 谓词填充
+        // 非 Pipeline / 未切分模式捕获检查：若 rs_splits 为空，说明需要 Scanner 自行向 Tablet 申请匹配当前读取版本的物理 Rowsets。
+        // 设计目的（如注释所示）：在 Scanner 准备阶段就尽早锁定/获取 Rowsets 的句柄，防止并发量巨大时（如 10,000 个 Scanner），后执行的 Scanner 尚未开始读取，底层数据就已经被后台 Compact 掉而引发版本冲突。
         if (_tablet_reader_params.rs_splits.empty()) {
             // Non-pipeline mode, Tablet : Scanner = 1 : 1
             // acquire tablet rowset readers at the beginning of the scan node
             // to prevent this case: when there are lots of olap scanners to run for example 10000
             // the rowsets maybe compacted when the last olap scanner starts
             ReadSource read_source;
-
+            // 存算分离热点统计：若在云原生模式（Cloud Mode）下，向热点统计模块注册当前 Tablet 的一次访问计数，用于缓存调度与预热策略。
             if (config::is_cloud_mode()) {
                 // FIXME(plat1ko): Avoid pointer cast
                 ExecEnv::GetInstance()->storage_engine().to_cloud().tablet_hotspot().count(*tablet);
             }
-
+            // 调用 capture_read_source 获取版本数据集：
+            // 传入目标版本号（version）以及配置选项（如跳过缺失版本、是否允许跨副本拉取 Rowset、云模式缓存偏好等）。
+            // 尝试捕获当前版本所包含的全部物理 Rowset 句柄。若捕获失败（如 Version 已经被 Compaction 融合且元数据已被清理），记录 Warning 日志并直接返回错误状态。
             auto maybe_read_source = tablet->capture_read_source(
                     _tablet_reader_params.version,
                     {
@@ -263,12 +286,12 @@ Status OlapScanner::_prepare_impl() {
                 return maybe_read_source.error();
             }
             read_source = std::move(maybe_read_source.value());
-
+            // 如果开启了 MOW 详细日志且当前表是主键写时合并表，记录完成数据源捕获的日志信息。
             if (config::enable_mow_verbose_log && tablet->enable_unique_key_merge_on_write()) {
                 LOG_INFO("finish capture_rs_readers for tablet={}, query_id={}",
                          tablet->tablet_id(), print_id(_state->query_id()));
             }
-
+            // 如果未开启 skip_delete_predicate，调用 fill_delete_predicates() 将历史 DELETE 语句产生的删除谓词填充到 read_source 中，确保读取时自动过滤掉已删除的记录。
             if (!_state->skip_delete_predicate()) {
                 read_source.fill_delete_predicates();
             }
@@ -276,12 +299,14 @@ Status OlapScanner::_prepare_impl() {
         }
 
         // Initialize tablet_reader_params
+        // 传入 Slot 描述符映射、键值范围（Scan Ranges）、谓词映射表和下推函数，完成针对存储层的谓词与参数全量组装。
         RETURN_IF_ERROR(_init_tablet_reader_params(
                 local_state->_parent->cast<OlapScanOperatorX>()._slot_id_to_slot_desc, _key_ranges,
                 local_state->_slot_id_to_predicates, local_state->_push_down_functions));
     }
 
     // add read columns in profile
+    // Profile 记录与相关统计量收集
     if (_state->enable_profile()) {
         _profile->add_info_string("ReadColumns",
                                   read_columns_to_string(tablet_schema, _return_columns));
@@ -299,15 +324,24 @@ Status OlapScanner::_prepare_impl() {
                 _state, _tablet_reader_params.rs_splits, _tablet_reader_params.tablet_schema,
                 _tablet_reader_params.common_expr_ctxs_push_down, &io_ctx));
     }
-
+    // 标记准备完成并返回
     _has_prepared = true;
     return Status::OK();
 }
-
+// 调用基类的 Open 逻辑：完成 Scanner 基类的通用初始化（如算子计时器、状态标记等）。
+// 初始化底层 BlockReader：触发 _tablet_reader->init(...)，真正加载物理 Rowset / Segment 文件的索引与数据迭代器，并在此过程中触发下推谓词的前置评估（Eager First-Row Read）。
+// 补充诊断上下文：如果初始化失败（例如过滤表达式报错或数据文件损坏），在错误信息中追加当前的 tablet_id 以及 BE 节点地址，便于排查定位。
+// 释放元数据内存：清空已分配完的 rs_splits 集合，及时释放 Scanner 占用的内存空间。
 Status OlapScanner::_open_impl(RuntimeState* state) {
+    // 检查基类的 Open 逻辑是否正常（如检查 Scanner 是否已被取消、计数器与统计变量是否正确重置等）。若返回错误，RETURN_IF_ERROR 宏会立即终止当前函数并向上层抛出 Error。
     RETURN_IF_ERROR(Scanner::_open_impl(state));
     SCOPED_TIMER(_local_state->cast<OlapScanLocalState>()._reader_init_timer);
-
+    // 物理初始化 BlockReader（最关键的步骤）
+    // 内部所做的核心工作：
+    // 根据传入的 Rowset/Segment 集合，创建对应的 SegmentIterator 迭代器。
+    // 加载 ZoneMap、BloomFilter、Bitmap 等索引进行数据块切片裁剪。
+    // 构建主键/排序键的 MergeIterator（如果是 Aggregate / Unique 主键模型）。
+    // 执行首行/首块数据预读（Eager read）并评估下推的谓词表达式（如正则表达式、类型转换等）。
     auto res = _tablet_reader->init(_tablet_reader_params);
     if (!res.ok()) {
         // init() also runs the eager first-row read that evaluates pushed-down expressions,
@@ -317,6 +351,7 @@ Status OlapScanner::_open_impl(RuntimeState* state) {
                    ", backend=" + BackendOptions::get_localhost());
         return res;
     }
+    // 将 Scanner 准备阶段记录的初始文件缓存统计 _initial_file_cache_stats 合并（merge_from）到 Reader 的统计变量中，确保 FileCache 的命中率、IO 耗时等监控计数不遗漏。
     _tablet_reader->mutable_stats()->file_cache_stats.merge_from(_initial_file_cache_stats);
 
     // Do not hold rs_splits any more to release memory.
@@ -833,11 +868,16 @@ doris::TabletStorageType OlapScanner::get_storage_type() {
     }
     return doris::TabletStorageType::STORAGE_TYPE_REMOTE_AND_LOCAL;
 }
-
+// OlapScanner 批量提取向量化数据（Block）的核心实现函数
+// 从物理读取器提取数据：调用底层的 _tablet_reader（即 BlockReader）读取填充一个向量化 Block。
+// 严格保证 eof（End of File/Scan）接口语义：确保只有在当前返回的 Block 完全为空（包含 0 行数据）且存储层已无更多数据时，才将 eof 标记置为 true。
+// 维护 Tablet 级并发度/指标计数：成功获取包含数据的 Block 时，更新底层 Tablet 的物理读取块数计数器（read_block_count）。
 Status OlapScanner::_get_block_impl(RuntimeState* state, Block* block, bool* eof) {
     // Read one block from block reader
     // ATTN: Here we need to let the _get_block_impl method guarantee the semantics of the interface,
     // that is, eof can be set to true only when the returned block is empty.
+    // 调用存储层读取核心逻辑
+    // 内部工作：存储层在此处遍历各 SegmentIterator，进行谓词过滤（ZoneMap/Bitmap/Inverted Index/Column Predicate）、删除标记（Delete Sign）过滤、聚合模型/Unique 主键模型的 Merge 聚合，最终将结果填充进 block 中，并初步设置 eof 标记。
     RETURN_IF_ERROR(_tablet_reader->next_block_with_aggregation(block, eof));
     if (block->rows() > 0) {
         _tablet_reader_params.tablet->read_block_count.fetch_add(1, std::memory_order_relaxed);

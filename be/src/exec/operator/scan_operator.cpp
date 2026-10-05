@@ -1318,28 +1318,35 @@ Status ScanLocalState<Derived>::close(RuntimeState* state) {
     return PipelineXLocalState<>::close(state);
 }
 
+// ScanOperatorX 是所有数据扫描算子（如 OLAP 表扫描、External File 扫描、JDBC 扫描等）的基类（属于 Source 算子）。
+// 在 Doris 的 Pipeline 执行架构中，get_block_impl 是算子拉取数据块的核心实现方法：它采用生产者-消费者模型，不直接在当前 Pipeline 执行线程中同步读取 IO，而是向后台的 Scanner 上下文/队列（_scanner_ctx）申请消费已经异步读取并准备好的数据块（Block）。
+// Block* block：数据块输出指针（输出参数）。用于接收从扫描队列中获取的一批向量化数据（列式内存块）。
+// bool* eos：End of Stream 标识指针（输出参数）。设置为 true 时告知下游算子：该扫描算子的数据已全部拉取完毕。
 template <typename LocalStateType>
 Status ScanOperatorX<LocalStateType>::get_block_impl(RuntimeState* state, Block* block, bool* eos) {
+    // 从 RuntimeState 中提取当前线程/Task 对应的 LocalStateType 状态对象引用。
     auto& local_state = get_local_state(state);
     SCOPED_TIMER(local_state.exec_time_counter());
-
+    // 检查当前查询是否已被用户手动取消、超时或因其他算子报错而终止。
     if (state->is_cancelled()) {
+        // 若查询已被取消，使用原子操作 load() 安全读取当前算子的 _scanner_ctx（Scanner 上下文句柄）
         if (auto ctx = local_state._scanner_ctx.load()) {
             ctx->stop_scanners(state);
         }
         return state->cancel_reason();
     }
-
+    // 短路检查：是否已经提前结束（EOS）
     if (local_state._eos) {
         *eos = true;
         return Status::OK();
     }
-
+    // 加载当前扫描算子的异步调度器/上下文对象 _scanner_ctx。
     auto ctx = local_state._scanner_ctx.load();
-
+    // 从异步队列中获取数据块（核心数据拉取）
+    // 后台工作线程（Scanner Threads）会持续从存储介质（如 Segment 文件、Parquet/ORC 文件）读取数据并写入队列；
     DCHECK(ctx != nullptr);
     RETURN_IF_ERROR(ctx->get_block_from_queue(state, block, eos, 0));
-
+    // Limit 限制检查与提前停止（Early-Stop）优化
     local_state.reached_limit(block, eos);
     if (*eos) {
         // reach limit, stop the scanners.

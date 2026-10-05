@@ -556,11 +556,26 @@ struct CaptureRowsetResult {
     std::shared_ptr<DeleteBitmap> delete_bitmap;
 };
 
+// 描述“如何去读取一个 Tablet 数据”的轻量级核心上下文结构体
+// 在 Apache Doris 的 MVCC 多版本存储架构和 Unique Key 写时合并（Merge-On-Write, MOW）模型中，读取一个 Tablet 绝非简单地把文件打开，而是需要组合多个 Rowset（数据段）、应用历史删除谓词（Delete Predicates）以及结合删除位图（Delete Bitmap）。TabletReadSource 就是把这些读取所需的元数据资源打成一个统一的“数据源包”，传递给 OlapScanner / TabletReader 使用。
+// TabletReadSource 的核心作用是为底层的 Scanner/Reader 打造一份完整且经过剪枝/拆分后的 Tablet 数据读取视图。它的具体职责包括：
+// 版本与切片管理：保存当前 Tablet 在目标版本范围内需要读取的所有 Rowset 切片（rs_splits），支持按 Segment 级别进行并行扫描拆分。
+// 历史删除条件追溯：收集当前版本之前发生过的 DELETE FROM 语句所生成的删除谓词 Rowset（delete_predicates），用于在读取时过滤掉被物理删除的数据行。
+// 写时合并（MOW）精准去重：在 Unique Key MOW 表中，挂载该 Tablet 当前版本的删除位图（delete_bitmap），通过 Bitmap 快速跳过已经被更新或删除的旧行，实现高并发极速读取。
 struct TabletReadSource {
+    // RowSetSplits 内部包含了某个 RowsetSharedPtr（Rowset 句柄）以及该 Rowset 中被选中的 SegmentReader 范围列表。
+    // 承载实际扫描的数据段。它指定了本次查询具体需要读取哪些 Rowset，以及这些 Rowset 里的哪些 Segment。
+    // 支持 Segment 级并行扫描。Doris 为了提高 Scan 的并行度，会将一个大的 Rowset 拆分为多个 Segment 切片，分配给不同的 Scanner 线程并发读取。rs_splits 保存的就是这些切片信息。
     std::vector<RowSetSplits> rs_splits;
+    // 存储累积的历史删除谓词。在 Doris 中，通过 DELETE FROM table WHERE ... 语法删除数据时，并不一定会立刻重写物理数据，而是生成一个特殊的“删除谓词 Rowset”（仅包含条件表达式，如 a > 10）。
+    // 提供行级过滤逻辑。在读取累积数据（如 Duplicate 引擎或 Aggregate 引擎的 Merge 过程）时，Reader 需要将这些 delete_predicates 转化为谓词过滤器，在扫描数据行时进行过滤。
     std::vector<RowsetMetaSharedPtr> delete_predicates;
+    // 写时合并（Merge-On-Write, MOW）模型的核心数据结构。在 MOW 表中，当有新数据写入（INSERT / UPDATE）时，系统不会在读取时做耗时的 Multi-Version Merge，而是在写入时直接计算出被覆盖/删除的旧数据行号，记录在 DeleteBitmap（RoaringBitmap）中。
+    // 跳过不可见行：存储引擎在读取 Segment 的 RowID 时，直接用 delete_bitmap 做 Bitmap 求差集运算，能以极高的效率跳过无效行，实现媲美 Duplicate 模型的点查与扫描性能。
     std::shared_ptr<DeleteBitmap> delete_bitmap;
     // Fill delete predicates with `rs_splits`
+    // 遍历当前 rs_splits 中所有的 Rowset，提取出其中带有删除谓词属性（即 rowset->rowset_meta()->has_delete_predicate() 为 true）的 Rowset，
+    // 并将它们的 rowset_meta() 收集追加到 delete_predicates 容器中。
     void fill_delete_predicates();
 };
 

@@ -274,6 +274,13 @@ const typename ColumnValueRange<TYPE_DOUBLE>::CppType ColumnValueRange<TYPE_DOUB
 ///  5. If no key predicates exist, get_key_range returns empty; the caller creates a single
 ///     default OlapScanRange with has_lower_bound=false (represents full table scan).
 ///
+// 用于将下推的列过滤条件构建并离散化为存储层主键/排序键扫描区间（Scan Key Ranges）的核心工具类
+// 在 Apache Doris 的 OLAP 引擎中，数据通常按照前缀键（Prefix Keys / Short Key）进行有序存储和索引建立。
+// 为了尽可能缩减底层磁盘扫描范围，计算层下推的过滤条件（如 WHERE k1 = 1 AND k2 IN (2, 3) AND k3 >= 10）需要按照键列的顺序逐步压入（Extend）并组合成若干个对 $[BeginKey, EndKey]$ 的主键扫描范围。OlapScanKeys 正是承担了这一“条件到存储键范围转换与扩展”的任务。
+// 组合与扩展 Scan Key（笛卡尔积扩展）：按照表定义的 Primary Key / Sort Key 顺序，依次将各 key 列的取值范围（ColumnValueRange）扩展到已有的 Scan Key 中。针对 IN / = 等固定值条件，采用笛卡尔积（Cartesian Product）方式展开为多个精准的 Key 组。
+// 范围边界锁定（Range Key Truncation）：当遇到范围条件（如 >、<、BETWEEN）时，更新边界值并将标志位 _has_range_value 置为 true。由于前缀复合索引的有序特性，一旦某一列出现了范围查询，其后续列就无法再继续通过笛卡尔积精确裁剪索引，扩展过程在此截断。
+// 安全并发/膨胀控制：限制笛卡尔积展开的最大数量（max_scan_key_num），防止过多的离散取值导致内存暴涨或生成成千上万个离散 Scanner。
+// 生成底层读取对象：最终将内部维护的起始/结束键元组对转化为存储层直接消费的 OlapScanRange 对象列表，供 TabletReader 或 SegmentReader 进行寻道（Seek）。
 class OlapScanKeys {
 public:
     /// Extend internal scan key pairs with the next key column's ColumnValueRange.
@@ -287,11 +294,26 @@ public:
     ///                           (can be erased from residual predicates).
     /// @param eos         [out]: true if the range is provably empty (no rows to scan).
     /// @param should_break[out]: true if the range cannot be encoded and we should stop.
+    // 按照复合主键/排序键（Prefix Sort Keys）的列顺序，将当前 Key 列的查询范围（ColumnValueRange）逐列“压入”并组合到已经生成的起始/结束键元组对中。
+    // range：当前 Key 列对应的列值范围对象（包含固定值列表或 min/max 范围条件）。
+    // max_scan_key_num：允许展开生成的最大 Scan Key 数量阈值（防止笛卡尔积爆炸）。
+    // exact_value：若返回 true，代表该列的所有过滤条件已被完整转换为 Scan Key，在后续谓词评估中可以从残留谓词（Residual Predicates）中安全擦除该列条件，避免重复计算。
+    // eos：若返回 true，代表推导过程中发现该列条件在逻辑上必然为空（如 k1 > 10 AND k1 < 5），此时可以直接放弃扫描（End Of Stream）。
+    // should_break：若返回 true，说明该列条件无法被有效编码或者达到了笛卡尔积膨胀上限，提示外层调用者停止继续追加后续 Key 列。
+    // Doris 存储层复合索引的基本规则
+    // 笛卡尔积展开（Cartesian Product Expansion）
+    // 如果前面的 Key 列存在 IN 或 = 条件（即有固定值列表 fixed_values），后续列也是固定值，extend_scan_key 会将当前列的多个固定值与之前已生成的全部 Scan Key 进行笛卡尔积组合。
+    // 示例：如果 k1 IN (1, 2)，k2 IN ('A', 'B')，则组合成 4 个精确点查区间：[(1, 'A'), (1, 'A')]、[(1, 'B'), (1, 'B')]、[(2, 'A'), (2, 'A')]、[(2, 'B'), (2, 'B')]。
+    // 范围截断（Range Value Truncation）
+    // 因为复合索引按照顺序排序（即字典序），一旦某一列出现了范围条件（如 k2 > 10），后续列的离散条件就无法再利用前缀索引做精确过滤了。此时 _has_range_value 会被置为 true，扩展过程在此截断，后续列不会再被压入 Key 中。
+    // 膨胀控制（Explosion Control）
+    // 如果 IN 条件中的元素过多（如 k1 IN (1..100)），笛卡尔积会导致生成的 Scan Key 数量暴增。通过参数 max_scan_key_num 进行截断控制，防止占用过多内存或生成过多的 Scanner。
     template <PrimitiveType primitive_type>
     Status extend_scan_key(ColumnValueRange<primitive_type>& range, int32_t max_scan_key_num,
                            bool* exact_value, bool* eos, bool* should_break);
 
     /// Convert accumulated scan key pairs into OlapScanRange objects for the storage layer.
+    // key_range（出参）：用于接收导出的 OlapScanRange 对象列表指针。
     Status get_key_range(std::vector<std::unique_ptr<OlapScanRange>>* key_range);
 
     bool has_range_value() const { return _has_range_value; }
@@ -322,11 +344,16 @@ public:
     void set_is_convertible(bool is_convertible) { _is_convertible = is_convertible; }
 
 private:
+    // 存储所有起始扫描键（Begin Keys）的元组数组。与 _end_scan_keys 按索引一一对应，每个 OlapTuple 相当于组合键中的左边界（如 [k1_val, k2_val, k3_min]）。
     std::vector<OlapTuple> _begin_scan_keys;
+    // 存储所有结束扫描键（End Keys）的元组数组。与 _begin_scan_keys 一一对应，每个 OlapTuple 相当于组合键中的右边界（如 [k1_val, k2_val, k3_max]）。
     std::vector<OlapTuple> _end_scan_keys;
+    // 标记当前组合键中是否已经包含了范围（Scope/Range）过滤条件（如 >、< 等）。
     bool _has_range_value = false;
+    // 标识当前的扫描起始键区间是否包含边界值（即是否闭区间 [）。若为 true，代表起点是 >= 关系；若为 false，代表起点是 > 关系。
     bool _begin_include = false;
     bool _end_include = false;
+    // 标记当前导出的 Scan Key 是否可以成功转换为底层 OlapScanRange 的有效格式，用于控制和校验 key 格式转换的可行性状态。
     bool _is_convertible = false;
 };
 

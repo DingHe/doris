@@ -45,21 +45,27 @@ Scanner::Scanner(RuntimeState* state, ScanLocalStateBase* local_state, int64_t l
     _total_rf_num = cast_set<int>(_local_state->_helper.runtime_filter_nums());
     DorisMetrics::instance()->scanner_cnt->increment(1);
 }
-
+// 为当前 Scanner 实例绑定全局共享的 Limit 计数器，并深度克隆（Clone）上层算子下发的过滤谓词与投影表达式上下文。
+// 由于多个 Scanner 会被调度到不同的工作线程中并发执行，直接共享表达式上下文对象会导致线程安全问题，因此必须为每个 Scanner 独立克隆一份专用的表达式实例（VExprContext）
+// conjuncts (const VExprContextSPtrs&)： 上层 Scan 算子下发给当前 Scanner 的过滤谓词表达式集合（如 SQL 中的 WHERE a > 10 以及动态 Runtime Filter）。
 Status Scanner::init(RuntimeState* state, const VExprContextSPtrs& conjuncts) {
     // All scanners share a remaining-limit counter so a LIMIT query can
     // stop once enough rows have been collected across scanners.
     // Key TopN scans have no ordinary scan LIMIT, so each scanner can
     // independently produce its full local top-N.
+    // 从算子本地状态（ScanLocalState）中获取指向全局原子计数器 std::atomic<int64_t> 的指针。
+    // 设计目的：在并发读取场景下（例如 SELECT * FROM table LIMIT 10），同一个 ScanNode 会创建多个并发执行的 Scanner。
+    // 通过共享这个原子指针，任何一个 Scanner 读到了新数据，都可以原子递减剩余 Limit。一旦减到 0，所有并发 Scanner 都会感知并提前终止读取，避免无效的磁盘 I/O。
+    // 对于 Key TopN 等无需普通 LIMIT 截断的场景，该指针可能为 nullptr。
     _shared_scan_limit = _local_state->shared_scan_limit_ptr();
-
+    // 深克隆过滤谓词（Conjuncts）
     if (!conjuncts.empty()) {
         _conjuncts.resize(conjuncts.size());
         for (size_t i = 0; i != conjuncts.size(); ++i) {
             RETURN_IF_ERROR(conjuncts[i]->clone(state, _conjuncts[i]));
         }
     }
-
+    // 深克隆最终投影表达式（Projections）
     const auto& projections = _local_state->_projections;
     if (!projections.empty()) {
         _projections.resize(projections.size());
@@ -67,7 +73,7 @@ Status Scanner::init(RuntimeState* state, const VExprContextSPtrs& conjuncts) {
             RETURN_IF_ERROR(projections[i]->clone(state, _projections[i]));
         }
     }
-
+    // 深克隆中间过程投影表达式（Intermediate Projections）
     const auto& intermediate_projections = _local_state->_intermediate_projections;
     if (!intermediate_projections.empty()) {
         _intermediate_projections.resize(intermediate_projections.size());
@@ -126,13 +132,23 @@ Status Scanner::get_block_after_projects(RuntimeState* state, Block* block, bool
     }
 }
 
+// 数据扫描节点中最核心的数据产生入口。它的主要职责是：
+// 控制全局与局部 Limit 裁剪：在读取数据前与读取数据后校验剩余配额，实现跨线程/并发 Scanner 的早期短路（Early Exit）。
+// 构建或重用内存数据块（Block）：根据输出 Tuple 的 Schema 构造向量化数据块。
+// 调用存储引擎读取原始数据：调用子类实现的 _get_block_impl 获取底层存储的原始列数据。
+// 执行谓词过滤（Filter）：对读取到的列数据应用 WHERE 表达式以及 Runtime Filter。
+// 循环重试与阈值控制：若当前批次被过滤后为空（0 行），在达到单次扫描阈值前自动循环重试，避免向上层算子频繁返回空 Block。
+// block (Block*)： 输出参数。 Scanner 将从存储层读取并过滤后的列数据填充到这个 Block 中，传给上层 pipeline 算子。
+// eof (bool*)： 输出参数。告知调用方当前 Scanner 是否已经读取完毕（true 表示数据已全部读完或达到 Limit，后续无需再调用 get_block）。
 Status Scanner::get_block(RuntimeState* state, Block* block, bool* eof) {
     // only empty block should be here
+    // 要求传入的 block 必须是空的（0 行数据）。如果不为空，说明上层未清理旧数据，可能引发内存覆盖或拼接错误。
     DCHECK(block->rows() == 0);
 
     // Stop early if other scanners have already collected enough rows
     // for the SQL LIMIT. Skipped when _shared_scan_limit is null (topn
     // path or no LIMIT).
+    // 当设置了 _shared_scan_limit（非 nullptr）时，通过原子操作 load(std::memory_order_acquire) 获取当前剩余的全局 Limit 额度。
     if (_shared_scan_limit && _shared_scan_limit->load(std::memory_order_acquire) <= 0) {
         *eof = true;
         return Status::OK();
@@ -140,8 +156,11 @@ Status Scanner::get_block(RuntimeState* state, Block* block, bool* eof) {
 
     // scanner running time
     SCOPED_RAW_TIMER(&_per_scanner_timer);
+    // 计算本次 get_block 调用的最大允许读取数据行数阈值（当前已读行数 + 配置项 doris_scanner_row_num）。用于防范在极端全过滤场景下，死循环消耗过多 CPU。
     int64_t rows_read_threshold = _num_rows_read + config::doris_scanner_row_num;
+    // 判断当前 block 是否开启了内存重用（mem_reuse()）。
     if (!block->mem_reuse()) {
+        // 如果没有重用（初次分配），遍历输出元组描述符 _output_tuple_desc 中的所有槽位（Slot），创建对应的空可变列（get_empty_mutable_column()）、数据类型和列名，插入到 block 中，从而建立起当前 Block 的向量化结构（Schema）。
         for (auto* const slot_desc : _output_tuple_desc->slots()) {
             block->insert(ColumnWithTypeAndName(slot_desc->get_empty_mutable_column(),
                                                 slot_desc->get_data_type_ptr(),
@@ -150,11 +169,13 @@ Status Scanner::get_block(RuntimeState* state, Block* block, bool* eof) {
     }
 
     {
+        // 核心读取与过滤循环 (Do-While 循环)
         do {
             // 1. Get input block from scanner
             {
                 // get block time
                 SCOPED_TIMER(_local_state->_scan_timer);
+                // 多态调用派生类（如 OlapScanner / FileScanner）实现的物理读取函数，填充 block。
                 RETURN_IF_ERROR(_get_block_impl(state, block, eof));
                 if (*eof) {
                     DCHECK(block->rows() == 0);
@@ -165,6 +186,8 @@ Status Scanner::get_block(RuntimeState* state, Block* block, bool* eof) {
             }
 
             // 2. Filter the output block finally.
+            // 谓词过滤（阶段 2）：
+            // 对 block 应用谓词表达式（WHERE 条件和 Runtime Filter），对不符合条件的行进行筛选切片。
             {
                 SCOPED_TIMER(_local_state->_filter_timer);
                 RETURN_IF_ERROR(_filter_output_block(block));
@@ -175,9 +198,16 @@ Status Scanner::get_block(RuntimeState* state, Block* block, bool* eof) {
             // observe it. The counter may go negative when several scanners
             // subtract concurrently; that is harmless because the operator's
             // reached_limit() makes the final cut.
+            // 如果当前 Batch 过滤后依然得到了有效数据（block->rows() > 0），使用原子扣减操作 fetch_sub 更新共享的 _shared_scan_limit。
             if (_shared_scan_limit && block->rows() > 0) {
                 _shared_scan_limit->fetch_sub(block->rows(), std::memory_order_acq_rel);
             }
+        // 退出循环的条件（满足任意一个即停止）：
+        // _should_stop == true（Scanner 被要求停止）；
+        // state->is_cancelled() == true（查询被取消）；
+        // block->rows() > 0（成功获取到了包含有效数据的 Block）；
+        // *eof == true（底盘数据已全部读完）；
+        // _num_rows_read >= rows_read_threshold（达到单次读取上限阈值，防止在过滤掉大量数据时卡死在当前调用中）。
         } while (!_should_stop && !state->is_cancelled() && block->rows() == 0 && !(*eof) &&
                  _num_rows_read < rows_read_threshold);
     }
@@ -186,6 +216,7 @@ Status Scanner::get_block(RuntimeState* state, Block* block, bool* eof) {
         // TODO: Should return the specific ErrorStatus instead of just Cancelled.
         return Status::Cancelled("cancelled");
     }
+    // 状态校验与终止条件判定 (Post-Process & Exit)
     *eof = *eof || _should_stop;
     // set eof to true if per scanner limit is reached
     // currently for query: ORDER BY key LIMIT n
@@ -194,9 +225,13 @@ Status Scanner::get_block(RuntimeState* state, Block* block, bool* eof) {
 
     return Status::OK();
 }
-
+// 核心职责是：接收从存储引擎（如 Segment / Parquet / ORC 等）读取出来的原始数据块（Block），对其应用当前 Scanner 持有的所有过滤谓词（_conjuncts，包括 SQL 中的 WHERE 条件以及动态生成的 Runtime Filter），过滤掉不符合条件的行，并记录被过滤掉的行数度量指标（Metrics）。
+// block (Block*)： 向量化数据块指针（Block 包含了多列数据，是 Doris 向量化执行引擎的核心数据载体）。
 Status Scanner::_filter_output_block(Block* block) {
+    // 在执行任何过滤计算之前，先调用 block->rows() 获取当前 Block 在过滤前的原始行数（Row Count），保存到变量 old_rows 中，用于后续计算被过滤掉的数据量。
     auto old_rows = block->rows();
+    // 执行向量化谓词过滤（核心计算）
+    // _conjuncts：当前 Scanner 内部持有的表达式上下文数组（VExprContextSPtrs），里面包含了下推给当前 Scanner 的所有 SQL 过滤条件和动态 Runtime Filter。
     Status st = VExprContext::filter_block(_conjuncts, block, block->columns());
     _counter.num_rows_unselected += old_rows - block->rows();
     return st;

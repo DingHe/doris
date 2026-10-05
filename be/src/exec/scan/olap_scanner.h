@@ -65,6 +65,15 @@ io::IOContext build_score_runtime_collection_io_context(RuntimeState* state, Rea
                                                         int64_t expiration_time,
                                                         io::FileCacheStatistics* file_cache_stats);
 
+// OlapScanner 是继承自 Scanner 基类的核心类之一，专门负责从 Doris 自研的内表存储引擎（即 OLAP 表 / Tablet，对应 Rowset、Segment 文件）中读取列式数据。
+// OlapScanner 是 Doris 存储层（Storage Engine）与向量化执行层（Pipeline Execution Engine）之间的关键桥梁。
+// 其主要作用包括：
+// 对接 OLAP 存储引擎：封装对 Doris 本地/存算分离 OLAP Tablet 的读取逻辑，调用底层的 TabletReader（如 BlockReader）读取 Rowset/Segment 文件中的数据。
+// 支持多样化读取特性：
+// 扫描范围与裁剪：支持基于 主键/排序键 范围（OlapScanRange）的数据过滤和切片。
+// 版本控制与 Binlog：支持历史版本读取、数据变更 Binlog 读取以及基于 TSO（Timestamp Oracle）的时间旅行/增量查询。
+// 半结构化与复杂类型扩展：支持 Variant 异构列推导、虚列（Virtual Column）表达式计算等。
+// 高级索引与向量检索：支持 ANN（近似最近邻）向量检索运行时上下文（AnnTopNRuntime）及分数计算（ScoreRuntime）。
 class OlapScanner : public Scanner {
     ENABLE_FACTORY_CREATOR(OlapScanner);
 
@@ -73,14 +82,23 @@ public:
         RuntimeState* state = nullptr;
         RuntimeProfile* profile = nullptr;
         std::vector<OlapScanRange*> key_ranges;
+        // 当前正在读取的目标 Tablet（分片）的智能指针。
         BaseTabletSPtr tablet;
+        // 读取的数据版本号（Data Version）。
         int64_t version;
+        // 读取源，包含了关联的 Rowset 句柄、RSReader 集合等。
         TabletReadSource read_source;
+        // 初始的 FileCache 文件缓存统计数据，用于性能分析。
         io::FileCacheStatistics initial_file_cache_stats;
+        // 当前 Scanner 允许返回的最大行数限制（LIMIT）。
         int64_t limit;
+        // 是否开启聚合（例如 Aggregate Key 模型是否需要在存储层做传输前预聚合）。
         bool aggregation;
+        // 是否读取行级 Binlog 数据（默认 false）。
         bool read_row_binlog = false;
+        // Binlog 扫描类型（如全部、仅变更记录等）。
         TBinlogScanType::type binlog_scan_type = TBinlogScanType::NONE;
+        // TSO 事务起始时间戳（用于增量/事务流读取）。
         std::optional<int64_t> start_tso;
         std::optional<int64_t> end_tso;
     };
@@ -117,7 +135,7 @@ private:
 #ifndef NDEBUG
     Status _check_ann_cache_hit_debug_points(const OlapReaderStatistics& stats);
 #endif
-
+    // 当前 Scanner 负责扫描的按 Key 裁剪后的范围列表（主键/排序键区间）。
     std::vector<OlapScanRange*> _key_ranges;
 
     TabletReader::ReaderParams _tablet_reader_params;

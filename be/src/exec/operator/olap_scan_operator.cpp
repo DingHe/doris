@@ -54,22 +54,35 @@
 
 namespace doris {
 
+// LocalStateInfo& info  包含当前 Pipeline Task 专属的上下文，例如 parent Operator 指针、RuntimeProfile 节点、Task 级别的表达式上下文（ExecEnv/State）等。
 Status OlapScanLocalState::init(RuntimeState* state, LocalStateInfo& info) {
+    // _parent 是基类中指向该 LocalState 对应父算子 OperatorX 的指针。
+    // 通过 cast<OlapScanOperatorX>() 将父算子转为具体的 OlapScanOperatorX 类型。
+    // 从父算子中获取 FE（Frontend）下发的 Thrift 结构体 TOlapScanNode（即 _olap_scan_node），其中包含了 FE 编译生成的索引、排序、倒排/向量检索等参数。
     const TOlapScanNode& olap_scan_node = _parent->cast<OlapScanOperatorX>()._olap_scan_node;
-
+    // 解析全文检索（BM25/Match）等场景下的 Score 打分与 Limit 优化信息。
+    // 判断 FE 是否下推了基于得分（Score）排序和截断（Limit）的相关配置。
     if (olap_scan_node.__isset.score_sort_info && olap_scan_node.__isset.score_sort_limit) {
+        // 获取计算 Score 得分的表达式（TExpr）
         const doris::TExpr& ordering_expr = olap_scan_node.score_sort_info.ordering_exprs.front();
+        // 获取排序方向（升序 true 还是降序 false）
         const bool asc = olap_scan_node.score_sort_info.is_asc_order[0];
+        // 获取需要保留的前 N 条数据数量。
         const size_t limit = olap_scan_node.score_sort_limit;
         std::shared_ptr<VExprContext> ordering_expr_ctx;
+        // 将 Thrift 格式的表达式翻译构建成向量化表达式树 VExprContext
         RETURN_IF_ERROR(VExpr::create_expr_tree(ordering_expr, ordering_expr_ctx));
+        // 实例化 ScoreRuntime 运行时对象并保存到 _score_runtime，用于在底层 Scanner 扫描数据时实现基于 Score 的 TopN 裁剪（例如早停/动态阈值过滤）。
         _score_runtime = ScoreRuntime::create_shared(ordering_expr_ctx, asc, limit);
     }
-
+    // 处理 ANN（Approximate Nearest Neighbor）向量检索 TopN 优化
+    // 解析向量检索（ANN/Vector Index）场景下的近似最近邻 TopN 下推信息。
     if (olap_scan_node.__isset.ann_sort_info || olap_scan_node.__isset.ann_sort_limit) {
+        // 断言确保 ann_sort_info 和 ann_sort_limit 同时存在，且排序表达式有且仅有一个，并且对应的排序列为虚拟列（Virtual Slot，如向量距离计算列）。
         DCHECK(olap_scan_node.__isset.ann_sort_info);
         DCHECK(olap_scan_node.__isset.ann_sort_limit);
         DCHECK(olap_scan_node.ann_sort_info.ordering_exprs.size() == 1);
+        // 提取消量距离/相似度计算表达式、排序方向及 TopN Limit 值。
         const doris::TExpr& ordering_expr = olap_scan_node.ann_sort_info.ordering_exprs.front();
         DCHECK(ordering_expr.nodes[0].__isset.slot_ref);
         DCHECK(ordering_expr.nodes[0].slot_ref.is_virtual_slot);
@@ -77,25 +90,31 @@ Status OlapScanLocalState::init(RuntimeState* state, LocalStateInfo& info) {
         const bool asc = olap_scan_node.ann_sort_info.is_asc_order[0];
         const size_t limit = olap_scan_node.ann_sort_limit;
         std::shared_ptr<VExprContext> ordering_expr_ctx;
+        // 创建向量 TopN 运行时管理对象 _ann_topn_runtime，后续下发给 Segment Reader 用于利用 ANN 索引跳过无关数据。
         RETURN_IF_ERROR(VExpr::create_expr_tree(ordering_expr, ordering_expr_ctx));
         _ann_topn_runtime =
                 segment_v2::AnnTopNRuntime::create_shared(asc, limit, ordering_expr_ctx);
     }
 
     // Parse score range filtering parameters and set to ScoreRuntime
+    // 处理 Score 范围过滤条件（Score Range Filtering）
+    // 解析得分的阈值过滤范围（如设定得分必须大于某个阈值 threshold）。
+    // 判断 FE 是否设置了 score_range_info 及其操作符 op（如 >, >=）和阈值 threshold。
     if (olap_scan_node.__isset.score_range_info) {
         const auto& score_range_info = olap_scan_node.score_range_info;
         if (score_range_info.__isset.op && score_range_info.__isset.threshold) {
+            // 若此前已成功创建 _score_runtime，则将比较操作符和阈值注入到 _score_runtime 中，使得底层存储层可以根据 Score 阈值提前过滤不满足条件的 RowSet 或 Segment。
             if (_score_runtime) {
                 _score_runtime->set_score_range_info(score_range_info.op,
                                                      score_range_info.threshold);
             }
         }
     }
-
+    // 调用基类 ScanLocalState 的 init 方法，完成通用的 Scan 节点初始化（如注册 RuntimeFilter、初始化 Profile 计数器、绑定父类公共成员等）。若失败直接返回。
     RETURN_IF_ERROR(Base::init(state, info));
+    // 在 Doris 存算分离（Cloud Mode）架构下，同步/刷新该 Scan 节点需要读取的 Cloud Tablet 元数据信息。确保在计算层（BE）读取时，Tablet 的版本和 Meta 缓存是最新的。
     RETURN_IF_ERROR(_sync_cloud_tablets(state));
-
+    // 挂载分区边界信息。将该 Scan 节点涉及的分区上界与下界绑定到当前 LocalState 中，便于进行动态分区剪枝以及生成存储引擎读取时的 Key Range。
     _attach_partition_boundaries();
 
     return Status::OK();
@@ -626,8 +645,12 @@ bool OlapScanLocalState::_is_binlog_merge_scan() const {
     auto scan_type = _scan_ranges[0]->binlog_scan_type;
     return scan_type == TBinlogScanType::MIN_DELTA || scan_type == TBinlogScanType::DETAIL;
 }
+// OlapScan 算子初始化核心扫描器（Scanner）的关键入口函数
+// 主要职责是：根据物理扫描范围（Scan Ranges）、下推的 Key 过滤条件、Runtime Filter 剪枝结果以及系统并发配置，构建出具体的 OlapScanner 列表（支持并行扫描 Parallel Scan 与传统按 Tablet 串行/分块扫描两种模式），为后续数据读取做好准备。
+// std::list<ScannerSPtr>* scanners (出参指针) 方法内部构建好的 OlapScanner 对象会被追加（push_back）到这个列表中，供 Pipeline 调度器（ScannerScheduler）并发调度执行
 
 Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
+    // 如果为空（例如在上游或 FE 裁剪后没有分配到任何数据区间），直接设置标志位 _eos = true（已达数据末尾 End-Of-Stream），唤醒依赖该 Scan 算子的 Pipeline 任务，并直接返回 Status::OK()
     if (_scan_ranges.empty()) {
         _eos = true;
         _scan_dependency->set_ready();
@@ -635,18 +658,22 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
     }
     SCOPED_TIMER(_scanner_init_timer);
     auto& p = _parent->cast<OlapScanOperatorX>();
-
+    // 提取 FE 传过来的目标输出列的唯一 ID（output_column_unique_ids），并填充到当前 LocalState 的集合 _output_column_ids 中，用于指示底层存储引擎仅读取需要的列（列式存储裁剪）
     for (auto uid : p._olap_scan_node.output_column_unique_ids) {
         _output_column_ids.emplace(uid);
     }
 
     // Step 3: convert accumulated scan key pairs into OlapScanRange objects.
     // Each OlapScanRange carries real begin/end OlapTuples with has_lower_bound = true.
+    // 构建主键/排序键扫描范围（Scan Key Ranges）
+    // 将下推到 Scan 节点的 Key 谓词（如 WHERE id >= 10 AND id <= 20 转换为的前缀 Key 条件）解析为具体的 OlapScanRange 区间列表 _cond_ranges。
     RETURN_IF_ERROR(_scan_keys.get_key_range(&_cond_ranges));
     // If no key predicates were pushed down, _cond_ranges is empty.
     // Create a single default-constructed OlapScanRange (has_lower_bound = false)
     // to represent a full table scan.  Consumers detect this and skip pushing
     // key range to the tablet reader.
+    // 处理全表扫描（Full Scan）情况。
+    // 如果没有针对排序键的过滤条件，_cond_ranges 为空。此时主动创建一个默认构造的 OlapScanRange（其 has_lower_bound 默认为 false），代表扫描整个 Tablet 的全部主键区间。
     if (_cond_ranges.empty()) {
         _cond_ranges.emplace_back(new doris::OlapScanRange());
     }
@@ -666,10 +693,14 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
     // the tablet, (b) acquire ready-at-start RFs before _sync_cloud_tablets()
     // and run partition pruning there to filter _scan_ranges by partition_id
     // so the heavy per-tablet work is skipped for pruned partitions.
+    // 运行时谓词（Runtime Filter）分区剪枝
+    // 检查是否有 Runtime Filter（如 Hash Join 动态生成的过滤条件）触发了分区级裁剪。
     if (_rf_partition_pruner.pruned_partition_count() > 0) {
         DCHECK_EQ(_tablets.size(), _scan_ranges.size());
         DCHECK_EQ(_tablets.size(), _read_sources.size());
         size_t write_idx = 0;
+        // 遍历所有待扫描的 Tablet，获取其所属的 partition_id。如果该分区已经被 RF 裁剪掉（is_partition_pruned(pid) == true），则丢弃；
+        // 否则移动保存 _tablets、_scan_ranges 和 _read_sources。
         for (size_t read_idx = 0; read_idx < _tablets.size(); ++read_idx) {
             int64_t pid = _tablets[read_idx].tablet->partition_id();
             if (!_rf_partition_pruner.is_partition_pruned(pid)) {
@@ -681,6 +712,7 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
                 ++write_idx;
             }
         }
+        // 更新 Profile 计数器记录被 RF 剪掉的 Tablet 数量，并将容器 resize 缩减到裁剪后的实际大小。
         if (write_idx < _tablets.size()) {
             COUNTER_SET(_tablets_pruned_by_rf_counter,
                         static_cast<int64_t>(_tablets.size() - write_idx));
@@ -688,13 +720,15 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
             _scan_ranges.resize(write_idx);
             _read_sources.resize(write_idx);
         }
+        // 如果所有 Tablet 都在此时被 RF 剪枝剪掉了，直接结束执行返回 OK。
         if (_tablets.empty()) {
             _eos = true;
             _scan_dependency->set_ready();
             return Status::OK();
         }
     }
-
+    // 并行扫描模式判断与构建（Parallel Scan Path）
+    // 解析运行环境变量与 Scan Range 参数，提取 Binlog 扫描类型、是否读取 Row Binlog 以及是否存在 TSO（时间戳）谓词等控制标记。
     bool enable_parallel_scan = state()->enable_parallel_scan();
     auto resolve_binlog_scan_type = [](const TPaloScanRange& scan_range) {
         if (scan_range.__isset.binlog_scan_type) {
@@ -721,6 +755,12 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
     // not idle accumulation), so a large suffix is split by rowset/segment
     // rows like any full scan, while a small delta naturally collapses to a
     // single scanner through min_rows_per_scanner.
+    // 判断是否满足并行扫描（Parallel Scan）的触发条件：
+    // 系统开启了并行扫描（enable_parallel_scan）；
+    // 没被强制要求串行（!_should_run_serial）
+    // 没有下推必须在 Scan 内部完全完成的聚合算子（TPushAggOp::NONE）
+    // 底层无需 Merge（如 Duplicate 模型，或 Unique Key MOW 模型）或者开启了预聚合（is_preaggregation）
+    // 不涉及必须严格有序读取的 Row Binlog 和 TSO 读
     if (enable_parallel_scan && !p._should_run_serial &&
         p._push_down_agg_type == TPushAggOp::NONE &&
         (_storage_no_merge() || p._olap_scan_node.is_preaggregation)
@@ -735,7 +775,7 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
             }
             key_ranges.emplace_back(range.get());
         }
-
+        // 创建 ParallelScannerBuilder 对象，计算并配置并行 Scanner 的上限（缺省为 CPU 核心数）以及单个 Scanner 负责的最少行数（至少 1024 行，防止切分太细产生过多线程开销）。
         ParallelScannerBuilder scanner_builder(this, _tablets, _read_sources, _scanner_profile,
                                                key_ranges, state(), p._limit, true,
                                                p._olap_scan_node.is_preaggregation);
@@ -754,6 +794,7 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
         scanner_builder.set_max_scanners_count(max_scanners_count);
         scanner_builder.set_min_rows_per_scanner(min_rows_per_scanner);
         // If the session variable is set, force one scanner per segment.
+        // 如果开启了索引扫描并行度优化且包含 ANN（向量近似最近邻）TopN 查询，设置按 Segment 粒度拆分并行度。
         if (state()->query_options().__isset.optimize_index_scan_parallelism &&
             state()->query_options().optimize_index_scan_parallelism) {
             // TODO: Use optimize_index_scan_parallelism for ann range search in the future.
@@ -762,13 +803,13 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
                 scanner_builder.set_scan_parallelism_by_per_segment(true);
             }
         }
-
+        // 触发并行拆分逻辑，将生产出的 Scanner 填入 scanners 列表，并逐一调用 olap_scanner->init() 完成谓词表达式 _conjuncts 的下推初始化。
         RETURN_IF_ERROR(scanner_builder.build_scanners(*scanners));
         for (auto& scanner : *scanners) {
             auto* olap_scanner = assert_cast<OlapScanner*>(scanner.get());
             RETURN_IF_ERROR(olap_scanner->init(state(), _conjuncts));
         }
-
+        // 收集并行 Scanner 构建阶段产生的文件缓存（FileCache）统计数据（如本地读取字节数、远程读取字节数），更新到 Profile 和系统 Metrics 指标中，随后成功退出并行模式分支。
         const OlapReaderStatistics* stats = scanner_builder.builder_stats();
         io::FileCacheProfileReporter cache_profile(_segment_profile.get());
         cache_profile.update(&stats->file_cache_stats);
@@ -780,8 +821,11 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
 
         return Status::OK();
     }
-
+    // 传统/非并行模式构建（Fallback / Normal Scan Path）
+    // 根据总 Scan Range 数量简单计算每个 Tablet 估算分配的 Scanner 数（限制全局上限并发规模）。
     int scanners_per_tablet = std::max(1, 64 / (int)_scan_ranges.size());
+    // 循环遍历每一个 Tablet 的 Scan Range，解析其对应的版本号 version。
+    // 按 Tablet 数据体积大小计算建议的 Scanner 数量。Tablet 占用的磁盘物理体积（tablet_footprint）越大，切分出的 Scanner 越多。
     for (size_t scan_range_idx = 0; scan_range_idx < _scan_ranges.size(); scan_range_idx++) {
         const auto& palo_scan_range = *_scan_ranges[scan_range_idx];
         int64_t version = 0;
@@ -795,10 +839,12 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
                     std::max(1, (int)(_tablets[scan_range_idx].tablet->tablet_footprint() /
                                       (config::doris_scan_range_max_mb << 20)));
         }
+        // 计算每个 Scanner 应该分配处理的 Key 条件范围数量（ranges_per_scanner）。
         int ranges_per_scanner =
                 std::max(1, (int)ranges->size() /
                                     std::min(scanners_per_tablet, size_based_scanners_per_tablet));
         int64_t num_ranges = ranges->size();
+        // 分批打包 _cond_ranges。将连续且具备相同闭区间属性（end_include）的若干 Key 区间组合到一个 scanner_ranges 集合中，作为一个 Scanner 的读取任务。
         for (int64_t i = 0; i < num_ranges;) {
             std::vector<doris::OlapScanRange*> scanner_ranges;
             scanner_ranges.push_back((*ranges)[i].get());
@@ -814,6 +860,7 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
             for (auto& split : _read_sources[scan_range_idx].rs_splits) {
                 split.rs_reader = split.rs_reader->clone();
             }
+            // 构造 OlapScanner::Params 参数包，实例化一个 OlapScanner 共享指针。传入当前扫描所需的配置（包含对应 Tablet 引用、版本、TabletReadSource、Limit 限制、预聚合标记、Binlog/TSO 参数等）。
             auto scanner = OlapScanner::create_shared(
                     this, OlapScanner::Params {
                                   state(),
@@ -834,6 +881,7 @@ Status OlapScanLocalState::_init_scanners(std::list<ScannerSPtr>* scanners) {
                                           ? std::make_optional(palo_scan_range.end_tso)
                                           : std::nullopt,
                           });
+            // 初始化生成的 Scanner 对象（下推谓词），并放入输出结果列表 scanners 中。
             RETURN_IF_ERROR(scanner->init(state(), _conjuncts));
             scanners->push_back(std::move(scanner));
         }
@@ -903,29 +951,36 @@ Status OlapScanLocalState::_sync_cloud_tablets(RuntimeState* state) {
     }
     return Status::OK();
 }
-
+// Apache Doris PipelineX 执行引擎中 OLAP 扫描算子（Scan Operator）在并发 Task 运行前进行“数据准备”的核心 API
+// 核心使命是：确定本次扫描需要操作哪些 Tablet，并为每一个 Tablet 捕获符合版本要求的 Rowset 读取源（TabletReadSource）。如果是存算分离（Cloud Mode）模式，它还要等待异步拉取元数据完成，并记录详细的 RPC 与缓存性能指标。
 Status OlapScanLocalState::prepare(RuntimeState* state) {
+    // 如果当前 LocalState 已经完成过 prepare 过程，直接返回 Status::OK()，避免重复构建数据源。
     if (_prepared) {
         return Status::OK();
     }
     MonotonicStopWatch timer;
     timer.start();
+    // 预分配存储 TabletReadSource 的数组空间，使其大小与当前算子被分配到的扫描范围 _scan_ranges（ScanRange 数量）一致
     _read_sources.resize(_scan_ranges.size());
-
+    // 存算分离模式（Cloud Mode）分支处理
     if (config::is_cloud_mode()) {
+        // 异步依赖检查。存算分离下，元数据同步是异步进行的。如果异步依赖 _cloud_tablet_dependency 处于 Blocked 状态（说明远端 Tablet 元数据还在 RPC 拉取中），直接返回 OK，让 Pipeline 调度器稍后再重新调度此 Task，避免阻塞执行线程。
         if (!_cloud_tablet_dependency ||
             _cloud_tablet_dependency->is_blocked_by(nullptr) != nullptr) {
             // Remote tablet still in-flight.
             return Status::OK();
         }
         COUNTER_UPDATE(_sync_rowset_timer, _sync_cloud_tablets_watcher.elapsed_time());
+        // 同步等待存算分离远端元数据异步拉取的最终结果。如果异步任务报错，返回错误状态。
         RETURN_IF_ERROR(_cloud_tablet_future.get());
+        // 遍历所有拉取到的 Tablet，计算当前 Task 关联的所有 Rowset 元数据的总数量，并将其更新到 Profile 计数器 _sync_rowset_tablets_rowsets_total_num 中。
         auto total_rowsets = std::accumulate(
                 _tablets.cbegin(), _tablets.cend(), 0LL,
                 [](long long acc, const auto& tabletWithVersion) {
                     return acc + tabletWithVersion.tablet->tablet_meta()->all_rs_metas().size();
                 });
         COUNTER_UPDATE(_sync_rowset_tablets_rowsets_total_num, total_rowsets);
+        // 遍历存算分离元数据同步过程中的统计信息 _sync_statistics，将元数据 Cache 命中/未命中数、拉取远端 Rowset/DeleteBitmap 的 RPC 耗时、网络传输字节数、bthread 调度延迟、锁等待耗时等丰富指标注入到 Runtime Profile 计数器中，用于精细化 Performance Debug。
         for (const auto& sync_stats : _sync_statistics) {
             COUNTER_UPDATE(_sync_rowset_tablet_meta_cache_hit, sync_stats.tablet_meta_cache_hit);
             COUNTER_UPDATE(_sync_rowset_tablet_meta_cache_miss, sync_stats.tablet_meta_cache_miss);
@@ -950,6 +1005,8 @@ Status OlapScanLocalState::prepare(RuntimeState* state) {
             COUNTER_UPDATE(_sync_rowset_sync_meta_lock_wait_timer,
                            sync_stats.sync_meta_lock_wait_ns);
         }
+        // 慢拉取监控与日志告警。如果同步 Tablet 元数据的总耗时超过了配置阈值（sync_rowsets_slow_threshold_ms），累加慢查询度量指标（Prometheus Metrics），
+        // 并在日志中以 KV Tag 形式打印详细诊断信息（包括 Query ID、Node ID、各项 RPC 耗时、Cache 命中情况等）。
         auto time_ms = _sync_cloud_tablets_watcher.elapsed_time_microseconds();
         if (time_ms >= config::sync_rowsets_slow_threshold_ms) {
             DorisMetrics::instance()->get_remote_tablet_slow_time_ms->increment(time_ms);
@@ -986,21 +1043,28 @@ Status OlapScanLocalState::prepare(RuntimeState* state) {
                                  TUnit::TIME_NS));
         }
     } else {
+    // 传统存算一体模式（Non-Cloud Mode）分支处理
+        // 预分配本地 Tablet 容器大小
         _tablets.resize(_scan_ranges.size());
         for (size_t i = 0; i < _scan_ranges.size(); i++) {
             int64_t version = 0;
+            // 高效地将 Thrift 字符串格式的版本号（Version）解析为 int64_t 整数（免除 std::string 构造开销）
             std::from_chars(_scan_ranges[i]->version.data(),
                             _scan_ranges[i]->version.data() + _scan_ranges[i]->version.size(),
                             version);
+            // 从本地 BE 存储引擎（StorageEngine）的全局 Tablet Map 中，根据 tablet_id 查找并获取 Tablet 智能指针。
             auto tablet = DORIS_TRY(ExecEnv::get_tablet(_scan_ranges[i]->tablet_id));
+            // 将获取到的 Tablet 句柄和目标版本号组合保存到 _tablets 结构中。
             _tablets[i] = {std::move(tablet), version};
         }
     }
-
+    // 捕获 Tablet 读取源（Capture Read Source）与结果集缓存优化（Query Cache）
+    // 检查当前查询是否启用了 Query Cache（查询缓存）的增量读取模式（INCREMENTAL）
     const bool cache_incremental =
             _query_cache_decision != nullptr &&
             _query_cache_decision->mode == QueryCacheInstanceDecision::Mode::INCREMENTAL;
     for (size_t i = 0; i < _scan_ranges.size(); i++) {
+        // 如果是增量缓存查询：
         if (cache_incremental) {
             // Scan only the delta rowsets in (cached_version, current_version].
             // The read source was already captured (and verified to contain no
@@ -1012,8 +1076,10 @@ Status OlapScanLocalState::prepare(RuntimeState* state) {
             // this tablet's read source); failing fast is the only safe answer,
             // because a silent full-scan fallback would emit the data twice
             // (cached blocks + full scan).
+            // 直接从缓存决策对象 _query_cache_decision 中取出并转移（take）该 Tablet 增量版本区间（cached_version, current_version]` 的 Read Source，避免重复全量扫描。
             auto delta_source =
                     _query_cache_decision->take_delta_read_source(_tablets[i].tablet->tablet_id());
+            // 如果取出的 delta_source 为空，说明违反了 FE 的下发契约，直接报错返回 InternalError，防止出现“既输出了 Cache 数据又输出了全量 Scan 数据”导致的数据重复问题。
             if (delta_source == nullptr) {
                 return Status::InternalError(
                         "query cache incremental read source is absent, tablet_id={}",
@@ -1022,6 +1088,9 @@ Status OlapScanLocalState::prepare(RuntimeState* state) {
             _read_sources[i] = std::move(*delta_source);
             continue;
         }
+        // 存储引擎核心 API
+        // 传入版本区间 {0, _tablets[i].version} 和控制参数（是否跳过缺失版本、是否允许从 Peer 副本抓取缺失 Rowset、存算分离 Cache 策略等）
+        // 存储引擎会在内部加读锁并收集满足该 version 范围的所有 Rowset（及 Version 路径），封装为 TabletReadSource 并返回。
         _read_sources[i] = DORIS_TRY(_tablets[i].tablet->capture_read_source(
                 {0, _tablets[i].version},
                 {.skip_missing_versions = _state->skip_missing_version(),
@@ -1030,9 +1099,11 @@ Status OlapScanLocalState::prepare(RuntimeState* state) {
                          config::is_cloud_mode() ? _state->enable_prefer_cached_rowset() : false,
                  .query_freshness_tolerance_ms =
                          config::is_cloud_mode() ? _state->query_freshness_tolerance_ms() : -1}));
+        // 如果当前查询不能忽略删除谓词（例如包含了 DELETE FROM 发生的历史条件），将这些删除谓词填充到 _read_sources[i] 中，供后续读取过滤使用。
         if (!PipelineXLocalState<>::_state->skip_delete_predicate()) {
             _read_sources[i].fill_delete_predicates();
         }
+        // 在写时合并（Merge-On-Write, MOW）模式且开启了详细日志时，记录完成 Rowset Reader 捕获的 Debug 日志。
         if (config::enable_mow_verbose_log &&
             _tablets[i].tablet->enable_unique_key_merge_on_write()) {
             LOG_INFO("finish capture_rs_readers for tablet={}, query_id={}",
@@ -1040,6 +1111,7 @@ Status OlapScanLocalState::prepare(RuntimeState* state) {
                      print_id(PipelineXLocalState<>::_state->query_id()));
         }
     }
+    // 性能告警与标记完成
     timer.stop();
     double cost_secs = static_cast<double>(timer.elapsed_time()) / NANOS_PER_SEC;
     if (cost_secs > 1) {

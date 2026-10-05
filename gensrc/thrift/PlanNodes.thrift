@@ -88,19 +88,36 @@ enum TBinlogScanType {
   DETAIL = 3,
   UNKNOWN = 4
 }
-
+// TPaloScanRange 是 Apache Doris FE（Frontend）与 BE（Backend）通信协议中的核心 Thrift 数据结构
+// 一个 OLAP 表的扫描任务（Scan）通常会被拆分为多个小粒度的并行扫描单元。TPaloScanRange 就是 FE 用于向 BE 描述“一个具体需要扫描的数据片（Scan Range / Tablet）”的元数据载体。
+// 核心作用包括：
+// 定位数据节点与存储片：告诉 BE 当前任务需要去读取哪个 tablet_id，以及该 Tablet 对应的副本分布在哪些节点（hosts）上。
+// 指定数据版本：通过 version 告诉 BE 读取哪个数据版本（Snapshot Version）的数据，以保证 MPP 引擎的读写隔离与 MVCC 一致性。
+// 定位 Schema 与索引结构：提供 schema_hash，用于 BE 在本地存储引擎中查找到正确的 Tablet Schema 和列定义（Column Mapping）。
+// 支持 Binlog / 数据变更追踪：在 CDC、数据同步或 CCR（Cross-Cluster Replication）等场景下，提供 TSO 时间戳和 Binlog 扫描模式信息。
 struct TPaloScanRange {
+  // Tablet 副本所在的节点地址列表（包含 IP/Host 和 Port）。FE 用其进行 Locality（本地化）调度优先匹配。
   1: required list<Types.TNetworkAddress> hosts
+  // Schema 版本哈希值。用于区分不同的 Schema 变更版本（例如发生过 ALTER TABLE 加减列之后，Tablet 目录下包含的 Schema 标识）。
   2: required string schema_hash
+  // 需要读取的数据版本号（Data Version）。格式通常为整数字符串（如 "15"），控制 BE 读取 Rowset 的最高可见版本，确保查询的事务一致性（MVCC）。
   3: required string version
   4: required string version_hash // Deprecated
+  // 存储片唯一标识（Tablet ID, 即 i64 类型）。直接对应底层存储引擎中一个具体的物理存储片（Tablet）。
   5: required Types.TTabletId tablet_id
+  // 数据库名称。标识当前 Tablet 所属的数据库名，用于日志打印、审计或上层上下文关联。
   6: required string db_name
+  // 分区列的 Key 范围列表。下推的分区列范围条件（Start Key / End Key），用于底层索引裁减与寻道优化。
   7: optional list<TKeyRange> partition_column_ranges
+  // Rollup / 物化视图 / 索引名称。如果命中物化视图或预聚合索引，标识当前读取的索引表名称（如物化视图名）。
   8: optional string index_name
+  // 表名称。标识当前 Tablet 所属的逻辑表（OlapTable）名称。
   9: optional string table_name
+  // Binlog 读取起始时间戳/TSO。仅在 Binlog Scan / CDC 增量数据读取时生效，指定读取的开始版本时刻。
   10: optional i64 start_tso
+  // Binlog 读取结束时间戳/TSO。仅在 Binlog Scan / CDC 增量数据读取时生效，指定读取的结束版本时刻。
   11: optional i64 end_tso
+  // Binlog 扫描模式枚举。如按 Commit Version 扫描、按 TSO 扫描或按数据增删类型过滤扫描（Insert/Delete/Update）。
   12: optional TBinlogScanType binlog_scan_type
 }
 
