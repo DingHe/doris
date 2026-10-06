@@ -30,19 +30,33 @@ import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.IOException;
-
+// 专门用于抽象与表示数据库用户身份认证与账号凭证信息的核心类
+// 在 Doris 的权限与认证体系中，客户端连接登录时的身份验证（Authentication）主要依靠 User 类进行处理。它与表示“操作许可与资源授权”的权限控制逻辑不同，专门专注于账号匹配、密码校验、Host 域名/IP 模糊匹配以及域名解析（Domain Resolver）。
+// 标识用户账号与凭证：封装了 UserIdentity（用户标识，如 'jack'@'192.168.1.%'）以及加盐/哈希处理后的 Password（密码）。
+// 连接 Host 模式匹配：维护针对用户主机地址（Host）的通配符/正则表达式正则匹配器（hostPattern），支持如 '%'（任意 Host）或 IP 网段的模糊匹配登录。
+//支持动态域名解析（Domain Resolver）：Doris 支持按域名授权（如 'jack'@'%.example.com'）。针对这类账号，FE 后台线程（Domain Resolver）会将域名异步解析为具体 IP 对应的 UserIdentity。User 类保留了原始的域名用户标识与解析后的具体 IP 用户标识（domainUserIdentity）。
 public class User implements Comparable<User>, GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(User.class);
+    // 当前用户对象的身份标识（包含用户名 username 和主机 host），带有 Gson 的 @SerializedName 注解参与序列化。
     @SerializedName(value = "userIdentity")
     private UserIdentity userIdentity;
+    // 基于域名解析生成的具体用户标识（非序列化持久化字段）。
+    // 当该账号是由后台 DomainResolver（域名解析器）将域名解析为 IP 后动态生成的，此属性记录原始带有域名的 UserIdentity 标识。
     private UserIdentity domainUserIdentity;
+    // 标识当前 User 实例是否是由后台域名解析器动态创建/设置的。
+    // 区分普通手动创建的用户与后台通过域名 IP 映射动态生成的临时用户。
     private boolean isSetByDomainResolver = false;
+    // 主机名/IP 通配符匹配器对象（非直接序列化字段，由 gsonPostProcess() 动态构建）。
+    // 用于在客户端发起 MySQL 协议连接时，判断客户端来源 IP 是否与当前用户定义的 Host 规则匹配（如 '192.168.1.%'）。
     // host is not case sensitive
     protected PatternMatcher hostPattern;
+    // 标识当前用户的 Host 是否为任意主机通配符 "%"（非序列化字段）。
     protected boolean isAnyHost = false;
+    // 加密/哈希后的密码对象
+    // 存储用户密码的哈希结果（如 MySQL 4.1+ 密文散列），供客户端握手认证时进行密文比对。
     @SerializedName(value = "password")
     private Password password;
-
+    // 云原生/云上版本（Doris Cloud）下的原始用户全局唯一 ID，带有序列化注解。
     @SerializedName(value = "userid")
     private String origUserId = "";
 

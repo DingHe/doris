@@ -932,16 +932,21 @@ public class Env {
             CHECKPOINT = null;
         }
     }
-
+    // Env（在旧版本 Doris 中称为 Catalog）是 FE 中最重要的单例管理类，包含了元数据、元数据日志、权限管理、集群节点状态等几乎所有全局的核心状态。
     public static Env getCurrentEnv() {
+        // 第一阶段：检查当前线程是否为 Checkpoint 线程
+        // 判断当前正在执行代码的线程是不是 Checkpoint 线程（元数据镜像/检查点生成线程）。
+        // 背景/原理：Doris FE 需要定时将内存中的 EditLog（元数据变更日志）持久化生成元数据镜像文件（Image/Checkpoint）。为了避免生成 Checkpoint 时阻塞主业务线程或受到主线程实时修改元数据的干扰，Doris 引入了隔离机制——Checkpoint 线程拥有独立的 Env 内存上下文，用来专门 replay（重放）日志并生成快照。
         if (isCheckpointThread()) {
             // only checkpoint thread it self will goes here.
             // so no need to care about the thread safe.
+            // 如果为空，通过工厂类 EnvFactory.getInstance().createEnv(true) 创建一个专用于 Checkpoint 的 Env 实例（入参 true 通常表示 isCheckpointEnv 开关开启）。
             if (CHECKPOINT == null) {
                 CHECKPOINT = EnvFactory.getInstance().createEnv(true);
             }
             return CHECKPOINT;
         } else {
+            // 第二阶段：非 Checkpoint 线程（普通业务线程）获取主单例
             return SingletonHolder.INSTANCE;
         }
     }

@@ -37,7 +37,10 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.stream.Collectors;
-
+// 负责维护用户身份（UserIdentity）与角色（Role）之间的双向绑定关系。
+// 维护用户与角色的多对多绑定关系：在 Doris 中，一个用户可以被授予多个角色，一个角色也可以被赋予多个用户。UserRoleManager 内部通过正向映射和反向索引双重映射结构，高效管理这种多对多关系。
+// 提供双向快速检索：支持从“用户 $\rightarrow$ 角色列表”的正向查询（用于用户登录鉴权和权限继承），以及从“角色 $\rightarrow$ 用户列表”的反向查询（用于删除角色或审计用户分布）。
+// 配合 RBAC 角色过滤：提供针对系统默认隐藏角色（如用户默认角色 DEFAULT_ROLE_PREFIX）的过滤查询功能，避免在展示用户角色时露出现象级的内部自动创建角色。
 public class UserRoleManager implements Writable, GsonPostProcessable {
     // Concurrency control is delegated by Auth, so not concurrentMap
     @SerializedName(value = "userToRoles")

@@ -53,8 +53,13 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.locks.Lock;
-
+// 负责用户账号及其密码认证管理的核心类。它维护了 Doris 系统中所有用户身份与密码信息的内存映射结构，并提供了用户账号创建、密码校验、域名解析（Domain Resolver）动态关联以及持久化等功能。
+// 用户身份与密码元数据管理：在 Doris 中，一个用户名（如 cmy）可能对应多个具体的访问主机（Host，例如 '192.168.1.%' 或 '%'）。UserManager 维护了用户名到具体的 User 对象列表的映射，负责用户账号的创建、更新、修改密码和删除。
+// 客户端登录密码认证：当客户端（如 MySQL Client 或 JDBC）连接 Doris 时，UserManager 负责匹配对应主机限制的账号，并根据 MySQL 的 Scramble 认证协议（或 Plain 明文协议）完成密码校验，同时配合 PasswordPolicyManager 处理账号锁定与密码过期策略。
+// 域名解析（Domain Resolver）动态扩展：支持基于域名配置的用户（如 cmy@'domain.com'）。DomainResolver 线程定时解析域名为 IP 后，UserManager 动态生成对应的 IP 用户节点并绑定到原域名用户，实现基于FQDN/动态IP的粒度控制。
+//
 public class UserManager implements Writable {
+    // 静态常量，值为 "%"。代表匹配任意主机的通配符。
     public static final String ANY_HOST = "%";
     private static final Logger LOG = LogManager.getLogger(UserManager.class);
 
@@ -63,9 +68,11 @@ public class UserManager implements Writable {
     private static final Lock wlock = rwLock.writeLock();
 
     // One name may have multiple User,because host can be different
+    // 核心内存数据结构。
+    // Key 为用户名（Qualified Name），Value 为对应不同 Host/Domain 的 User 对象列表。
     @SerializedName(value = "nameToUsers")
     private Map<String, List<User>> nameToUsers = Maps.newHashMap();
-
+    // 判断指定的 userIdentity（用户名+Host）是否存在。
     public boolean userIdentityExist(UserIdentity userIdentity, boolean includeByDomain) {
         rlock.lock();
         try {
@@ -74,7 +81,7 @@ public class UserManager implements Writable {
             rlock.unlock();
         }
     }
-
+    // includeByDomain 表示是否包含由 Domain Resolver 动态解析出来的临时 IP 用户。
     public boolean userIdentityExistWithoutLock(UserIdentity userIdentity, boolean includeByDomain) {
         List<User> users = nameToUsers.get(userIdentity.getQualifiedUser());
         if (CollectionUtils.isEmpty(users)) {
@@ -119,11 +126,17 @@ public class UserManager implements Writable {
             List<UserIdentity> currentUser) throws AuthenticationException {
         checkPasswordInternalForUser(userIdentity, null, null, remotePasswd, currentUser, true);
     }
-
+    // 负责根据客户端传入的用户名和 Host 匹配对应的权限条目、校验密码有效性，并配合密码策略（如锁定、过期等）完成登录。
+    // remotePasswd MySQL Scramble 认证协议下客户端发送的密文加密 responses（哈希盐值计算后的结果）。若为明文认证（plain=true），该参数传 null。
+    // randomString MySQL 握手阶段服务端生成的 20 字节随机挑战盐值（Challenge Salt）。用于与密文计算比对。
+    // remotePasswdStr 明文认证协议下客户端传入的明文密码字符串。若为加密认证，该参数传 null。
+    // plain  认证方式标识。true 表示使用明文密码认证；false 表示使用 MySQL 标准 Scramble 加密认证。
     private void checkPasswordInternal(String remoteUser, String remoteHost, byte[] remotePasswd, byte[] randomString,
             String remotePasswdStr, List<UserIdentity> currentUser, boolean plain) throws AuthenticationException {
+        // 获取全局环境中的密码策略管理器 PasswordPolicyManager，用于后续检查账号是否被锁定、密码是否过期，以及记录失败登录次数。
         PasswordPolicyManager passwdPolicyMgr = Env.getCurrentEnv().getAuth().getPasswdPolicyManager();
         List<User> users = new ArrayList<>();
+        // 加读锁获取用户名对应的规则列表
         rlock.lock();
         try {
             users = nameToUsers.get(remoteUser);
@@ -134,17 +147,23 @@ public class UserManager implements Writable {
         } finally {
             rlock.unlock();
         }
-
+        // 遍历账号规则列表，进行 Host 匹配与密码校验
         for (User user : users) {
+            // 如果当前规则是纯域名规则（如 cmy@'domain.com'），则直接跳过。因为域名规则是由后台 DomainResolver 动态解析成 IP 节点后另行匹配的，不能直接拿 Host 文本去匹配 IP。
             if (user.getUserIdentity().isDomain()) {
                 continue;
             }
             // check host
+            // 当前规则不是允许任意主机（即不是 %）
+            // 来源 remoteHost 不符合当前规则定义的通配符正则（如 '192.168.1.%'）。
             if (!user.isAnyHost() && !user.getHostPattern().match(remoteHost)) {
                 continue;
             }
+            // 获取该用户规则对应的绑定身份 curUser
             UserIdentity curUser = user.getDomainUserIdentity();
+            // 根据 plain 参数决定走明文比对还是 MySQL 加密盐值比对。
             if (comparePassword(user.getPassword(), remotePasswd, randomString, remotePasswdStr, plain)) {
+                // 密码正确后，调用密码策略管理器检查当前账号是否处于锁定状态（如多次输错被冻结），或者密码是否已过期。若异常则内部会抛出异常中断登录。
                 passwdPolicyMgr.checkAccountLockedAndPasswordExpiration(curUser);
                 if (currentUser != null) {
                     currentUser.add(curUser);

@@ -55,24 +55,37 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+// RoleManager 是 Apache Doris FE（Frontend）模块中负责角色与权限管理（RBAC - 基于角色的访问控制）的核心管理类。
+// RoleManager 负责在 Apache Doris 内门维护所有角色（Role）的生命周期与权限分配。主要功能包括：
+// 角色生命周期管理：负责创建、合并、删除、恢复/持久化系统中的角色。
+// 基于角色的权限控制 (RBAC)：管理角色与各种资源权限（表、资源、Workload Group、Compute Group/Cluster、Stage、Storage Vault 等）的关联与撤销。
+// 内置/默认角色维护：
+// 预置系统最高管理员角色（ADMIN）与运维角色（OPERATOR）。
+// 自动为新建用户生成默认角色（带有 information_schema、mysql 库的 SELECT 权限以及默认 Workload Group 的 USAGE 权限）。
+// 元数据展示与系统表审计：为 SHOW ROLES 命令以及系统视图（如 Workload Group 权限）提供数据格式化与导出接口。
+// 元数据持久化：实现 Writable 接口，通过 JSON 序列化/反序列化将角色元数据持久化至 EditLog。
 public class RoleManager implements Writable {
     private static final Logger LOG = LogManager.getLogger(RoleManager.class);
     //prefix of each user default role
+    // 用户默认角色的前缀标识。系统在创建用户时，会为其自动生成形如 default_role_rbac_user@host 的默认角色。
     public static String DEFAULT_ROLE_PREFIX = "default_role_rbac_";
 
     // Concurrency control is delegated by Auth, so not concurrentMap
+    // 内存中存储所有角色的 Map 容器。Key 为角色名称（roleName），Value 为对应的 Role 实例。使用 ConcurrentMap 保证线程安全的并发访问。
     @SerializedName(value = "roles")
     private ConcurrentMap<String, Role> roles = Maps.newConcurrentMap();
-
+    // 在初始化时默认创建并注册系统预置的两个顶级角色：
+    // OPERATOR：运维人员角色。
+    // ADMIN：超级管理员角色。
     public RoleManager() {
         roles.put(Role.OPERATOR.getRoleName(), Role.OPERATOR);
         roles.put(Role.ADMIN.getRoleName(), Role.ADMIN);
     }
-
+    // 根据角色名称获取对应的角色对象。
     public Role getRole(String name) {
         return roles.get(name);
     }
-
+    // 添加新角色；若角色已存在，则根据参数决定抛出异常还是合并权限。
     public Role addOrMergeRole(Role newRole, boolean errOnExist) throws DdlException {
         Role existingRole = roles.get(newRole.getRoleName());
         if (existingRole != null) {
@@ -87,7 +100,7 @@ public class RoleManager implements Writable {
             return newRole;
         }
     }
-
+    // 删除指定的角色。
     public void dropRole(String qualifiedRole, boolean errOnNonExist) throws DdlException {
         if (!roles.containsKey(qualifiedRole)) {
             if (errOnNonExist) {
@@ -107,7 +120,11 @@ public class RoleManager implements Writable {
             map.put(type, clusterSet);
         }
     }
-
+    // 撤销指定角色对表（及列）级别资源的权限。
+    // name - 角色名称。
+    // tblPattern - 表匹配模式（如 db1.tbl1、db1.*）。
+    // privs - 要撤销的权限集合（位图表示）。
+    // olPrivileges - 要撤销的列级别权限映射。
     public Role revokePrivs(String name, TablePattern tblPattern, PrivBitSet privs,
             Map<ColPrivilegeKey, Set<String>> colPrivileges, boolean errOnNonExist)
             throws DdlException {
@@ -121,7 +138,9 @@ public class RoleManager implements Writable {
         existingRole.revokePrivs(tblPattern, privs, colPrivileges, errOnNonExist);
         return existingRole;
     }
-
+    // 撤销指定角色对 Resource 级别资源的权限。
+    // resourcePattern - Resource 匹配模式。
+    // privs - 要撤销的权限集合。
     public Role revokePrivs(String role, ResourcePattern resourcePattern, PrivBitSet privs, boolean errOnNonExist)
             throws DdlException {
         Role existingRole = roles.get(role);
@@ -134,7 +153,9 @@ public class RoleManager implements Writable {
         existingRole.revokePrivs(resourcePattern, privs, errOnNonExist);
         return existingRole;
     }
-
+    // 撤销指定角色对 Workload Group（工作负载组）级别资源的权限。
+    // workloadGroupPattern - Workload Group 匹配模式。
+    // privs - 要撤销的权限集合。
     public Role revokePrivs(String role, WorkloadGroupPattern workloadGroupPattern, PrivBitSet privs,
             boolean errOnNonExist)
             throws DdlException {
@@ -236,7 +257,8 @@ public class RoleManager implements Writable {
             }
         }
     }
-
+    // 为新创建的用户生成默认角色，并赋予基础的只读与使用权限。
+    // 为该角色赋予 information_schema.*.* 和 mysql.*.* 的 SELECT 权限。
     public Role createDefaultRole(UserIdentity userIdent) throws DdlException {
         String userDefaultRoleName = getUserDefaultRoleName(userIdent);
         if (roles.containsKey(userDefaultRoleName)) {
@@ -272,7 +294,7 @@ public class RoleManager implements Writable {
         roles.put(role.getRoleName(), role);
         return role;
     }
-
+    // 删除指定用户对应的默认角色（例如在 DROP USER 时调用）。
     public Role removeDefaultRole(UserIdentity userIdent) {
         return roles.remove(getUserDefaultRoleName(userIdent));
     }

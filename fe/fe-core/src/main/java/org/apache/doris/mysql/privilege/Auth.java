@@ -90,32 +90,45 @@ import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
-
+// Auth 类是 Apache Doris FE 模块中负责 身份认证（Authentication）、权限校验（Authorization）、用户/角色管理（RBAC，基于角色的权限控制） 以及 外部认证集成（如 LDAP） 的绝对核心控制类。
+// 统一安全入口与并发控制：包裹了底层的各个管理子组件（如 UserManager、RoleManager、UserRoleManager、UserPropertyMgr），并通过内部的读写锁（ReentrantReadWriteLock）保证所有元数据变更和权限校验在多线程环境下的线程安全性。
+// 身份认证（Authentication）：支持 MySQL 握手协议密码验证（基于 Challenge/Response 的散列计算）、明文密码校验、本地环回免密登录（skip_localhost_auth_check）以及 SSL/TLS 证书认证等。
+// 基于角色的权限层级控制（RBAC Authorization）：实现多层级的权限检查机制，覆盖 GLOBAL（全局）、CATALOG（数据目录）、DATABASE（数据库）、TABLE（表）、COLUMN（列）、RESOURCE（资源）、WORKLOAD_GROUP（工作负载组）、STORAGE_VAULT（存储卷）等多种粒度。
+// 外部认证服务集成（LDAP）：集成 LDAP 系统的认证及动态角色/权限映射。
+// 密码策略管理（Password Policy）：管理密码复杂度、重试次数、过期策略等安全合规需求。
 public class Auth implements Writable {
     private static final Logger LOG = LogManager.getLogger(Auth.class);
 
     // root user's role is operator.
     // each Doris system has only one root user.
+    // 系统内置超管用户名常量，值为 "root"，默认拥有 Operator 角色。
     public static final String ROOT_USER = "root";
+    // 系统内置管理员用户名常量，值为 "admin"。
     public static final String ADMIN_USER = "admin";
     // unknown user does not have any privilege, this is just to be compatible with old version.
+    // 未知用户名常量 "unknown"，不具备任何权限，主要用于兼容旧版本。
     public static final String UNKNOWN_USER = "unknown";
+    // 默认内部 Catalog 的名称（即 InternalCatalog.INTERNAL_CATALOG_NAME，即 "internal"）。
     public static final String DEFAULT_CATALOG = InternalCatalog.INTERNAL_CATALOG_NAME;
 
     // There is no concurrency control logic inside roleManager,userManager,userRoleManage and rpropertyMgr,
     // and it is completely managed by Auth.
     // Therefore, their methods cannot be directly called outside, and should be called indirectly through Auth.
+    // 角色管理器，负责角色的创建、销毁以及角色绑定的权限条目维护。内部无并发控制，依赖 Auth 加锁。
     private RoleManager roleManager = new RoleManager();
+    // 用户管理器，维护系统中所有创建的 UserIdentity 及其密码哈希、账户状态等。
     private UserManager userManager = new UserManager();
+    // 用户与角色的绑定关系管理器，维护用户与一个或多个角色的对应映射。
     private UserRoleManager userRoleManager = new UserRoleManager();
+    // 用户属性管理器，维护用户的配额、最大连接数、默认角色、查询资源限制等属性。
     private UserPropertyMgr propertyMgr = new UserPropertyMgr();
-
+    // 存储 LDAP 配置信息的持久化对象（如 LDAP Server 地址、DN 等）。
     private LdapInfo ldapInfo = new LdapInfo();
-
+    // LDAP 服务管理对象，负责执行具体的 LDAP 远程认证与角色组映射查找。
     private LdapManager ldapManager = new LdapManager();
-
+    // 密码策略管理器，负责处理密码安全策略（如复杂度、过期时间、锁定重试等）。
     private PasswordPolicyManager passwdPolicyManager = new PasswordPolicyManager();
-
+    // 内部可重入读写锁，用于保护所有用户、角色及权限变更/读取的并发安全。
     private ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private void readLock() {
@@ -133,7 +146,7 @@ public class Auth implements Writable {
     private void writeUnlock() {
         lock.writeLock().unlock();
     }
-
+    // 定义权限生效的物理/逻辑层级粒度：
     public enum PrivLevel {
         GLOBAL, CATALOG, DATABASE, TABLE, RESOURCE, WORKLOAD_GROUP, CLUSTER, STAGE, STORAGE_VAULT
     }
@@ -540,13 +553,20 @@ public class Auth implements Writable {
             LOG.error("should not happen", e);
         }
     }
-
+    // 负责真正创建用户、分配角色、设置密码策略以及写元数据日志（EditLog）的底层私有核心方法。无论是系统初始化创建内置账户（如 root、admin），还是响应用户执行 SQL 语句 CREATE USER，最终都会调用此方法。
+    // UserIdentity userIdent：用户的身份标识对象，包含用户名（username）和主机访问权限（host，如 '%' 或 '192.168.1.%'）。
+    // String roleName：创建用户时需要同时绑定的初始角色名称（如 "admin"、"operator" 等，若无则传入 null）。
+    // byte[] password：用户的加密密码哈希（MySQL 散列格式算法计算出的字节数组）。
+    // boolean ignoreIfExists：对应 SQL 中的 IF NOT EXISTS 语法。为 true 时，若用户已存在则静默忽略并返回；为 false 时，若用户已存在则抛出 DdlException。
+    // PasswordOptions passwordOptions：密码策略选项，配置如密码过期时间（EXPIRE）、密码重试锁数、历史密码限制等。
+    // boolean isReplay false：表示当前由 Leader FE 处理主业务请求，需要将创建用户的元数据写入 EditLog 进行集群同步。
     private void createUserInternal(UserIdentity userIdent, String roleName, byte[] password,
             boolean ignoreIfExists, PasswordOptions passwordOptions, String comment, String userId, boolean isReplay)
             throws DdlException {
         writeLock();
         try {
             // check if role exist
+            // 检查绑定的角色是否存在
             Role role = null;
             if (roleName != null) {
                 role = roleManager.getRole(roleName);
@@ -556,6 +576,7 @@ public class Auth implements Writable {
             }
 
             // check if user already exist
+            // 检查用户是否已存在
             if (doesUserExist(userIdent)) {
                 if (ignoreIfExists) {
                     LOG.info("user exists, ignored to create user: {}, is replay: {}", userIdent, isReplay);
@@ -565,6 +586,7 @@ public class Auth implements Writable {
             }
 
             // create user
+            // 真正创建用户对象与设置 User ID
             try {
                 // we should not throw AnalysisException at here,so transfer it
                 User user = userManager.createUser(userIdent, password, null, false, comment);
@@ -574,25 +596,29 @@ public class Auth implements Writable {
             } catch (PatternMatcherException e) {
                 throw new DdlException("create user failed,", e);
             }
+            // 如果设置了密码，将该密码记录进 passwdPolicyManager 的密码历史记录中，用于未来校验“不能使用历史使用过的密码”等安全策略。
             if (password != null) {
                 // save password to password history
                 passwdPolicyManager.updatePassword(userIdent, password);
             }
             // 4.create defaultRole
+            // 每个用户在 Doris 中都会自动拥有一个专属于该用户的默认私有角色（用于存放直接赋予该用户的私有表/库权限）
             Role defaultRole = roleManager.createDefaultRole(userIdent);
             // 5.create user role
+            // 在 userRoleManager 中添加“用户 -> 默认角色”的绑定
             userRoleManager.addUserRole(userIdent, defaultRole.getRoleName());
             if (role != null) {
                 userRoleManager.addUserRole(userIdent, roleName);
             }
             // other user properties
+            // 为用户分配默认的资源配额与监控指标
             propertyMgr.addUserResource(userIdent.getQualifiedUser());
             MetricRepo.updateUserConnectionMaxMetric(this, userIdent.getQualifiedUser(),
                     propertyMgr.getMaxConn(userIdent.getQualifiedUser()));
 
             // 5. update password policy
             passwdPolicyManager.updatePolicy(userIdent, password, passwordOptions);
-
+            // 写 EditLog（元数据持久化与同步）
             if (!isReplay) {
                 PrivInfo privInfo = new PrivInfo(userIdent, null, password,
                         roleName, passwordOptions, comment, userId);
@@ -872,6 +898,7 @@ public class Auth implements Writable {
 
 
     // return true if user ident exist
+    // 检查用户是否存在
     public boolean doesUserExist(UserIdentity userIdent) {
         return userManager.userIdentityExist(userIdent, false);
     }
@@ -1720,11 +1747,20 @@ public class Auth implements Writable {
 
     private void initUser() {
         try {
+            // 第一阶段：初始化 root 用户
+            // ROOT_USER: 用户名常量（即 "root"）。
+            // "%": 主机地址匹配模式（Host Pattern），"%"  表示允许 root 从任何 IP 地址连接登录。
+            // 设计意图：在 Doris 中，通过 SQL 命令行解析出的 UserIdentity 会经过语法/语义分析（Analysis 阶段）。由于此处是在代码中手动创建的内置用户，直接标记为 setIsAnalyzed() 可以跳过后续冗余的语义合法性检查。
             UserIdentity rootUser = new UserIdentity(ROOT_USER, "%");
             rootUser.setIsAnalyzed();
+            // 调用 Auth 的内部核心建户方法 createUserInternal，正式把 root 用户注册到系统的用户与角色数据库中。
+            // Role.OPERATOR_ROLE：赋予的角色。root 默认赋予系统内置的 operator（操作员）角色，拥有集群最高级别的节点管理与运维权限。
+            // new byte[0]：空字节数组，表示初始化时设置空密码（即默认无密码）。
+            // true (is replay)：关键参数。标记为 true 表示这是系统内部恢复/重放行为，不会将创建 root 用户的动作写进 EditLog（元数据变更日志），防止 FE 节点集群间重复持久化该日志。
             createUserInternal(rootUser, Role.OPERATOR_ROLE, new byte[0],
                     false /* ignore if exists */, PasswordOptions.UNSET_OPTION,
                     "ROOT", ROOT_USER, true /* is replay */);
+            // 第二阶段：初始化 admin 用户
             UserIdentity adminUser = new UserIdentity(ADMIN_USER, "%");
             adminUser.setIsAnalyzed();
             createUserInternal(adminUser, Role.ADMIN_ROLE, new byte[0],
