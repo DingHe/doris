@@ -279,7 +279,10 @@ public class BaseController {
                     + predicate.getPrivs().toString() + " privilege(s) for this operation");
         }
     }
-
+    // 针对当前请求发起的用户，检查其是否拥有对指定数据库执行特定操作的权限。 如果用户缺乏对应权限，则直接抛出 UnauthorizedException 异常，中断后续业务逻辑并向客户端返回“无权限访问（403 Access Denied）”的响应。
+    // currentUser 当前发起请求的用户身份。包含用户名（username）和客户端 Host/IP 信息（host），通常从 Session 或 HTTP Header 中解析提取。
+    // db 目标数据库名称。即当前操作尝试访问或修改的 Database 名称。
+    // predicate 权限判定谓词（所需权限断言）。定义了本次操作要求具备的具体权限类型（如 PrivPredicate.SELECT、PrivPredicate.LOAD、PrivPredicate.ALTER 等）。
     protected void checkDbAuth(UserIdentity currentUser, String db, PrivPredicate predicate)
             throws UnauthorizedException {
         if (!Env.getCurrentEnv().getAccessManager()

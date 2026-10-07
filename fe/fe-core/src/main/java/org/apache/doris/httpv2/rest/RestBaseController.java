@@ -62,20 +62,34 @@ import java.util.Collections;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import javax.net.ssl.HttpsURLConnection;
-
+// RestBaseController 是 Apache Doris FE（Frontend）模块中所有 RESTful API Controller 的抽象基类（继承自 BaseController）。
+// 所有的 REST API 接口（如 Stream Load 导入、元数据查询、集群运维管理、镜像文件拉取等）提供了通用的框架级支持。
+// 统一身份认证与线程上下文初始化：解析 HTTP 请求头的 Basic Auth 凭证，校验用户密码，并将登录用户的 UserIdentity 绑定至当前线程的 ConnectContext 中，保障鉴权上下文正确传递。
+// 请求转发与重定向管理（Forward & Redirect）：
+// Master 转发/重定向：Doris 属于 Master-Follower 架构，部分写操作或元数据变更请求只能由 FE Master 节点处理。该类提供了将非 Master 接收到的请求重定向（HTTP 307）或代理转发（RestTemplate）给 FE Master 的能力。
+// BE 重定向：在数据导入（如 Stream Load）场景下，FE 接收到请求后需将数据流重定向到指定的 BE（Backend）节点上处理。
+// HTTP 与 HTTPS 协议适配：支持配置驱动的 HTTP $\rightarrow$ HTTPS 强制重定向，以及内部节点间 HTTPS 通信时的 SSL 证书校验忽略（自签名证书适配）。
+// 文件下载与元数据传输流控制：提供通用的二进制文件下载工具方法（如下载元数据 Image 镜像文件），并自动构建包含 MD5 和 Size 标头的标准 HTTP Response。
+// 权限与 Token 校验：提供基于角色/全局权限的检查封装（如 Admin 权限校验）以及集群内部 Token 认证。
 public class RestBaseController extends BaseController {
-
+    // 静态常量 "ns"，用于在 REST 请求中提取 Namespace（命名空间）参数。
     protected static final String NS_KEY = "ns";
+    // 静态常量 "catalog"，用于提取编目名称参数。
     protected static final String CATALOG_KEY = "catalog";
     protected static final String DB_KEY = "db";
     protected static final String TABLE_KEY = "table";
+    // 静态常量 "label"，用于提取导入任务 Label 参数。
     protected static final String LABEL_KEY = "label";
+    // 静态常量 "txn_id"，用于提取事务 ID 参数。
     protected static final String TXN_ID_KEY = "txn_id";
+    // 静态常量 "txn_operation"，用于提取事务操作类型（如 commit/abort）参数。
     protected static final String TXN_OPERATION_KEY = "txn_operation";
+    // 静态常量 "single_replica"，用于标识单副本导入/操作参数
     protected static final String SINGLE_REPLICA_KEY = "single_replica";
     protected static final String FORWARD_MASTER_UT_TEST = "forward_master_ut_test";
     private static final Logger LOG = LogManager.getLogger(RestBaseController.class);
 
+    // 解析 HTTP 请求并执行密码身份校验，同时初始化当前线程的连接上下文（ConnectContext）
     public ActionAuthorizationInfo executeCheckPassword(HttpServletRequest request,
                                                         HttpServletResponse response) throws UnauthorizedException {
         ActionAuthorizationInfo authInfo = getAuthorizationInfo(request);
@@ -93,7 +107,7 @@ public class RestBaseController extends BaseController {
         ctx.setThreadLocalInfo();
         return authInfo;
     }
-
+    // 重定向 URL 构建方法
     protected String buildRedirectUrl(HttpServletRequest request, TNetworkAddress addr) {
         return buildRedirectUrl(request, addr, request.getRequestURI(), request.getQueryString());
     }
@@ -104,23 +118,37 @@ public class RestBaseController extends BaseController {
     }
 
     // BE's stream-load listener never terminates TLS, so BE-bound redirects must stay "http".
+    // 专门构建指向 Backend（BE）节点的重定向 URL。
+    // 强制将 Scheme 设置为 "http"（因为 BE 的 Stream Load 端口通常不处理 TLS 握手）
     protected String buildRedirectUrlToBackend(HttpServletRequest request, TNetworkAddress addr,
             String requestPath, String queryString) {
         return buildRedirectUrl("http", request, addr, requestPath, queryString);
     }
-
+    // buildRedirectUrl 是 RestBaseController 中用于拼接完整 HTTP 重定向 URL 的私有核心工具方法。
+    // 在 Doris 中（例如客户端发起 Stream Load 导入，需要从 FE 重定向到具体 BE，或从 Follower FE 重定向到 Master FE 时），该方法负责将认证信息、目标主机端口以及请求路径参数合成为合法的目标 URL。
+    // scheme 网络传输协议。例如 "http" 或 "https"。
+    // addr 重定向的目标节点网络地址（Thrift 生成的数据结构）。包含目标节点的 hostname（主机名/IP）和 port（端口号）。
+    //  requestPath 请求的 URI 路径部分。例如 /api/db1/tbl1/_stream_load。
+    // queryString 请求的 URL 查询参数部分。例如 label=my_label_1&columns=k1,v1（不含 ?）。
     private String buildRedirectUrl(String scheme, HttpServletRequest request, TNetworkAddress addr,
             String requestPath, String queryString) {
+        // 解析与提取 Authorization 认证凭证
         String userInfo = null;
         if (!Strings.isNullOrEmpty(request.getHeader("Authorization"))) {
             ActionAuthorizationInfo authInfo = getAuthorizationInfo(request);
+            // 拼接成符合 URI 规范的 userInfo 格式（如 admin:123456），以便将登录凭证透传给重定向后的目标节点。
             userInfo = authInfo.fullUserName + ":" + authInfo.password;
         }
         try {
             // Preserve the original request path to avoid re-encoding an already encoded URI path.
+            // 利用 java.net.URI 的构造函数生成只包含“网络位置/权限（Authority）”部分的 URI 对象。
+            // 后续 3 个 null 分别代表 path、query 和 fragment。
+            // 为什么要这么做？：URI 构造器会自动处理 userInfo、hostname 中的特殊字符转义编码，确保生成合法的 URL 前缀（例如 [http://admin:123456@192.168.1.10:8030](http://admin:123456@192.168.1.10:8030)）。
             URI authorityUri = new URI(scheme, userInfo, addr.getHostname(),
                     addr.getPort(), null, null, null);
+            // 拼接请求路径与查询参数
             String redirectUrl = authorityUri.toASCIIString() + requestPath;
+            // 检查原请求是否存在 Query 参数。若存在且不为空，则追加 ? 以及完整的 queryString，还原原请求的所有 URL 参数。
             if (!Strings.isNullOrEmpty(queryString)) {
                 redirectUrl += "?" + queryString;
             }
@@ -131,14 +159,15 @@ public class RestBaseController extends BaseController {
             throw new RuntimeException(e);
         }
     }
-
+    // 通过原生 HttpServletResponse 写入 HTTP 307 临时重定向响应
+    // 设置 Response Header 的 Location 为 redirectUrl，状态码为 307 TEMPORARY_REDIRECT，设置 Content-Type 为 text/html;charset=utf-8 并刷新缓冲区。
     protected void writeTemporaryRedirect(HttpServletResponse response, String redirectUrl) throws IOException {
         response.setContentType("text/html;charset=utf-8");
         response.setStatus(HttpStatus.TEMPORARY_REDIRECT.value());
         response.setHeader("Location", redirectUrl);
         response.flushBuffer();
     }
-
+    // 返回 Spring MVC 的 RedirectView 对象，重定向到指定地址。
     public RedirectView redirectTo(HttpServletRequest request, TNetworkAddress addr) {
         RedirectView redirectView = new RedirectView(buildRedirectUrl(request, addr));
         redirectView.setContentType("text/html;charset=utf-8");
@@ -147,6 +176,7 @@ public class RestBaseController extends BaseController {
     }
 
     // Use for redirects whose destination is a BE (e.g. stream load), which never speaks HTTPS.
+    // 返回指向 BE 节点的 RedirectView 对象（HTTP 协议）
     public RedirectView redirectToBackend(HttpServletRequest request, TNetworkAddress addr) {
         RedirectView redirectView = new RedirectView(
                 buildRedirectUrlToBackend(request, addr, request.getRequestURI(), request.getQueryString()));
@@ -154,18 +184,18 @@ public class RestBaseController extends BaseController {
         redirectView.setStatusCode(org.springframework.http.HttpStatus.TEMPORARY_REDIRECT);
         return redirectView;
     }
-
+    // 对外暴露获取重定向字符串的简单 Getter。
     public String getRedirectUrL(HttpServletRequest request, TNetworkAddress addr) {
         return buildRedirectUrl(request, addr);
     }
-
+    // 重定向到任意指定的 URL 字符串（例如对象存储预签名地址）
     public RedirectView redirectToObj(String sign) throws URISyntaxException {
         RedirectView redirectView = new RedirectView(sign);
         redirectView.setContentType("text/html;charset=utf-8");
         redirectView.setStatusCode(org.springframework.http.HttpStatus.TEMPORARY_REDIRECT);
         return redirectView;
     }
-
+    // 检查当前 FE 是否为 Master 节点，若不是则返回重定向到 Master 节点的 RedirectView；若是则返回 null。
     public RedirectView redirectToMasterOrException(HttpServletRequest request, HttpServletResponse response)
                     throws Exception {
         Env env = Env.getCurrentEnv();
@@ -183,7 +213,7 @@ public class RestBaseController extends BaseController {
             return ResponseEntityBuilder.okWithCommonError(e.getMessage());
         }
     }
-
+    // 向 HTTP 响应写出二进制文件下载流（支持 File 对象或 byte[] 字节数组）。
     public void getFile(HttpServletRequest request, HttpServletResponse response, Object obj, String fileName)
             throws IOException {
         response.setHeader("Content-type", "application/octet-stream");
@@ -224,7 +254,8 @@ public class RestBaseController extends BaseController {
             os.write((byte[]) obj);
         }
     }
-
+    // 专门用于向响应写出元数据镜像（Image）文件
+    // 断言文件非空且存在，计算文件的 MD5（DigestUtils.md5Hex）与字节大小，在 Header 中加入 Doris 专用的 X-Image-Size 和 X-Image-MD5 元数据标头，最后调用 getFile 将文件流传输给客户端/从节点。
     public void writeFileResponse(HttpServletRequest request,
             HttpServletResponse response, File imageFile) throws IOException {
         Preconditions.checkArgument(imageFile != null && imageFile.exists());
@@ -234,11 +265,13 @@ public class RestBaseController extends BaseController {
         response.setHeader(MetaHelper.X_IMAGE_MD5, DigestUtils.md5Hex(new FileInputStream(imageFile)));
         getFile(request, response, imageFile, imageFile.getName());
     }
-
+    // 判断当前请求是否需要从 HTTP 重定向到 HTTPS。
+    // 若系统配置了 Config.enable_https == true 且当前请求 Scheme 为 "http" 则返回 true。
     public boolean needRedirect(String scheme) {
         return Config.enable_https && "http".equalsIgnoreCase(scheme);
     }
-
+    // 生成将当前请求重定向至 HTTPS 端口的 RedirectView
+    // 提取请求的 ServerName、URI、QueryString，结合配置中的 Config.https_port 拼装 https:// 开头的新 URL，返回 307 状态码的重定向视图。
     public Object redirectToHttps(HttpServletRequest request) {
         String serverName = request.getServerName();
         String uri = request.getRequestURI();
@@ -251,7 +284,7 @@ public class RestBaseController extends BaseController {
         redirectView.setStatusCode(HttpStatus.TEMPORARY_REDIRECT);
         return redirectView;
     }
-
+    // 判断当前请求是否需要由当前 FE 代理转发（Forward）给 Master FE 处理
     public Object forwardToMaster(HttpServletRequest request) {
         try {
             return forwardToMaster(request, (Object) getRequestBody(request));
@@ -370,6 +403,7 @@ public class RestBaseController extends BaseController {
      *
      * @param userIdentity The user identity to check
      */
+    // 检查指定用户是否具备 Admin（超级管理员）权限
     protected void checkAdminAuth(UserIdentity userIdentity) throws UnauthorizedException {
         if (Config.enable_all_http_auth) {
             checkGlobalAuth(userIdentity, org.apache.doris.mysql.privilege.PrivPredicate.ADMIN);
