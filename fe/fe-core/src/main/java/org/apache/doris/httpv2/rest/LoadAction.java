@@ -167,11 +167,15 @@ public class LoadAction extends RestBaseController {
             }
         }
     }
-
+    // E（Frontend）模块提供的一个 HTTP API 接口（路由地址为 /api/_http_stream，请求方式为 PUT）。
+    // 主要负责接收用户基于 SQL 形式发起的 Stream Load 数据导入请求，对其进行必要的请求头校验、Group Commit（组提交）状态检查与元数据解析，并将请求重定向（Redirect）给合适的 BE（Backend）节点去真正执行数据流传输和导入。
     @RequestMapping(path = "/api/_http_stream", method = RequestMethod.PUT)
     public Object streamLoadWithSql(HttpServletRequest request, HttpServletResponse response) {
+        // 1. 提取 SQL 与日志记录
+        // 从 HTTP 请求头中获取 key 为 "sql" 的值，即客户端传进来的 Stream Load 导入 SQL 语句（例如 INSERT INTO db.table VALUES ... 或结合 TVF 的 SQL）。
         String sql = request.getHeader("sql");
         LOG.info("streaming load sql={}", sql);
+        // 2. 初始化变量与处理 Group Commit（组提交）逻辑
         boolean groupCommit = false;
         long tableId = -1;
         String groupCommitStr = request.getHeader("group_commit");
@@ -182,10 +186,13 @@ public class LoadAction extends RestBaseController {
             }
             if (!groupCommitStr.equalsIgnoreCase("off_mode")) {
                 try {
+                    // 将 groupCommit 标志设为 true，并调用辅助方法 parseDbAndTb(sql) 从 SQL 语句中解析提取出目标数据库名和表名，返回一个二元数组 pair（pair[0] 为 dbName，pair[1] 为 tableName）。
                     groupCommit = true;
                     String[] pair = parseDbAndTb(sql);
+                    // 通过 Doris 的元数据管理类 Env 获取内部 Catalog，校验数据库是否存在。若不存在则抛出 TException 异常。
                     Database db = Env.getCurrentInternalCatalog()
                             .getDbOrException(pair[0], s -> new TException("database is invalid for dbName: " + s));
+                    // 从数据库对象 db 中获取对应的目标表 tbl。若表不存在同样抛出异常。
                     Table tbl = db.getTableOrException(pair[1], s -> new TException("table is invalid: " + s));
                     tableId = tbl.getId();
 
@@ -203,6 +210,7 @@ public class LoadAction extends RestBaseController {
                 }
             }
         }
+        // 调用基类/继承方法对 HTTP 请求中的认证头（如 Basic Auth 包含的用户与密码）进行账号密码校验与权限预检查。校验不通过会在内部直接抛出未经授权异常。
         executeCheckPassword(request, response);
         try {
             // A 'Load' request must have 100-continue header
@@ -215,7 +223,8 @@ public class LoadAction extends RestBaseController {
 
             LOG.info("redirect load action to destination={}, label: {}",
                     redirectAddr.toString(), label);
-
+            // 构建并返回 HTTP 重定向响应（通常为 HTTP 307 Temporary Redirect），将计算好的 BE 地址（redirectAddr）写入 Response 的 Location Header 中，
+            // 指导客户端（如 curl 或 Doris Stream Loader 客户端）重新将数据流发送给选中的 BE 执行真正的落盘导入。
             return createRedirectResponse(request, response, redirectAddr, true, null, null, label);
         } catch (Exception e) {
             return new RestBaseResult(e.getMessage());
@@ -261,7 +270,8 @@ public class LoadAction extends RestBaseController {
         }
         return pair;
     }
-
+    // 专门用于处理 Stream Load 的两阶段提交（Two-Phase Commit, 2PC）控制请求（如事务的 commit 确认提交或 abort 撤销中止）。
+    // 与数据传输接口不同，该接口不传输实际的数据体，仅用于控制指定数据库下某个事务的最终状态。
     @RequestMapping(path = "/api/{" + DB_KEY + "}/_stream_load_2pc", method = RequestMethod.PUT)
     public Object streamLoad2PC(HttpServletRequest request,
             HttpServletResponse response,
@@ -370,7 +380,8 @@ public class LoadAction extends RestBaseController {
             return new RestBaseResult(e.getMessage());
         }
     }
-
+    // 处理 Stream Load 两阶段提交（2PC） 的底层核心重定向逻辑方法
+    // 要作用是：校验客户端传入的数据库名称、事务标识（txn_id 或 label）以及操作类型（commit 或 abort），确认合法后选择一个存活的 Backend（BE）节点，并将该 2PC 控制请求重定向（Redirect）给 BE 去真正调用 FE/BE 的事务接口执行提交或撤销。
     private Object executeStreamLoad2PC(HttpServletRequest request, String db) {
         try {
             String dbName = db;

@@ -192,26 +192,39 @@ public class GlobalTransactionMgr implements GlobalTransactionMgrIface {
             throw e;
         }
     }
-
+    // 全局事务管理器处理导入事务两阶段提交（2PC）中预提交（Pre-Commit）阶段的入口方法。
+    // 核心职责是在执行真正的预提交逻辑之前，对涉及的所有表加上写锁（Write Lock），以确保事务修改元数据时的并发安全性与一致性；同时通过 try-finally 结构保证无论成功与否均能可靠释放表锁。
+    // Database db  目标数据库元数据对象，在此方法中主要用于提取数据库 ID（db.getId()）。
+    // List<Table> tableList 本次事务涉及的所有 Table 对象的列表（在上游方法中已按 Table ID 升序排列，用于规避多表加锁时的死锁问题）。
+    // long transactionId  作用：全局唯一的事务 ID（txnId）。
+    // List<TabletCommitInfo> tabletCommitInfos 后端（BE）节点汇报的副本（Tablet/Replica）写入提交信息，包含哪些副本数据写入成功、版本号、数据行数等。
+    // long timeoutMillis  尝试获取表写锁的超时时间（单位：毫秒）。
+    // TxnCommitAttachment txnCommitAttachment  事务提交时的附加元信息（如 Stream Load 或 Routine Load 的导入统计与版本标记）。
     @Override
     public void preCommitTransaction2PC(Database db, List<Table> tableList, long transactionId,
             List<TabletCommitInfo> tabletCommitInfos, long timeoutMillis,
             TxnCommitAttachment txnCommitAttachment)
             throws UserException {
+        // 尝试对 tableList 中的所有表依次施加写锁（Write Lock）
         if (!MetaLockUtils.tryWriteLockTablesOrMetaException(tableList, timeoutMillis, TimeUnit.MILLISECONDS)) {
             throw new UserException("get tableList write lock timeout, tableList=("
                     + StringUtils.join(tableList, ",") + ")");
         }
+        // 调用同名的内部重载函数（非 Database 重载版本）。
+        // 在持有表写锁的前提下，执行真正的预提交状态变更逻辑（如校验各 Tablet 副本写入成功数量是否达到多数派 Quorum、校验版本号、将事务状态由 PREPARE 改为 PREPARED 等）。
         try {
             preCommitTransaction2PC(db.getId(), tableList, transactionId, tabletCommitInfos, txnCommitAttachment);
         } finally {
+            // 无论 try 块中的预提交逻辑成功执行，还是抛出任何业务异常/运行时错误，finally 块都保证 100% 执行，按顺序释放 tableList 中所有表的写锁。
             MetaLockUtils.writeUnlockTables(tableList);
         }
     }
-
+    // 完成了获取表写锁（Write Lock）的操作后，本方法负责进行全局级别的系统配置状态检查，随后将具体的预提交业务逻辑下发转交给该数据库对应的 DatabaseTransactionMgr（数据库级别的事务管理器）来执行。
     private void preCommitTransaction2PC(long dbId, List<Table> tableList, long transactionId,
             List<TabletCommitInfo> tabletCommitInfos, TxnCommitAttachment txnCommitAttachment)
             throws UserException {
+        // 集群全局导入开关检查
+        // 检查 Doris 全局配置项 disable_load_job 是否被设置为 true（通常在运维人员需要紧急停机、清理系统负载或进行元数据维护时手动开启）
         if (Config.disable_load_job) {
             throw new TransactionCommitFailedException("disable_load_job is set to true, all load jobs are prevented");
         }
@@ -219,7 +232,10 @@ public class GlobalTransactionMgr implements GlobalTransactionMgrIface {
         if (LOG.isDebugEnabled()) {
             LOG.debug("try to pre-commit transaction: {}", transactionId);
         }
+        // 获取数据库级事务管理器并路由下发
         DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
+        // 将预提交动作推进到具体的数据表与事务状态更新阶段。
+        // 系统会根据 transactionId 检索 TransactionState 对象，校验事务状态是否为 PREPARE，核对各分片副本的写入成功数量，最后将事务状态切换为 PREPARED（预提交完成），等待 coordinator 发送最终 Commit 命令。
         dbTransactionMgr.preCommitTransaction2PC(tableList, transactionId, tabletCommitInfos, txnCommitAttachment);
     }
 

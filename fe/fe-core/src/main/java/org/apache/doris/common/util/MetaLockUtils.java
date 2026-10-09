@@ -99,17 +99,23 @@ public class MetaLockUtils {
             }
         }
     }
-
+    // 主要用于在处理涉及多张表的事务（如多表导入、表锁冲突管理等）时，按顺序尝试对表列表中所有的表批量施加写锁（Write Lock）
+    // 最核心的机制在于“全有或全无”（All-or-Nothing）的回滚保护：如果在给某张表加锁超时，或者某张表元数据已被删除/不存在（抛出 MetaNotFoundException）时，方法会自动释放之前已经加锁成功的所有表，防止发生死锁或锁泄漏。
     public static boolean tryWriteLockTablesOrMetaException(List<? extends TableIf> tableList, long timeout,
             TimeUnit unit) throws MetaNotFoundException {
+        // 遍历表列表进行逐一加锁
         for (int i = 0; i < tableList.size(); i++) {
             try {
+                // 尝试获取第 i 张表的写锁，最多等待 timeout 时间。
+                // 若在超时时间内未能获取到第 i 张表的写锁（返回 false），说明发生了写锁竞争或超时。
                 if (!tableList.get(i).tryWriteLockOrMetaException(timeout, unit)) {
+                    // 回滚所有已拿到的锁之后，向调用方返回 false，表示本次批量加锁操作失败。
                     for (int j = i - 1; j >= 0; j--) {
                         tableList.get(j).writeUnlock();
                     }
                     return false;
                 }
+            // 异常回滚机制（元数据丢失时释放已加的锁）
             } catch (MetaNotFoundException e) {
                 for (int j = i - 1; j >= 0; j--) {
                     tableList.get(j).writeUnlock();

@@ -208,17 +208,26 @@ public class DatabaseTransactionMgr {
         return unprotectedGetTransactionState(transactionId);
 
     }
-
+    // 核心职责是：根据给定的事务 ID，依次检索内存中的运行中事务容器、终态事务容器以及子事务映射表，最终返回对应的 TransactionState（事务状态对象）。
     private TransactionState unprotectedGetTransactionState(Long transactionId) {
+        // 1. 检索运行中的事务（Running Transactions）
+        // 从内存字典 idToRunningTransactionState（记录所有处于 PREPARE、PREPARED、COMMITTED 等运行中/未完全结束状态的事务 Map）中查找该 transactionId。
         TransactionState transactionState = idToRunningTransactionState.get(transactionId);
+        // 如果查找到了，说明该事务属于当前正在运行的事务，直接返回对应的 TransactionState 对象。
         if (transactionState != null) {
             return transactionState;
         }
+        // 2. 检索已结束/处于终态的事务（Final Status Transactions）
+        // 若在运行中字典未命中，则从 idToFinalStatusTransactionState（记录已达到最终状态如 VISIBLE、ABORTED 的历史事务 LRU 缓存/Map）中继续查找。
         transactionState = idToFinalStatusTransactionState.get(transactionId);
         if (transactionState != null) {
             return transactionState;
         }
+        // 3. 递归检索子事务（Sub-Transaction Routing）
+        // 判断传入的 transactionId 是否其实是一个子事务 ID（SubTxnId）（例如多表导入或复合事务场景下的子任务）。
         if (subTxnIdToTxnId.containsKey(transactionId)) {
+            // 如果匹配成功，根据子事务 ID 查出对应的主事务 ID（Parent TxnId）。
+            // 递归调用自身，传入主事务 ID 重新检索，最终获取并返回主事务的 TransactionState。
             return unprotectedGetTransactionState(subTxnIdToTxnId.get(transactionId));
         }
         return null;
@@ -417,72 +426,93 @@ public class DatabaseTransactionMgr {
     public void updateDatabaseUsedQuotaData(long usedQuotaDataBytes) {
         this.usedQuotaDataBytes = usedQuotaDataBytes;
     }
-
+    // Apache Doris 中数据库级别的事务管理器（DatabaseTransactionMgr）中处理导入事务两阶段提交（2PC）预提交（Pre-Commit）阶段的核心方法
+    // 在完成了上层 FE/BE 的鉴权、数据库与表对象解析以及加锁之后，该方法在数据库维度执行事务状态校验、副本写入正确性检查（Quorum 校验）、更新事务状态为 PRECOMMITTED 以及元数据持久化（EditLog 持久化/异步入队）。
     public void preCommitTransaction2PC(List<Table> tableList, long transactionId,
             List<TabletCommitInfo> tabletCommitInfos, TxnCommitAttachment txnCommitAttachment)
             throws UserException {
         // check status
         // the caller method already own db lock, we do not obtain db lock here
+        // 1. 查找目标事务状态对象
+        // 从当前元数据目录中根据 dbId 获取目标数据库对象；若数据库不存在则直接抛出元数据异常。
         Database db = env.getInternalCatalog().getDbOrMetaException(dbId);
         TransactionState transactionState;
+        // 给当前 DatabaseTransactionMgr 加上读锁，保护对内部事务状态容器（如内存中的事务 Map）的并发读取。
         readLock();
         try {
+            // 在持有读锁的前提下，根据 transactionId 检索出内存中的事务状态对象 TransactionState。
             transactionState = unprotectedGetTransactionState(transactionId);
         } finally {
             readUnlock();
         }
+        // 2. 事务合法性与当前状态校验
+        // 如果事务不存在（null），或者已被回滚/终止（状态为 ABORTED），则抛出 TransactionCommitFailedException，并带上对应的异常原因（transactionState.getReason()）。
         if (transactionState == null
                 || transactionState.getTransactionStatus() == TransactionStatus.ABORTED) {
             throw new TransactionCommitFailedException(
                     transactionState == null ? "transaction not found" : transactionState.getReason());
         }
-
+        // 校验事务是否已经生效可见（VISIBLE）。如果是，说明事务早已彻底完成，不能重复执行预提交，抛出异常。
         if (transactionState.getTransactionStatus() == TransactionStatus.VISIBLE) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("transaction is already visible: {}", transactionId);
             }
             throw new TransactionCommitFailedException("transaction is already visible");
         }
-
+        // 校验事务是否处于已提交状态（COMMITTED）。如果是，说明事务已完成 Commit 阶段，不可回退执行 Pre-Commit，抛出异常。
         if (transactionState.getTransactionStatus() == TransactionStatus.COMMITTED) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("transaction is already committed: {}", transactionId);
             }
             throw new TransactionCommitFailedException("transaction is already committed");
         }
-
+        // 幂等性处理。如果事务状态已经是 PRECOMMITTED（预提交完成），说明之前已经成功调用过该接口（如网络重试场景）。
+        // 此时打印日志并直接 return 成功，不再重复执行后续校验与写 EditLog 操作。
         if (transactionState.getTransactionStatus() == TransactionStatus.PRECOMMITTED) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("transaction is already pre-committed: {}", transactionId);
             }
             return;
         }
-
+        // 3. 副本写入状态与分布式 Quorum 校验
+        // 记录导入过程中写入失败或异常的副本（Replica）ID 集合。
         Set<Long> errorReplicaIds = Sets.newHashSet();
+        // 记录参与本次事务写入的所有 Backend 节点 ID 集合。
         Set<Long> totalInvolvedBackends = Sets.newHashSet();
+        // 记录本次事务影响的表 ID 到分区 ID 集合（TableID -> Set<PartitionID>）的映射。
         Map<Long, Set<Long>> tableToPartition = new HashMap<>();
-
+        // 核心提交校验函数。
+        // 遍历所有 Tablet，对比 BE 汇报的 tabletCommitInfos 与 FE 元数据。校验写入成功的副本数量是否达到了多数派要求（Quorum）；
+        // 若有副本写入失败，将其放入 errorReplicaIds；同时整理出涉及的 Partition 和 Backend。如果成功副本数未达标，该方法内部会直接抛出异常。
         checkCommitStatus(tableList, transactionState, tabletCommitInfos, txnCommitAttachment, errorReplicaIds,
                           tableToPartition, totalInvolvedBackends);
-
+        // 4. 事务状态内存更新与 EditLog 持久化
         EditLog.EditLogItem logItem = null;
+        // 对当前事务状态对象加同步锁，保证该事务状态变更与日志写入过程的原子性。
         synchronized (transactionState) {
+            // 更新内存中的 transactionState 属性，将其状态字段修改为 PRECOMMITTED，并记录错误副本、涉及的分区及 BE 列表等信息。
             unprotectedPreCommitTransaction2PC(transactionState, errorReplicaIds, tableToPartition,
                     totalInvolvedBackends, db);
+            // true（开启同步/异步解耦）：调用 enqueueTransactionState(...) 将 transactionState 包装成日志项 logItem 放入 EditLog 异步写入队列，避免在长锁竞争下阻塞写日志。
             if (Config.enable_txn_log_outside_lock) {
                 logItem = enqueueTransactionState(transactionState);
             } else {
+            // false（传统模式）：调用 persistTransactionState(...) 直接将事务预提交状态同步持久化写入 Doris BDBJE / EditLog 中。
                 persistTransactionState(transactionState);
             }
         }
+        // 5. 等待日志落盘与完成返回
+        // 等待元数据 EditLog 彻底持久化完成（如果在异步队列模式下，会在此处挂起等待 logItem 刷盘完成的 Signal）。这确保了返回给客户端成功之前，预提交状态已经安全落盘，防止 FE 宕机导致事务状态丢失。
         awaitTransactionState(logItem, transactionState);
         LOG.info("transaction:[{}] successfully pre-committed", transactionState);
     }
-
+    // 核心职责是：核对 Backend（BE）上报的副本写入成果，判断每个 Tablet 成功写入数据的副本数量是否满足多数派（Quorum）法定要求。
+    // 同时，它还负责检测表/分区是否处于恢复状态（Restore），并自动触发写失败 Tablet 的修复（Repair）。
     private void checkCommitStatus(List<Table> tableList, TransactionState transactionState,
                                    List<TabletCommitInfo> tabletCommitInfos, TxnCommitAttachment txnCommitAttachment,
                                    Set<Long> errorReplicaIds, Map<Long, Set<Long>> tableToPartition,
                                    Set<Long> totalInvolvedBackends) throws UserException {
+        // 1. 基础元数据与提交附加信息绑定
         long transactionId = transactionState.getTransactionId();
         Database db = env.getInternalCatalog().getDbOrMetaException(dbId);
 
@@ -490,9 +520,12 @@ public class DatabaseTransactionMgr {
         if (txnCommitAttachment != null) {
             transactionState.setTxnCommitAttachment(txnCommitAttachment);
         }
-
+        // 2. 建立索引映射与初始化结构
+        // 获取全局 Tablet 倒排索引（TabletInvertedIndex），用于快速反查 Tablet、Replica 与 Backend 的对应关系。
         TabletInvertedIndex tabletInvertedIndex = env.getTabletInvertedIndex();
+        // 创建映射 TabletID -> Set<BackendID>，记录上报写入成功的 BE 节点集合。
         Map<Long, Set<Long>> tabletToBackends = new HashMap<>();
+        // 建立 TableID -> Table 对象的快速映射字典。
         Map<Long, Table> idToTable = new HashMap<>();
         for (int i = 0; i < tableList.size(); i++) {
             idToTable.put(tableList.get(i).getId(), tableList.get(i));
@@ -502,13 +535,18 @@ public class DatabaseTransactionMgr {
         // if index is dropped, it does not matter.
         // if table or partition is dropped during load, just ignore that tablet,
         // because we should allow dropping rollup or partition during load
+        // 3. 校验表与分区的恢复（RESTORE）状态，整理成功上报信息
+        // 通过 Stream 流提取 BE 上报的所有 tabletId
         List<Long> tabletIds = tabletCommitInfos.stream()
                 .map(TabletCommitInfo::getTabletId).collect(Collectors.toList());
+        // 从倒排索引中批量获取这些 Tablet 的元数据信息 TabletMeta（包含所属的 tableId 和 partitionId）
         List<TabletMeta> tabletMetaList = tabletInvertedIndex.getTabletMetaList(tabletIds);
+        // 用于缓存表是否正在处于 Restore（备份恢复）状态的计算结果。
         HashMap<Long, Boolean> tableIdtoRestoring = new HashMap<>();
         for (int i = 0; i < tabletMetaList.size(); i++) {
             // get partition and table of this tablet
             TabletMeta tabletMeta = tabletMetaList.get(i);
+            // 过滤已被删除的元数据：如果 Tablet 不存在（NOT_EXIST_TABLET_META）或对应的表已被删除/正在删除（tbl == null），则忽略该 Tablet。
             if (tabletMeta == TabletInvertedIndex.NOT_EXIST_TABLET_META) {
                 continue;
             }
@@ -521,6 +559,7 @@ public class DatabaseTransactionMgr {
             }
 
             // check relative partition restore here
+            // 分区 RESTORE 校验：如果 Tablet 所属的分区正处于物理恢复阶段（PartitionState.RESTORE），直接抛出 LoadException 拒绝写入数据。
             long partitionId = tabletMeta.getPartitionId();
             if (tbl.getPartition(partitionId) == null) {
                 // this can happen when partitionId == -1 (tablet being dropping) or partition really not exist.
@@ -533,6 +572,8 @@ public class DatabaseTransactionMgr {
             }
 
             // only do check when here's restore on this table now
+            // 整表 RESTORE 校验：如果表状态为 OlapTableState.RESTORE，需要区分是“整表恢复”还是“部分分区恢复”。
+            // 如果是整表恢复（没有任何单个分区处于 Restore 状态，即整表结构恢复中），抛出 LoadException 拒绝导入。
             if (tbl.getState() == OlapTableState.RESTORE) {
                 boolean hasPartitionRestoring = false;
                 if (tableIdtoRestoring.containsKey(tableId)) {
@@ -554,20 +595,26 @@ public class DatabaseTransactionMgr {
                             "Table " + tbl.getName() + " is in restore process. " + "Can not load into it");
                 }
             }
-
+            // 将 partitionId 加入 tableToPartition 集合中（记录哪些表和分区被真正写入了数据）；
             if (!tableToPartition.containsKey(tableId)) {
                 tableToPartition.put(tableId, new HashSet<>());
             }
+            // 将成功写入该 tabletId 的 backendId 加入 tabletToBackends 字典中。
             tableToPartition.get(tableId).add(partitionId);
             if (!tabletToBackends.containsKey(tabletId)) {
                 tabletToBackends.put(tabletId, new HashSet<>());
             }
             tabletToBackends.get(tabletId).add(tabletCommitInfos.get(i).getBackendId());
         }
+        // 4. 分布式多数派（Quorum）副本数量与健康状态校验
+        // 分类收集器：针对每个 Tablet，定义三个集合分类保存副本：
+        // 完全正常且成功写入数据的副本。
         List<Replica> tabletSuccReplicas = Lists.newArrayList();
+        // 写入失败或未上报写入成功的副本。
         List<Replica> tabletWriteFailedReplicas = Lists.newArrayList();
+        // 数据虽然写了，但版本落后/处于异常状态（getLastFailedVersion() >= 0）的副本。
         List<Replica> tabletVersionFailedReplicas = Lists.newArrayList();
-
+        // 获取待校验的物化视图/索引（MaterializedIndex）：遍历涉及到的表和分区，根据 transactionState.getLoadedTblIndexes() 提取本次导入实际写入的 Index 列表（如 Base 表索引及 Rollup 索引）。
         for (long tableId : tableToPartition.keySet()) {
             OlapTable table = (OlapTable) db.getTableOrMetaException(tableId);
             for (Partition partition : table.getAllPartitions()) {
@@ -588,7 +635,7 @@ public class DatabaseTransactionMgr {
                         }
                     }
                 }
-
+                // 延长 Publish 超时优化：如果表正处于 Rollup 或 Schema Change 变更状态，调用 prolongPublishTimeout() 延长后续版本发布阶段的超时时间，降低因为 Alter Job 期间冲突导致 Publish 失败的概率。
                 if (table.getState() == OlapTable.OlapTableState.ROLLUP
                         || table.getState() == OlapTable.OlapTableState.SCHEMA_CHANGE) {
                     /*
@@ -609,7 +656,9 @@ public class DatabaseTransactionMgr {
                 }
 
                 // (TODO): ignore the alter index if txn id is less than sc sched watermark
+                // 计算该分区导入最少必须成功写入的副本数量（通常是多数派 $\lfloor \text{ReplicaNum} / 2 \rfloor + 1$）。
                 int loadRequiredReplicaNum = table.getLoadRequiredReplicaNum(partition.getId());
+                // 遍历属于该索引的每个 Tablet，清空上一个 Tablet 的临时列表，并拿到元数据中定义的所有期望 BE 节点 tabletBackends。
                 for (MaterializedIndex index : allIndices) {
                     for (Tablet tablet : index.getTablets()) {
                         tabletSuccReplicas.clear();
@@ -646,12 +695,15 @@ public class DatabaseTransactionMgr {
                                 errorReplicaIds.add(replica.getId());
                             }
                         }
-
+                        // 5. Quorum 多数派判断与自动修复（Tablet Repair）触发
                         int successReplicaNum = tabletSuccReplicas.size();
+                        // 判断成功副本数是否达标：如果 successReplicaNum < loadRequiredReplicaNum（健康且成功的副本数小于法定要求数量）：
                         if (successReplicaNum < loadRequiredReplicaNum) {
                             long now = System.currentTimeMillis();
                             long lastLoadFailedTime = tablet.getLastLoadFailedTime();
                             tablet.setLastLoadFailedTime(now);
+                            // 触发自动修复机制：更新 Tablet 的最后一次导入失败时间 lastLoadFailedTime。如果距离上次失败已超过 5 秒（now - lastLoadFailedTime >= 5000L），
+                            // 调用 TabletScheduler.tryAddRepairTablet(...) 将该坏 Tablet 加入系统的后台修复调度队列，通知 FE 尽快发起副本补齐/克隆（Clone）。
                             if (now - lastLoadFailedTime >= 5000L) {
                                 Env.getCurrentEnv().getTabletScheduler().tryAddRepairTablet(
                                         tablet, db.getId(), table, partition, index, 0);
@@ -1545,23 +1597,34 @@ public class DatabaseTransactionMgr {
             tabletWriteFailedReplicas.add(replica);
         }
     }
-
+    // 核心职责是：在完成了副本 Quorum 多数派校验后，正式将内存中的事务状态切换为预提交状态（PRECOMMITTED），
+    // 构建并绑定本次事务涉及的表与分区提交元数据（TableCommitInfo / PartitionCommitInfo），更新事务管理器的内存索引状态。
     protected void unprotectedPreCommitTransaction2PC(TransactionState transactionState, Set<Long> errorReplicaIds,
                                                 Map<Long, Set<Long>> tableToPartition, Set<Long> totalInvolvedBackends,
                                                 Database db) {
         // transaction state is modified during check if the transaction could committed
+        // 1. 事务状态幂等校验与防重
         if (transactionState.getTransactionStatus() != TransactionStatus.PREPARE) {
             return;
         }
         // update transaction state version
+        // 2. 更新事务的核心预提交状态与异常副本
+        // 记录当前系统时间作为本次事务的预提交时间戳（Pre-Commit Time），用于后续事务超时监控与统计。
         transactionState.setPreCommitTime(System.currentTimeMillis());
+        // 将事务状态从 PREPARE 正式修改为 PRECOMMITTED（已预提交）。两阶段提交（2PC）的第一阶段在内存中完成标记。
         transactionState.setTransactionStatus(TransactionStatus.PRECOMMITTED);
+        // 将写入失败的副本集合记录到事务状态中，后续在 Commit 阶段，事务管理器会将这些副本标记为版本落后，以便触发后续修复（Repair）。
         transactionState.setErrorReplicas(errorReplicaIds);
+        // 3. 构建表与分区的提交元数据（TableCommitInfo & PartitionCommitInfo）
         for (long tableId : tableToPartition.keySet()) {
+            // 从数据库中获取对应表的 OlapTable 元数据对象。
             OlapTable table = (OlapTable) db.getTableNullable(tableId);
+            // 实例化表提交信息对象 TableCommitInfo，用于收集该表下所有变动分区的提交元数据。
             TableCommitInfo tableCommitInfo = new TableCommitInfo(tableId);
+            // 获取表的分区元数据定义（用于后续提取分区的 Range 范围描述等）。
             PartitionInfo tblPartitionInfo = table.getPartitionInfo();
             for (long partitionId : tableToPartition.get(tableId)) {
+                // 遍历当前表下被实际写入数据的每一个分区 ID。
                 String partitionRange = tblPartitionInfo.getPartitionRangeString(partitionId);
                 PartitionCommitInfo partitionCommitInfo = new PartitionCommitInfo(
                         partitionId, partitionRange, -1, -1,
@@ -1571,7 +1634,11 @@ public class DatabaseTransactionMgr {
             transactionState.putIdToTableCommitInfo(tableId, tableCommitInfo);
         }
         // Update in-memory state only; caller handles edit log persistence
+        // 4. 更新内存索引与关联 Backend 节点
+        // 更新 DatabaseTransactionMgr 内部的内存数据结构（例如维护表 ID 到运行中事务的映射表、更新事务超时定时器等）。
+        // 注释强调：此步骤仅更新内存状态（In-memory state），元数据持久化 EditLog 的写入由外层调用方（preCommitTransaction2PC 主流程）统一处理。
         unprotectUpdateInMemoryState(transactionState, false);
+        // 将参与本次事务的所有 BE 节点 ID 集合记录到 transactionState 中，用于后续 Publish Version（版本发布）阶段向这些 BE 节点下发最终的 Commit 命令。
         transactionState.setInvolvedBackends(totalInvolvedBackends);
     }
 
@@ -1835,13 +1902,19 @@ public class DatabaseTransactionMgr {
      * For PREPARE transactions with non-FRONTEND source type, persistence is skipped
      * because losing them only requires the client to retry.
      */
+    // Apache Doris 中数据库事务管理器内部专门负责同步持久化事务状态（将 TransactionState 写入元数据日志 EditLog）的保护方法（protected）。
+    // 核心价值在于通过精准判断事务的状态和来源类型，对无须落盘的事务跳过 EditLog 持久化，从而显著降低 FE（Frontend）在处理海量高频导入任务时的磁盘 I/O 压力与元数据日志膨胀速度。
     protected void persistTransactionState(TransactionState transactionState) {
+        // 事务状态不处于 PREPARE 阶段（例如当前正在处理的 PRECOMMITTED、COMMITTED、VISIBLE、ABORTED 等关键状态）。
+        // 一旦事务跨越了 PREPARE 阶段进入预提交或提交阶段，数据版本与状态必须强一致并持久化，因此必须写入 EditLog。
+        // 事务的导入来源类型为 FRONTEND（例如由 FE 节点自身内部驱动并异步运行的 Insert Into语句、Broker Load、Routine Load 等后台任务）。
         if (transactionState.getTransactionStatus() != TransactionStatus.PREPARE
                 || transactionState.getSourceType() == TransactionState.LoadJobSourceType.FRONTEND) {
             // if this is a prepare txn, and load source type is not FRONTEND
             // no need to persist it. if prepare txn lost, the following commit will just be failed.
             // user only need to retry this txn.
             // The FRONTEND type txn is committed and running asynchronously, so we have to persist it.
+            // 当满足上述任一条件时（即：不是 PREPARE 状态，或者来源是 FRONTEND），调用 editLog 将当前 transactionState 序列化并同步写入元数据持久化日志中。
             editLog.logInsertTransactionState(transactionState);
         }
     }
@@ -1867,19 +1940,28 @@ public class DatabaseTransactionMgr {
      * @param item the handle returned by {@link #enqueueTransactionState}, may be null
      * @param transactionState the transaction state (for binlog and timing)
      */
+    // 专门配合异步 EditLog 刷盘机制（即配置 Config.enable_txn_log_outside_lock = true 时）使用的等待与后处理辅助方法。
+    // 事务状态已被封装为 EditLog.EditLogItem 并放入后台异步写日志队列。为了确保在向客户端返回“预提交（Pre-Commit）”或“提交（Commit）”成功之前，元数据已安全落盘并生成 Binlog，必须调用此方法在释放了事务/元数据锁之后阻塞等待 EditLog 持久化完成。
+    // 必须在锁外部（outside the write lock）调用。因为等待 BDBJE / 磁盘 I/O 刷盘可能耗时较长，在锁外部等待可以避免阻塞其他线程对元数据的并发读写。同时，该方法内部还会处理 Binlog 生成以及写日志耗时的监控统计。
     protected void awaitTransactionState(EditLog.EditLogItem item, TransactionState transactionState) {
+        // 如果传入的 item 为 null（例如系统关闭了 enable_txn_log_outside_lock 走同步写模式，或者由于某些无需持久化的场景未生成异步日志句柄），说明无需异步等待，直接返回。
         if (item == null) {
             return;
         }
         long start = System.currentTimeMillis();
+        // 核心阻塞点。挂起当前线程，等待后台 EditLog 刷新线程将该事务日志写入 BDBJE 存储并返回分配的全局 EditLog ID（logId）。
         long logId = item.await();
         long logEditEnd = System.currentTimeMillis();
         long end = logEditEnd;
+        // 3. Binlog 增量记录生成（针对交易终态 VISIBLE）
+        // 判断事务状态是否已达到最终的 VISIBLE（版本可见/提交完成） 阶段。在预提交（Pre-Commit）阶段状态为 PRECOMMITTED，不会触发此分支。
         if (transactionState.getTransactionStatus() == TransactionStatus.VISIBLE) {
             UpsertRecord record = new UpsertRecord(logId, transactionState);
+            // 将该记录添加到 Doris 的 BinlogManager 中，用于数据变更订阅、跨集群 CDC（Change Data Capture）同步或特征流管道。
             Env.getCurrentEnv().getBinlogManager().addUpsertRecord(record);
             end = System.currentTimeMillis();
         }
+        // 若总耗时超标，打印 WARN 级别的日志，并细分输出 BDBJE 写磁盘耗时（logEditEnd - start） 与 Binlog 写入耗时（end - logEditEnd），便于定位到底是磁盘 I/O 瓶颈还是 Binlog 处理瓶颈。
         if (end - start > Config.lock_reporting_threshold_ms) {
             LOG.warn("edit log insert transaction take a lot time, write bdb {} ms, write binlog {} ms",
                     logEditEnd - start, end - logEditEnd);

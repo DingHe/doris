@@ -243,10 +243,13 @@ public abstract class Table extends MetaObject implements Writable, TableIf, Gso
     // TabletStatMgr will invoke all olap tables' tryWriteLock every one minute,
     // we can set Config.check_table_lock_leaky = true
     // and check log to find out whether if the table has lock leaky.
+    // 封装了 JUC（java.util.concurrent）的读写锁 ReentrantReadWriteLock，用于尝试获取当前表对象的写锁（Write Lock）。
     public boolean tryWriteLock(long timeout, TimeUnit unit) {
         try {
+            // 尝试获取写锁
             boolean res = this.rwLock.writeLock().tryLock(timeout, unit);
             if (!res && unit.toSeconds(timeout) >= 1) {
+                // 加锁失败时的诊断日志打印
                 if (readLockThreads == null) {
                     LOG.warn("Failed to try table {}'s write lock. timeout {} {}. Current owner: {}",
                             name, timeout, unit.name(), rwLock.getOwner());

@@ -87,14 +87,24 @@ import java.util.stream.Collectors;
  * LoadManager.lock
  * LoadJob.lock
  */
+// 负责协调、管控和调度 Doris 中绝大多数类型的导入任务（如 Broker Load、Spark Load、Insert Load 以及部分 Mysql Load 等）
+// LoadManager 的核心作用
+// 导入作业全生命周期管理：负责导入作业的创建、调度、分析（Analyze）、取消（Cancel）、状态更新以及元数据持久化/回放（Replay）。
+// 作业索引与状态追踪：基于作业 ID（jobId）、数据库 ID（dbId）和标签（label）维护高效的双重内存索引，支持快速查询、防重复 Label 机制以及元数据清理。
+// 容量控制与淘汰策略：限制系统内未完成作业的最大数量（防止超载），并通过基于过期时间（TTL）或容量阈值（label_num_threshold）的淘汰机制防止内存泄漏。
+// 事务与回调注册：作为连接全局事务管理器（GlobalTransactionMgr）的桥梁，将未完成的导入作业注册为事务回调，确保数据导入过程的原子性与一致性。
 public class LoadManager implements Writable {
     private static final Logger LOG = LogManager.getLogger(LoadManager.class);
-
+    // Job ID 级的主 Map：使用 ConcurrentHashMap 存储，映射 jobId -> LoadJob。用于根据作业 ID 快速查找具体的导入任务对象。
     protected Map<Long, LoadJob> idToLoadJob = Maps.newConcurrentMap();
+    // 库与 Label 维度的二级 Map：结构为 dbId -> (label -> List<LoadJob>)。
+    // 用于支持按数据库和 Label 检索作业、校验 Label 重复性以及按数据库批量取消/展示导入作业。
     protected Map<Long, Map<String, List<LoadJob>>> dbIdToLabelToLoadJobs = Maps.newConcurrentMap();
+    // 导入作业调度器：负责将进入队列的导入作业放入后台线程池真正调度并执行。
     protected LoadJobScheduler loadJobScheduler;
-
+    // 读写锁：用于保护 LoadManager 内部内存结构（如 idToLoadJob 和 dbIdToLabelToLoadJobs）并发安全，并发读多写少时提供高吞吐。
     private ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    // MySQL 协议导入管理器：专门负责处理 MYSQL_LOAD（如 LOAD DATA LOCAL INFILE）类型的导入生命周期管理。
     private MysqlLoadManager mysqlLoadManager;
 
     public LoadManager(LoadJobScheduler loadJobScheduler) {

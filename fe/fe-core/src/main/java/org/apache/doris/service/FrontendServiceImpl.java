@@ -1615,21 +1615,26 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
         return result;
     }
-
+    // loadTxnPreCommit 是 Apache Doris 中 Frontend（FE）节点提供的一个 Thrift RPC 接口方法，用于处理导入事务的预提交（Pre-Commit）请求
+    // 在两阶段提交（2PC）的导入模式中，该接口负责将事务状态推进到“准备提交”状态，确保数据写入动作已在各 Backend（BE）节点完成，等待最终的 Commit 确认
     @Override
     public TLoadTxnCommitResult loadTxnPreCommit(TLoadTxnCommitRequest request) throws TException {
+        // 获取发起本次 RPC 请求的客户端（通常是 Backend 节点）的 IP 地址和端口字符串，便于后续日志排查与追踪
         String clientAddr = getClientAddrAsString();
         if (LOG.isDebugEnabled()) {
             LOG.debug("receive txn pre-commit request: {}, backend: {}", request, clientAddr);
         }
-
+        // 初始化结果对象与 Master 角色校验
         TLoadTxnCommitResult result = new TLoadTxnCommitResult();
+        // 校验当前 FE 节点是否为 Master (Leader) 节点。在 Apache Doris 中，所有的元数据修改和事务状态切换（如 Pre-Commit、Commit、Abort）都必须由 FE Master 节点统一管理
         TStatus status = checkMaster();
+        // 将 Master 检查的状态结果设置到返回对象中
         result.setStatus(status);
+        // 如果当前 FE 节点不是 Master，status 会返回非 OK 状态（例如 NOT_MASTER），此时直接返回结果，阻止后续事务逻辑在 Non-Master 节点上执行。
         if (status.getStatusCode() != TStatusCode.OK) {
             return result;
         }
-
+        // 执行核心预提交逻辑与异常处理
         try {
             loadTxnPreCommitImpl(request);
         } catch (UserException e) {
@@ -1677,8 +1682,11 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
         return result;
     }
-
+    // 专门负责解析并提取导入事务（Load Transaction）所关联的表对象列表（List<Table>）的内部私有方法
+    // 在导入数据预提交（Pre-Commit）或提交（Commit）时，系统需要获取目标表元数据以进行后续校验与锁管理。
+    // 此外，如果是多表导入场景（Multi-Table Load），该方法还承担了对表按 ID 排序防死锁以及更新全局事务管理器中多表关联状态的核心职责。
     private List<Table> queryLoadCommitTables(TLoadTxnCommitRequest request, Database db) throws UserException {
+        // 优先处理按 Table ID 快速查询（单表场景）
         if (request.isSetTableId() && request.getTableId() > 0) {
             Table table = Env.getCurrentEnv().getInternalCatalog().getTableByTableId(request.getTableId());
             if (table == null) {
@@ -1686,26 +1694,35 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             }
             return Collections.singletonList(table);
         }
-
+        // 解析表名列表（兼容单表与多表名称）
         List<String> tbNames;
         // check has multi table
+        // 判断请求中是否设置了多表名称列表 tbls。
         if (CollectionUtils.isNotEmpty(request.getTbls())) {
             tbNames = request.getTbls();
         } else {
             tbNames = Collections.singletonList(request.getTbl());
         }
+        // 从数据库提取表元数据并校验类型
         List<Table> tables = new ArrayList<>(tbNames.size());
         for (String tbl : tbNames) {
+            // 要求表类型必须是 TableType.OLAP（因为 Doris 的事务写入仅支持内表/OLAP 表）。
             OlapTable table = (OlapTable) db.getTableOrMetaException(tbl, TableType.OLAP);
             tables.add(table);
         }
+        // 表列表排序（死锁预防）
+        // 如果本次事务涉及多张表（tables.size() > 1），强制按照 Table ID 升序对表列表进行排序。
+        // 核心价值（死锁预防）：在分布式事务提交过程中，后续逻辑会对涉及的表逐一加锁。如果多个并发事务以不同顺序给多张表加锁（例如事务 A 锁 T1->T2，事务 B 锁 T2->T1），会导致数据库死锁。通过统一按 Table ID 升序加锁，彻底消除了此类死锁隐患。
         if (tables.size() > 1) {
             tables.sort(Comparator.comparing(Table::getId));
         }
         // if it has multi table, use multi table and update multi table running
         // transaction table ids
+        // 再次确认是否为多表导入场景。
         if (CollectionUtils.isNotEmpty(request.getTbls())) {
             List<Long> multiTableIds = tables.stream().map(Table::getId).collect(Collectors.toList());
+            // 将当前数据库 ID、事务 ID（txnId）与关联的多表 ID 列表注册并更新到 GlobalTransactionMgr（全局事务管理器）中。
+            // 确保了事务管理器在后续做状态清理、故障恢复（Recovery）或元数据持久化时，能够明确该事务覆盖了哪些表。
             Env.getCurrentGlobalTransactionMgr()
                     .updateMultiTableRunningTransactionTableIds(db.getId(), request.getTxnId(), multiTableIds);
             if (LOG.isDebugEnabled()) {
@@ -1714,20 +1731,26 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
         return tables;
     }
-
+    // Apache Doris 中 FE 节点处理导入事务两阶段提交（2PC）中预提交（Pre-Commit）阶段的核心内部实现方法
+    // 主要负责权限与身份校验、获取数据库与表元数据，并将预提交动作交由全局事务管理器处理。
     private void loadTxnPreCommitImpl(TLoadTxnCommitRequest request) throws UserException {
+        // 检查请求中是否设置了 authCode。根据注释说明，此方式已弃用（将在 3.1 版本移除），此处不做逻辑处理。
         if (request.isSetAuthCode()) {
             // TODO: deprecated, removed in 3.1, use token instead.
+        // 若设置了集群内部通信的 token，则通过 checkToken() 进行合法性校验。
         } else if (request.isSetToken()) {
             if (!checkToken(request.getToken())) {
                 throw new AuthenticationException("Invalid token: " + request.getToken());
             }
         } else {
+        // 若既没有 AuthCode 也没有 Token，则使用常规的用户密码 + 权限（Privilege）进行认证。
+            // 多表导入场景：如果 request.getTbls() 不为空，调用 checkPasswordAndPrivs 校验用户对 request.getTbls() 中涉及的所有表是否具备 LOAD（导入）权限。
             if (CollectionUtils.isNotEmpty(request.getTbls())) {
                 checkPasswordAndPrivs(request.getUser(), request.getPasswd(), request.getDb(), request.getTbls(),
                         request.getUserIp(), PrivPredicate.LOAD,
                         toForwardedCertificateInfo(request.getCertBasedAuth()));
             } else {
+                // 单表导入场景：否则，调用 checkSingleTablePasswordAndPrivs 校验对单表 request.getTbl() 的 LOAD 权限。
                 checkSingleTablePasswordAndPrivs(request.getUser(), request.getPasswd(), request.getDb(),
                         request.getTbl(), request.getUserIp(), PrivPredicate.LOAD,
                         toForwardedCertificateInfo(request.getCertBasedAuth()));
@@ -1735,14 +1758,18 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
 
         // get database
+        // 获取当前的 FE 环境对象 Env（即元数据全局入口），并提取请求中的数据库名称。
         Env env = Env.getCurrentEnv();
         String fullDbName = request.getDb();
         Database db;
+        // 根据请求参数查找数据库对象 Database。
+        // 优先根据 dbId 获取（通过 ID 查找更快且不依赖重命名）；若未设置 dbId，则退化为按数据库名称 fullDbName 从 InternalCatalog 中查找。
         if (request.isSetDbId() && request.getDbId() > 0) {
             db = env.getInternalCatalog().getDbNullable(request.getDbId());
         } else {
             db = env.getInternalCatalog().getDbNullable(fullDbName);
         }
+        // 如果未查找到目标数据库，抛出数据库不存在的 UserException 异常。
         if (db == null) {
             String dbName = fullDbName;
             if (Strings.isNullOrEmpty(request.getCluster())) {
@@ -1750,9 +1777,11 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             }
             throw new UserException("unknown database, database=" + dbName);
         }
-
+        // 计算超时时间与获取涉及的表对象
         long timeoutMs = request.isSetThriftRpcTimeoutMs() ? request.getThriftRpcTimeoutMs() / 2 : 5000;
+        // 根据请求参数从数据库 db 中查询本次导入涉及的所有 Table 对象列表。
         List<Table> tables = queryLoadCommitTables(request, db);
+        // 调用全局事务管理器执行预提交 (2PC)
         Env.getCurrentGlobalTransactionMgr()
                 .preCommitTransaction2PC(db, tables, request.getTxnId(),
                         TabletCommitInfo.fromThrift(request.getCommitInfos()), timeoutMs,

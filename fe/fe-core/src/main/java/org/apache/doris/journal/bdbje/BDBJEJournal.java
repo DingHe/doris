@@ -70,19 +70,30 @@ import java.util.concurrent.atomic.AtomicLong;
  * Finally, close this journal.
  * This class encapsulates the read, write APIs of bdbje
  */
+// BDBJEJournal 是 Apache Doris Frontend（FE）节点元数据持久化框架中的核心存储实现类，实现了 Journal 接口。
+// 它基于 Oracle Berkeley DB Java Edition (BDBJE) 的分布式复制环境（ReplicatedEnvironment），为 Doris FE 提供了高效、可靠的元数据变更日志（EditLog）存储与高可用同步能力。
+// 元数据日志持久化与批量写入：负责将 FE 产生的元数据操作（JournalEntity 或 JournalBatch）序列化后写入 BDBJE 存储，支持单条与批量 2PC 事务提交。
+// 日志分库管理与滚动（Roll Journal）：BDBJE 中使用递增的起始 Journal ID 来命名 Database（如 1、100、201）。该类管理当前写入的 Database，并在日志条数达到阈值时触发滚动建新库。
+// 日志读取与游标遍历：提供根据 Journal ID 读取单条元数据日志、按范围获取 JournalCursor（用于 Follower/Observer 节点的日志 Replay 回放）等接口。
+// 分布式一致性与容错恢复：处理 BDBJE 高可用集群运行中的各种复制异常（如 ReplicaWriteException、InsufficientLogException 缺失日志恢复、RollbackException 冲突回滚处理等）。
+// 元数据故障恢复截断（Truncate）：在通过命令行 -Drecovery_journal_id 进行灾难恢复时，负责截断并清理大于目标 ID 的多余日志。
 public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use uppercase
     public static final Logger LOG = LogManager.getLogger(BDBJEJournal.class);
     private static final int OUTPUT_BUFFER_INIT_SIZE = 128;
     private static final int RETRY_TIME = 3;
     private static final long RECOVERY_JOURNAL_ID_UNSET = -1L;
-
+    // BDBJE 数据库文件在磁盘上的存储绝对路径（由 Env.getServingEnv().getBdbDir() 获取）。
     private String environmentPath = null;
+    // 当前 FE 节点在 BDBJE 复制集群中的节点名称（如 172.16.1.10_9010_16888888）。
     private String selfNodeName;
+    // 当前 FE 节点的通信地址（Host:Port），优先采用 Hostname 格式，避免 IP 变更导致 BDBJE 启动失败。
     private String selfNodeHostPort;
-
+    // 封装了 BDBJE 原生 ReplicatedEnvironment 的环境管理类对象，负责底层 DB 实例的创建、连接与关闭。
     private BDBEnvironment bdbEnvironment = null;
+    // 当前正在写入 EditLog 的 BDBJE Database 引用。
     private Database currentJournalDB;
     // the next journal's id. start from 1.
+    // 下一个待分配/写入的 Journal ID 原子计数器，全局递增，初始值为 1。
     private AtomicLong nextJournalId = new AtomicLong(1);
 
     public BDBJEJournal(String nodeName) {

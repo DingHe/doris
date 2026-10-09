@@ -242,36 +242,44 @@ void StreamLoadAction::_send_reply(std::shared_ptr<StreamLoadContext> ctx, HttpR
 }
 
 int StreamLoadAction::on_header(HttpRequest* req) {
+    // 通知底层 HTTP 框架（如 Libevent / evhttp 封装层），
+    // 当前请求将在合适的时机由 StreamLoadAction 显式接管并发送 HTTP 响应（Reply），防止网络框架在方法返回时自动关闭连接或提前发送默认响应。
     req->mark_send_reply();
-
+    // 将 Prometheus 监控指标中的当前活跃流式导入计数器（streaming_load_current_processing）加 1，用于实时追踪 BE 端正在并发处理的 Stream Load 请求数量。
     streaming_load_current_processing->increment(1);
-
+    // 创建并挂载导入上下文对象
+    // 实例化一个 StreamLoadContext（流导入上下文）智能指针，传入全局执行环境 _exec_env。该上下文对象会贯穿整个 Stream Load 生命周期的每一个环节（Header 解析、Chunk 接收、Plan 执行、事务提交等）
     std::shared_ptr<StreamLoadContext> ctx = std::make_shared<StreamLoadContext>(_exec_env);
     req->set_handler_ctx(ctx);
-
+    // 标记导入类型为手动/常规导入
     ctx->load_type = TLoadType::MANUL_LOAD;
+    // 标记数据源类型为原始文本/二进制数据流（非 Kafka 等 Routine Load 模式）。
     ctx->load_src_type = TLoadSourceType::RAW;
-
+    // 解析数据库名、表名与基础 Header 属性
     url_decode(req->param(HTTP_DB_KEY), &ctx->db);
     url_decode(req->param(HTTP_TABLE_KEY), &ctx->table);
     ctx->label = req->header(HTTP_LABEL_KEY);
+    // 判断 Header 中是否开启了两阶段提交（two_phase_commit: true），并将结果保存为布尔值。
     ctx->two_phase_commit = req->header(HTTP_TWO_PHASE_COMMIT) == "true";
+    // 校验并决定当前请求是否走 Group Commit（组合提交，用于高并发小批量数据写入优化）。如果符合条件，会在此处进行 WAL 磁盘空间检查并准备 Group Commit 相关管道。其状态存入 st
     Status st = _handle_group_commit(req, ctx);
+    // 如果不是 Group Commit 模式，且用户在 HTTP Header 中没有显式指定 label，系统会自动生成一个 UUID 字符串作为该导入任务的默认 Label，确保每个 Stream Load 事务的 Label 都是唯一且非空的。
     if (!ctx->group_commit && ctx->label.empty()) {
         ctx->label = generate_uuid_string();
     }
-
+    // 日志记录与计时起始
     LOG(INFO) << "new income streaming load request." << ctx->brief() << ", db=" << ctx->db
               << ", tbl=" << ctx->table << ", group_commit=" << ctx->group_commit
               << ", group_commit_mode=" << ctx->group_commit_mode
               << ", HTTP headers=" << req->get_all_headers();
     ctx->begin_receive_and_read_data_cost_nanos = MonotonicNanos();
-
+    // 执行深度 Header 解析与业务初始化
     if (st.ok()) {
         st = _on_header(req, ctx);
         LOG(INFO) << "finished to handle HTTP header, " << ctx->brief();
     }
     if (!st.ok()) {
+        // 将失败的状态码/错误信息（st）转移赋值给上下文的 ctx->status
         ctx->status = std::move(st);
         {
             std::unique_lock<std::mutex> lock1(ctx->_send_reply_lock);
@@ -286,12 +294,15 @@ int StreamLoadAction::on_header(HttpRequest* req) {
 
 Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<StreamLoadContext> ctx) {
     // auth information
+    // 1. HTTP Basic Auth 认证解析
     if (!parse_basic_auth(*http_req, &ctx->auth)) {
         LOG(WARNING) << "parse basic authorization failed." << ctx->brief();
         return Status::NotAuthorized("no valid Basic authorization");
     }
 
     // get format of this put
+    // 解析数据格式与压缩类型
+    // 获取请求头中的 format 字段（例如 csv、json、parquet、csv_with_names 等）。
     std::string format_str = http_req->header(HTTP_FORMAT_KEY);
     if (iequal(format_str, BeConsts::CSV_WITH_NAMES) ||
         iequal(format_str, BeConsts::CSV_WITH_NAMES_AND_TYPES)) {
@@ -299,6 +310,8 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<Strea
         //treat as CSV
         format_str = BeConsts::CSV;
     }
+    // 调用工具函数 LoadUtil::parse_format，根据 format_str 和请求头中的 compress_type（如 gzip、bz2、lz4 等），
+    // 转译并设置 ctx->format（文件格式枚举）和 ctx->compress_type（压缩类型枚举）
     LoadUtil::parse_format(format_str, http_req->header(HTTP_COMPRESS_TYPE), &ctx->format,
                            &ctx->compress_type);
     if (ctx->format == TFileFormatType::FORMAT_UNKNOWN) {
@@ -307,25 +320,32 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<Strea
     }
 
     // check content length
+    // 校验请求体大小限制（Content-Length / Body Size）
     ctx->body_bytes = 0;
+    // 从 BE 配置项 config::streaming_load_max_mb 读取常规（CSV 等）单次流式导入的最大允许兆字节数（MB），并转换为字节数（csv_max_body_bytes）
     const auto csv_max_body_mb = config::streaming_load_max_mb;
     size_t csv_max_body_bytes = csv_max_body_mb * MEBIBYTE;
+    // 从 BE 配置项 config::streaming_load_json_max_mb 读取 JSON 格式单次导入的最大允许兆字节数（MB），并转换为字节数（json_max_body_bytes）
     const auto json_max_body_mb = config::streaming_load_json_max_mb;
     size_t json_max_body_bytes = json_max_body_mb * MEBIBYTE;
+    // 检查请求头中是否包含 read_json_by_line。若为 true，说明 JSON 数据按行分割（像 CSV 一样流式处理），可以免受单大对象 JSON 内存限制。
     bool read_json_by_line = false;
     if (!http_req->header(HTTP_READ_JSON_BY_LINE).empty()) {
         if (iequal(http_req->header(HTTP_READ_JSON_BY_LINE), "true")) {
             read_json_by_line = true;
         }
     }
+    // 检查 HTTP 请求头中是否传了 Content-Length
     if (!http_req->header(HttpHeaders::CONTENT_LENGTH).empty()) {
         try {
+        // 尝试将 Content-Length 字符串转换为长整型 int64_t 并存入 ctx->body_bytes。如果转换抛出异常，返回 InvalidArgument 错误。
             ctx->body_bytes = std::stol(http_req->header(HttpHeaders::CONTENT_LENGTH));
         } catch (const std::exception& e) {
             return Status::InvalidArgument("invalid HTTP header CONTENT_LENGTH={}: {}",
                                            http_req->header(HttpHeaders::CONTENT_LENGTH), e.what());
         }
         // json max body size
+        // 若格式为 JSON 且没有开启 read_json_by_line，则判断 Content-Length 是否超过 json_max_body_bytes。如果超过限制，返回 EXCEEDED_LIMIT 错误（提示提示可通过调整 streaming_load_json_max_mb 配置放大额度）。
         if ((ctx->format == TFileFormatType::FORMAT_JSON) &&
             (ctx->body_bytes > json_max_body_bytes) && !read_json_by_line) {
             return Status::Error<ErrorCode::EXCEEDED_LIMIT>(
@@ -336,6 +356,7 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<Strea
                     json_max_body_bytes, json_max_body_mb);
         }
         // csv max body size
+        // 对于非 JSON 或开启了行读取的场景，校验 Content-Length 是否超过了 csv_max_body_bytes（常规最大限制）。超过则打印 Warning 并返回 EXCEEDED_LIMIT 错误。
         else if (ctx->body_bytes > csv_max_body_bytes) {
             LOG(WARNING) << "body exceed max size." << ctx->brief();
             return Status::Error<ErrorCode::EXCEEDED_LIMIT>(
@@ -351,12 +372,14 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<Strea
                 evhttp_request_get_connection(http_req->get_evhttp_request()), csv_max_body_bytes);
 #endif
     }
-
+    // 4. 传输编码校验（Chunked 协议合规检查）
+    // 检查请求头 Transfer-Encoding 中是否包含 chunked 关键字。若包含，将 ctx->is_chunked_transfer 置为 true。
     if (!http_req->header(HttpHeaders::TRANSFER_ENCODING).empty()) {
         if (http_req->header(HttpHeaders::TRANSFER_ENCODING).find(CHUNK) != std::string::npos) {
             ctx->is_chunked_transfer = true;
         }
     }
+    // 检查异常组合 1：既没有提供 Content-Length，又没有设置 Transfer-Encoding: chunked。HTTP 无法确定边界，打印 Warning 并返回 InvalidArgument 错误。
     if (UNLIKELY((http_req->header(HttpHeaders::CONTENT_LENGTH).empty() &&
                   !ctx->is_chunked_transfer))) {
         LOG(WARNING) << "content_length is empty and transfer-encoding!=chunked, please set "
@@ -364,13 +387,14 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<Strea
         return Status::InvalidArgument(
                 "content_length is empty and transfer-encoding!=chunked, please set content_length "
                 "or transfer-encoding=chunked");
+    // 检查异常组合 2：同时设置了 Content-Length 和 Transfer-Encoding: chunked。这违反 HTTP 标准规范，打印 Warning 并返回 InvalidArgument 错误。
     } else if (UNLIKELY(!http_req->header(HttpHeaders::CONTENT_LENGTH).empty() &&
                         ctx->is_chunked_transfer)) {
         LOG(WARNING) << "please do not set both content_length and transfer-encoding";
         return Status::InvalidArgument(
                 "please do not set both content_length and transfer-encoding");
     }
-
+    // 5. 解析 Timeout 与 Comment 参数
     if (!http_req->header(HTTP_TIMEOUT).empty()) {
         ctx->timeout_second = DORIS_TRY(safe_stoi(http_req->header(HTTP_TIMEOUT), HTTP_TIMEOUT));
     }
@@ -378,16 +402,20 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<Strea
         ctx->load_comment = http_req->header(HTTP_COMMENT);
     }
     // begin transaction
+    // 6. 开启导入事务（Begin Transaction）
     if (!ctx->group_commit) {
         int64_t begin_txn_start_time = MonotonicNanos();
+        // 通过全局执行环境中的 stream_load_executor 向 FE 发起 RPC，开启一个 Doris 导入事务（生成 Transaction ID 并关联 Label）。若开启失败，利用 RETURN_IF_ERROR 宏直接返回错误。
         RETURN_IF_ERROR(_exec_env->stream_load_executor()->begin_txn(ctx.get()));
         ctx->begin_txn_cost_nanos = MonotonicNanos() - begin_txn_start_time;
+        // 降级防线检查。如果向 FE 开启事务的过程中，FE 返回或动态协商判定该请求需要转为 group_commit 模式，则在此处补做 WAL 磁盘空间检查（_check_wal_space）。
         if (ctx->group_commit) {
             RETURN_IF_ERROR(_check_wal_space(ctx->group_commit_mode, ctx->body_bytes));
         }
     }
 
     // process put file
+    // 提交处理 Pipeline（Process Put）
     return _process_put(http_req, ctx);
 }
 
@@ -446,13 +474,17 @@ void StreamLoadAction::free_handler_ctx(std::shared_ptr<void> param) {
     ctx->exec_env()->new_load_stream_mgr()->remove(ctx->id);
     streaming_load_current_processing->increment(-1);
 }
-
+// 主要负责接收和解析 HTTP Stream Load 请求参数，将其组装成 Thrift 结构体发送给 Frontend (FE) 进行导入执行计划（Plan）的生成，并根据导入模式（内存管道流式处理还是落盘处理）初始化管道并启动执行。
 Status StreamLoadAction::_process_put(HttpRequest* http_req,
                                       std::shared_ptr<StreamLoadContext> ctx) {
     // Now we use stream
+    // 1. 判断是否使用流式传输 (Streaming)
+    // 根据导入的数据格式（如 CSV, JSON, Parquet, ORC 等），检查该格式是否支持边接收 HTTP Body 边解析的“流式传输”。结果写入 ctx->use_streaming。
     ctx->use_streaming = LoadUtil::is_format_support_streaming(ctx->format);
 
     // put request
+    // 2. 初始化 Thrift 请求并填充基础元数据
+    // 创建一个 RPC 请求对象 TStreamLoadPutRequest（发送给 FE），将 ctx 中解析好的认证信息、数据库名、表名、事务 ID (txnId)、数据格式、压缩类型、Header 类型以及全局唯一导入 ID (loadId) 填充进去。
     TStreamLoadPutRequest request;
     set_request_auth(&request, ctx->auth);
     request.db = ctx->db;
@@ -462,6 +494,7 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     request.__set_compress_type(ctx->compress_type);
     request.__set_header_type(ctx->header_type);
     request.__set_loadId(ctx->id.to_thrift());
+    // 3. 分流处理：流式 Pipe 处理 vs 本地文件落盘处理
     if (ctx->use_streaming) {
         std::shared_ptr<io::StreamLoadPipe> pipe;
         if (ctx->is_chunked_transfer) {
@@ -474,10 +507,12 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
                     MIN_CHUNK_SIZE /* min_chunk_size */, ctx->body_bytes /* total_length */);
         }
         request.fileType = TFileType::FILE_STREAM;
+        // 将 pipe 绑定到 ctx 上，并将 ctx 注册到 BE 的 NewLoadStreamMgr 管理器中，以便后续 HTTP 读线程写入数据时能找到对应的 Pipe。
         ctx->body_sink = pipe;
         ctx->pipe = pipe;
         RETURN_IF_ERROR(_exec_env->new_load_stream_mgr()->put(ctx->id, ctx));
     } else {
+        // 若不支持流式（如部分复杂格式），数据需要先下载并落盘到本地。
         RETURN_IF_ERROR(_data_saved_path(http_req, &request.path, ctx->body_bytes));
         auto file_sink = std::make_shared<MessageBodyFileSink>(request.path);
         RETURN_IF_ERROR(file_sink->open());
@@ -487,6 +522,8 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         ctx->body_sink = file_sink;
         ctx->data_saved_path = request.path;
     }
+    // 4. 解析 HTTP Headers 并设置到 RPC Request
+    // 提取列映射与转换规则 (columns)、过滤条件 (where)、列分隔符 (column_separator)、行分隔符 (line_delimiter)。
     if (!http_req->header(HTTP_COLUMNS).empty()) {
         request.__set_columns(http_req->header(HTTP_COLUMNS));
     }
@@ -499,6 +536,7 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     if (!http_req->header(HTTP_LINE_DELIMITER).empty()) {
         request.__set_line_delimiter(http_req->header(HTTP_LINE_DELIMITER));
     }
+    // 提取包围符 (enclose) 和转义符 (escape)。两者都要求必须是单字符，否则返回 InvalidArgument 报错。
     if (!http_req->header(HTTP_ENCLOSE).empty() && !http_req->header(HTTP_ENCLOSE).empty()) {
         const auto& enclose_str = http_req->header(HTTP_ENCLOSE);
         if (enclose_str.length() != 1) {
@@ -515,6 +553,7 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         }
         request.__set_escape(http_req->header(HTTP_ESCAPE)[0]);
     }
+    // 解析目标分区。不允许同时指定普通分区 (partitions) 和临时分区 (temporary_partitions)，校验冲突后设置对应的标志。
     if (!http_req->header(HTTP_PARTITIONS).empty()) {
         request.__set_partitions(http_req->header(HTTP_PARTITIONS));
         request.__set_isTempPartition(false);
@@ -531,11 +570,13 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
                     "Can not specify both partitions and temporary partitions");
         }
     }
+    // 设置是否开启“负导入”（聚合模型用于做数据抵扣/撤销）
     if (!http_req->header(HTTP_NEGATIVE).empty() && http_req->header(HTTP_NEGATIVE) == "true") {
         request.__set_negative(true);
     } else {
         request.__set_negative(false);
     }
+    // 解析严格模式 (strict_mode)。开启后会对列类型转换失败等错误进行更严格的清洗检查。
     bool strictMode = false;
     if (!http_req->header(HTTP_STRICT_MODE).empty()) {
         if (iequal(http_req->header(HTTP_STRICT_MODE), "false")) {
@@ -548,11 +589,13 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         request.__set_strictMode(strictMode);
     }
     // timezone first. if not, try system time_zone
+    // 解析时区参数 (timezone 或 time_zone)。
     if (!http_req->header(HTTP_TIMEZONE).empty()) {
         request.__set_timezone(http_req->header(HTTP_TIMEZONE));
     } else if (!http_req->header(HTTP_TIME_ZONE).empty()) {
         request.__set_timezone(http_req->header(HTTP_TIME_ZONE));
     }
+    // 解析单个导入任务的执行内存限制 (exec_mem_limit)。
     if (!http_req->header(HTTP_EXEC_MEM_LIMIT).empty()) {
         try {
             request.__set_execMemLimit(std::stoll(http_req->header(HTTP_EXEC_MEM_LIMIT)));
@@ -560,12 +603,14 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
             return Status::InvalidArgument("Invalid mem limit format, {}", e.what());
         }
     }
+    // 解析 JSON 格式导入专属的 jsonpaths（解析路径）和 json_root（根节点）。
     if (!http_req->header(HTTP_JSONPATHS).empty()) {
         request.__set_jsonpaths(http_req->header(HTTP_JSONPATHS));
     }
     if (!http_req->header(HTTP_JSONROOT).empty()) {
         request.__set_json_root(http_req->header(HTTP_JSONROOT));
     }
+    // 解析 JSON 解析方式：strip_outer_array（是否裁剪最外层数组 []）和 read_json_by_line（按行读取 JSON，即 NDJSON）。若均未配置，默认开启按行读取 JSON。
     if (!http_req->header(HTTP_STRIP_OUTER_ARRAY).empty()) {
         if (iequal(http_req->header(HTTP_STRIP_OUTER_ARRAY), "true")) {
             request.__set_strip_outer_array(true);
@@ -575,7 +620,7 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     } else {
         request.__set_strip_outer_array(false);
     }
-
+    // 解析 JSON 参数：数字是否当作字符串解析 (num_as_string) 以及是否启用模糊解析模式 (fuzzy_parse，提高 JSON 解析吞吐量)。
     if (!http_req->header(HTTP_READ_JSON_BY_LINE).empty()) {
         if (iequal(http_req->header(HTTP_READ_JSON_BY_LINE), "true")) {
             request.__set_read_json_by_line(true);
@@ -610,12 +655,12 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     } else {
         request.__set_fuzzy_parse(false);
     }
-
+    // 设置 Sequence 列列名（针对 Unique Key 模型的 Sequence 列功能，控制版本更新顺序）。
     if (!http_req->header(HTTP_FUNCTION_COLUMN + "." + HTTP_SEQUENCE_COL).empty()) {
         request.__set_sequence_col(
                 http_req->header(HTTP_FUNCTION_COLUMN + "." + HTTP_SEQUENCE_COL));
     }
-
+    // 解析数据发送批次并行度 (send_batch_parallelism) 以及是否将数据全部导入到单个 Tablet (load_to_single_tablet)。
     if (!http_req->header(HTTP_SEND_BATCH_PARALLELISM).empty()) {
         int parallelism = DORIS_TRY(safe_stoi(http_req->header(HTTP_SEND_BATCH_PARALLELISM),
                                               HTTP_SEND_BATCH_PARALLELISM));
@@ -629,11 +674,13 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
             request.__set_load_to_single_tablet(false);
         }
     }
-
+    // 设置任务超时时间 (timeout) 及 Thrift RPC 调用的超时阈值。
     if (ctx->timeout_second != -1) {
         request.__set_timeout(ctx->timeout_second);
     }
     request.__set_thrift_rpc_timeout_ms(config::thrift_rpc_timeout_ms);
+    // 解析 merge_type（数据合并类型：APPEND、DELETE、MERGE）
+    // 强制校验逻辑：如果 merge_type 是 MERGE，必须提供 delete_condition；反之如果不为 MERGE 则不能提供 delete_condition。
     TMergeType::type merge_type = TMergeType::APPEND;
     StringCaseMap<TMergeType::type> merge_type_map = {{"APPEND", TMergeType::APPEND},
                                                       {"DELETE", TMergeType::DELETE},
@@ -688,7 +735,9 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
             request.__set_enable_profile(false);
         }
     }
-
+    // 5. 主键模型局部更新 (Partial Update) 逻辑校验
+    // 解析 Unique Key 表的更新模式 (unique_key_update_mode)。特别地，对于 灵活列局部更新 (UPDATE_FLEXIBLE_COLUMNS)，进行了极其严格的互斥性与合法性检查：
+    // 仅支持 JSON 格式输入；
     if (!http_req->header(HTTP_UNIQUE_KEY_UPDATE_MODE).empty()) {
         static const StringCaseMap<TUniqueKeyUpdateMode::type> unique_key_update_mode_map = {
                 {"UPSERT", TUniqueKeyUpdateMode::UPSERT},
@@ -757,7 +806,7 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
             request.__set_partial_update(true);
         }
     }
-
+    // 设置局部更新遇到新 Key 时的处理策略（APPEND：直接追加新行；ERROR：报错提示）。
     if (!http_req->header(HTTP_PARTIAL_UPDATE_NEW_ROW_POLICY).empty()) {
         static const std::map<std::string, TPartialUpdateNewRowPolicy::type> policy_map {
                 {"APPEND", TPartialUpdateNewRowPolicy::APPEND},
@@ -775,12 +824,14 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         }
         request.__set_partial_update_new_key_policy(it->second);
     }
-
+    // 6. 内存表与分布式计算参数设置
     if (!http_req->header(HTTP_MEMTABLE_ON_SINKNODE).empty()) {
+        // memtable_on_sink_node：控制是否在 Data Sink 节点构建 MemTable（减少节点间 RPC 传输）。
         bool value = iequal(http_req->header(HTTP_MEMTABLE_ON_SINKNODE), "true");
         request.__set_memtable_on_sink_node(value);
     }
     if (!http_req->header(HTTP_LOAD_STREAM_PER_NODE).empty()) {
+        // stream_per_node：每个目标 BE 建立的数据流连接数量。
         int stream_per_node = DORIS_TRY(
                 safe_stoi(http_req->header(HTTP_LOAD_STREAM_PER_NODE), HTTP_LOAD_STREAM_PER_NODE));
         request.__set_stream_per_node(stream_per_node);
@@ -792,6 +843,7 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     // Keep cloud_cluster for compatibility with old FEs during rolling upgrade. New FEs use
     // backend_id below to bind planning to the compute group of the receiving BE.
     if (!http_req->header(HTTP_COMPUTE_GROUP).empty()) {
+        // cloud_cluster/compute_group：存算分离架构下绑定的计算集群/计算组。
         request.__set_cloud_cluster(http_req->header(HTTP_COMPUTE_GROUP));
     } else if (!http_req->header(HTTP_CLOUD_CLUSTER).empty()) {
         request.__set_cloud_cluster(http_req->header(HTTP_CLOUD_CLUSTER));
@@ -811,6 +863,9 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
 
 #ifndef BE_TEST
     // plan this load
+    // 7. 发送 RPC 请求至 Master FE 生成导入执行计划 (Plan)
+    // 获取 Master FE 地址，通过 Thrift 发送 streamLoadPut RPC 请求。FE 接收到请求后会进行权限校验、表结构元数据获取、分片分配并生成 Query Plan（ Fragment 执行计划），
+    // 然后将结果返回写回 ctx->put_result 中。计时并记录 RPC 耗时。
     TNetworkAddress master_addr = _exec_env->cluster_info()->master_fe_addr;
     int64_t stream_load_put_start_time = MonotonicNanos();
     RETURN_IF_ERROR(ThriftRpcHelper::rpc<FrontendServiceClient>(
@@ -822,6 +877,8 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
 #else
     ctx->put_result = k_stream_load_put_result;
 #endif
+    // 8. 校验 Plan 状态与参数调整
+    // 检查 FE 生成 Plan 的状态，失败则记录日志并提前退出；
     Status plan_status(Status::create(ctx->put_result.status));
     if (!plan_status.ok()) {
         LOG(WARNING) << "plan streaming load failed. errmsg=" << plan_status << ctx->brief();
@@ -833,6 +890,8 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     if (config::is_cloud_mode() && ctx->two_phase_commit && ctx->is_mow_table()) {
         return Status::NotSupported("stream load 2pc is unsupported for mow table");
     }
+    // 9. 针对 Async Group Commit 计算 Content-Length
+    // 如果是异步 Group Commit 模式，解析 Content-Length 并估算解压后的数据体大小（若被压缩则简单乘以 3），供分配 WAL (Write-Ahead Log) 预留空间使用。
     if (iequal(ctx->group_commit_mode, ASYNC_MODE)) {
         // FIXME find a way to avoid chunked stream load write large WALs
         size_t content_length = 0;
@@ -855,10 +914,12 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
                 << apache::thrift::ThriftDebugString(ctx->put_result.pipeline_params);
     // if we not use streaming, we must download total content before we begin
     // to process this load
+    // 如果不支持流式传输，函数在此结束返回 Status::OK()，后方的 HTTP 接收逻辑会继续将全部 Body 写入本地文件，写完后再触发实际导入。
     if (!ctx->use_streaming) {
         return Status::OK();
     }
-
+    // 10. 启动执行计划或返回
+    // 如果是流式传输，直接调用 StreamLoadExecutor 开始在当前 BE 上执行由 FE 返回的 Pipeline Plan Fragment。同时注册回调匿名函数 _on_finish，当导入任务完成（无论成功还是失败）时回调以响应 HTTP 客户端。
     TPipelineFragmentParamsList mocked;
     return _exec_env->stream_load_executor()->execute_plan_fragment(
             ctx, mocked, [http_req, this](std::shared_ptr<StreamLoadContext> ctx) {
