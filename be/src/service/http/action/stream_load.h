@@ -37,6 +37,7 @@ class HttpRequest;
 // 鉴权与参数解析：提取 HTTP Header 中的认证信息（如 Basic Auth）、目标数据库/表名、导入格式（CSV, JSON 等）、过滤条件（Where）等配置，并封装进 StreamLoadContext（流导入上下文）。
 // 元数据与路由校验：向 FE（Frontend）提交请求或校验事务，确认导入的目标 Pipe / Channel，或者判断是否可以走 Group Commit（组合提交）模式。
 // 数据传输与下发：将通过 HTTP Chunk 分批到达的数据写入 BE 内存缓冲、WAL（Write-Ahead Log，如 Group Commit 场景）或下发给具体的数据接收 Pipeline/Fragment 引擎进行写盘。
+
 class StreamLoadAction : public HttpHandler {
 public:
     StreamLoadAction(ExecEnv* exec_env);

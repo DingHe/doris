@@ -246,21 +246,30 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
             kafkaDefaultOffSet = convertedCustomProperties.remove(KafkaConfiguration.KAFKA_DEFAULT_OFFSETS.getName());
         }
     }
-
+    // int currentConcurrentTaskNum   作用：表示当前应该切分并发执行的任务数量。
+    // 背景：该数值通常由系统的调度器（RoutineLoadScheduler）根据集群当前的可用资源、用户设置的期望并发数（desireTaskConcurrentNum）以及 Kafka Partition 的总数综合计算得出。
+    // 它决定了要把当前作业的 Kafka 消费分片均分到多少个具体的子任务（Task）中并行处理。
     @Override
     public void divideRoutineLoadJob(int currentConcurrentTaskNum) throws UserException {
         List<RoutineLoadTaskInfo> result = new ArrayList<>();
         writeLock();
         try {
+            // 检查当前作业的状态是否为 NEED_SCHEDULE（需要调度状态）。只有处于该状态的作业才需要进行任务切分和初始化并发分配。
             if (state == JobState.NEED_SCHEDULE) {
                 // divide kafkaPartitions into tasks
+                // 根据传入的并发数 currentConcurrentTaskNum，外层循环构建相应数量的子任务。每个循环迭代对应生成一个并行的 KafkaTaskInfo 任务。
                 for (int i = 0; i < currentConcurrentTaskNum; i++) {
+                    // 为当前子任务创建一个 Kafka 进度映射表（taskKafkaProgress，Key 是 Kafka Partition ID，Value 是该分区当前的消费 Offset）。
                     Map<Integer, Long> taskKafkaProgress = Maps.newHashMap();
+                    // 使用步长为 currentConcurrentTaskNum 的 for 循环（如 j = i; j < size; j += concurrentNum），
+                    // 采用轮询（Round-Robin）方式将该 Job 监听的所有 Kafka 分区（currentKafkaPartitions）平均分配给各个并发任务。
                     for (int j = i; j < currentKafkaPartitions.size(); j = j + currentConcurrentTaskNum) {
                         int kafkaPartition = currentKafkaPartitions.get(j);
+                        // 从全局进度对象 progress 中获取该分区当前的消费 Offset（偏移量），并绑定到当前子任务的进度中。这样每个任务就明确了自己需要消费哪些 Partition 以及从哪个 Offset 开始。
                         taskKafkaProgress.put(kafkaPartition,
                                 ((KafkaProgress) progress).getOffsetByPartition(kafkaPartition));
                     }
+                    // 实例化一个具体的 Kafka 导入任务对象。传入随机 UUID 作为任务唯一标识、当前作业的 id、超时时间（毫秒单位，由秒乘以 1000 转换）、分配给该任务的 Kafka 进度字典、是否为多表导入等参数。
                     KafkaTaskInfo kafkaTaskInfo = new KafkaTaskInfo(UUID.randomUUID(), id,
                             getTimeout() * 1000, taskKafkaProgress, isMultiTable(), -1, false);
                     routineLoadTaskInfoList.add(kafkaTaskInfo);

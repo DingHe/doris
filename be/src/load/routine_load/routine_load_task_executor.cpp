@@ -250,16 +250,19 @@ Status RoutineLoadTaskExecutor::get_kafka_real_offsets_for_partitions(
     }
     return st;
 }
-
+// const TRoutineLoadTask& task  指向从 FE 端通过 Thrift RPC 发送过来的例行导入任务结构体（TRoutineLoadTask）。它包含了该任务的所有核心配置和元数据，如任务唯一 ID (task.id)、作业 ID (task.job_id)、事务 ID (task.txn_id)、目标数据库与表、Kafka 消费位点（Offset）、管道执行参数（pipeline_params）以及数据源类型等。
+//
 Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
     std::unique_lock<std::mutex> l(_lock);
     // check if already submitted
+    // 检查当前 BE 节点的 _task_map 中是否已经存在相同 ID 的任务。如果已经存在，说明该任务已被提交过，直接打印日志并返回 Status::OK()（保证重复提交的幂等性）。
     if (_task_map.find(task.id) != _task_map.end()) {
         LOG(INFO) << "routine load task " << UniqueId(task.id) << " has already been submitted";
         return Status::OK();
     }
 
     // check task num limit
+    // 查当前正在运行的任务总数是否已经达到了配置的最大限制（config::max_routine_load_thread_pool_size）。如果超限，拒绝该任务并返回 Status::TooManyTasks 错误码，触发 FE 层的降级重试。
     if (_task_map.size() >= config::max_routine_load_thread_pool_size) {
         LOG(INFO) << "too many tasks in thread pool. reject task: " << UniqueId(task.id)
                   << ", job id: " << task.job_id
@@ -270,6 +273,7 @@ Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
     }
 
     // check memory limit
+    // 检查当前 BE 的导入内存是否超限。若超限则拒绝任务并返回 Status::MemoryLimitExceeded。
     std::string reason;
     DBUG_EXECUTE_IF("RoutineLoadTaskExecutor.submit_task.memory_limit", {
         _reach_memory_limit(reason);
@@ -282,6 +286,8 @@ Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
     }
 
     // create the context
+    // 创建一个基于智能指针的 StreamLoadContext（流式导入上下文对象）
+    // 并将任务的基础属性（如类型、作业 ID、事务 ID、库名、表名、Label、权限验证凭证等）从 Thrift 结构体中复制映射到上下文中。
     std::shared_ptr<StreamLoadContext> ctx = std::make_shared<StreamLoadContext>(_exec_env);
     ctx->load_type = TLoadType::ROUTINE_LOAD;
     ctx->load_src_type = task.type;
@@ -344,7 +350,7 @@ Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
             }
         }
     }
-
+    // 将构造好的执行结果赋予上下文；设置文件格式；将 need_rollback 设为 true（因为事务已在 FE 端开启，若 BE 执行出错必须回滚事务）；设置最大容忍错误率 max_filter_ratio 为 1.0。
     ctx->put_result = put_result;
     if (task.__isset.format) {
         ctx->format = task.format;
@@ -355,6 +361,7 @@ Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
     ctx->max_filter_ratio = 1.0;
 
     // set source related params
+    // 按数据源类型初始化具体配置
     switch (task.type) {
     case TLoadSourceType::KAFKA:
         ctx->kafka_info.reset(new KafkaLoadInfo(task.kafka_load_info));
@@ -372,6 +379,8 @@ Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
     _task_map[ctx->id] = ctx;
 
     // offer the task to thread pool
+    // 向线程池投递异步任务
+    // 将任务提交到内部线程池异步执行。
     if (!_thread_pool->submit_func(std::bind<void>(
                 &RoutineLoadTaskExecutor::exec_task, this, ctx, &_data_consumer_pool,
                 [this](std::shared_ptr<StreamLoadContext> ctx) {
@@ -409,9 +418,10 @@ bool RoutineLoadTaskExecutor::_reach_memory_limit(std::string& reason) {
     }
     return false;
 }
-
+// DataConsumerPool* consumer_pool 数据消费者池指针。用于为当前任务获取、复用和归还与外部流式存储（如 Kafka 消费客户端）交互的连接/消费者实例。
 void RoutineLoadTaskExecutor::exec_task(std::shared_ptr<StreamLoadContext> ctx,
                                         DataConsumerPool* consumer_pool, ExecFinishCallback cb) {
+// 定义了两个局部错误处理宏。用于简化状态检查：如果执行某条语句返回的状态（_status_）不成功且不是发布超时（PUBLISH_TIMEOUT），则自动调用 err_handler 记录错误、触发回调 cb(ctx) 并提前退出。多表错误宏还会额外处理 load_status_future 的同步获取。
 #define HANDLE_ERROR(stmt, err_msg)                                        \
     do {                                                                   \
         Status _status_ = (stmt);                                          \
@@ -435,23 +445,27 @@ void RoutineLoadTaskExecutor::exec_task(std::shared_ptr<StreamLoadContext> ctx,
             return;                                                        \
         }                                                                  \
     } while (false);
-
+    // 标志着当前例行导入子任务正式开始在 BE 端执行。
     LOG(INFO) << "begin to execute routine load task: " << ctx->brief();
 
     // create data consumer group
+    // 从数据消费者池中为当前任务获取对应的消费者组（DataConsumerGroup）。若获取失败则通过宏触发错误处理。
     std::shared_ptr<DataConsumerGroup> consumer_grp;
     HANDLE_ERROR(consumer_pool->get_consumer_grp(ctx, &consumer_grp), "failed to get consumers");
 
     // create and set pipe
     std::shared_ptr<io::StreamLoadPipe> pipe;
+    // Kafka 数据源管道初始化与分区指派
     switch (ctx->load_src_type) {
     case TLoadSourceType::KAFKA: {
+        // 判断如果为多表导入（is_multi_table），创建 MultiTablePipe；否则创建单表 KafkaConsumerPipe。
         if (ctx->is_multi_table) {
             LOG(INFO) << "recv single-stream-multi-table request, ctx: " << ctx->brief();
             pipe = std::make_shared<io::MultiTablePipe>(ctx);
         } else {
             pipe = std::make_shared<io::KafkaConsumerPipe>();
         }
+        // 为消费者组指派对应的 Kafka Topic 和 Partition 分区。若出错则报错退出。
         Status st = std::static_pointer_cast<KafkaDataConsumerGroup>(consumer_grp)
                             ->assign_topic_partitions(ctx);
         if (!st.ok()) {
@@ -488,12 +502,14 @@ void RoutineLoadTaskExecutor::exec_task(std::shared_ptr<StreamLoadContext> ctx,
         return;
     }
     }
+    // 将创建好的数据流管道（Pipe）同时赋值给上下文的 body_sink 和 pipe。
     ctx->body_sink = pipe;
     ctx->pipe = pipe;
 
     // must put pipe before executing plan fragment
+    // 将当前任务的上下文注册到全局的 new_load_stream_mgr（新版流式加载管理器）中，必须在执行导入计划前放入。
     HANDLE_ERROR(_exec_env->new_load_stream_mgr()->put(ctx->id, ctx), "failed to add pipe");
-
+    // 对于普通单表导入，调用流式加载执行器的 execute_plan_fragment 异步启动管道执行计划（生产环境中 BE_TEST 未定义）。
     if (!ctx->is_multi_table) {
         // only for normal load, single-stream-multi-table load will be planned during consuming
 #ifndef BE_TEST
@@ -506,7 +522,8 @@ void RoutineLoadTaskExecutor::exec_task(std::shared_ptr<StreamLoadContext> ctx,
         HANDLE_ERROR(_execute_plan_for_test(ctx), "test failed");
 #endif
     }
-
+    // 启动消费与数据拉取
+    // 若为多表导入：启动消费者组、动态请求并执行多个表的导入计划、最后完成 Pipe。
     pipe = std::static_pointer_cast<io::StreamLoadPipe>(ctx->body_sink);
 
     // Multi-table currently only supported for Kafka
@@ -529,25 +546,31 @@ void RoutineLoadTaskExecutor::exec_task(std::shared_ptr<StreamLoadContext> ctx,
         multi_table_pipe->handle_consume_finished();
         HANDLE_MULTI_TABLE_ERROR(pipe->finish(), "finish multi table task failed");
     } else {
+    // 若为普通单表导入：调用 consumer_grp->start_all(ctx, pipe) 启动消费者组开始从外部拉取数据并写入 Pipe（此过程可能会阻塞一段时间）。
         // start to consume, this may block a while
         HANDLE_ERROR(consumer_grp->start_all(ctx, pipe), "consuming failed");
     }
 
     // wait for all consumers finished
+    // 阻塞等待整个批次数据消费与导入的最终状态结果。
     HANDLE_ERROR(ctx->load_status_future.get(), "consume failed");
-
+    // 计算当前批次的导入耗时（毫秒）。
     ctx->load_cost_millis = UnixMillis() - ctx->start_millis;
 
     // return the consumer back to pool
     // call this before commit txn, in case the next task can come very fast
+    // 将消费者组归还给 consumer_pool（在提交事务之前归还，以防下一个任务由于没有可用消费者而被阻塞）。
     consumer_pool->return_consumers(consumer_grp.get());
 
     // commit txn
     int64_t commit_and_publish_start_time = MonotonicNanos();
+    // 向 FE 提交当前批次的事务，并统计并记录事务提交与发布阶段的延迟指标。
     HANDLE_ERROR(_exec_env->stream_load_executor()->commit_txn(ctx.get()), "commit failed");
     g_routine_load_commit_and_publish_latency_ms
             << (MonotonicNanos() - commit_and_publish_start_time) / 1000000;
     // commit kafka offset
+    // 当事务提交成功后，获取 Kafka 消费者实例，将成功消费并提交的各 Partition 消费位点（cmt_offset + 1，代表下一次要读的起始位置）构建为 librdkafka 的 TopicPartition 数组。
+    // 调用 Kafka 客户端的 commit 接口向 Kafka 集群提交 Offset。
     switch (ctx->load_src_type) {
     case TLoadSourceType::KAFKA: {
         std::shared_ptr<DataConsumer> consumer;

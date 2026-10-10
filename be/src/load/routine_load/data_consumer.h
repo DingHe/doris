@@ -46,7 +46,10 @@ namespace doris {
 
 template <typename T>
 class BlockingQueue;
-
+// 在 Doris 的例行导入（Routine Load，如 Kafka 或 Kinesis 导入）过程中，系统需要从外部流式数据源拉取数据。DataConsumer 的核心职责包括：
+// 统一数据消费抽象：作为顶层抽象类，它定义了所有具体数据源消费者（如 Kafka 消费者 KafkaDataConsumer）所必须实现的通用生命周期接口（如 init、consume、cancel、reset、match）。
+// 连接池复用与管理：通过 last_visit_time、reset() 等机制，支持将消费者实例缓存在对象池（DataConsumerPool）中进行高效复用，避免频繁创建和销毁带来的网络与对象开销。
+// 状态与归属追踪：维护消费者的唯一标识（_id）、所属消费者组标识（_grp_id）、初始化状态、取消状态以及并发访问锁。
 class DataConsumer {
 public:
     DataConsumer()
@@ -60,17 +63,22 @@ public:
     virtual ~DataConsumer() {}
 
     // init the consumer with the given parameters
+    // 根据传入的流式导入上下文 ctx（包含 Topic、Broker 地址、认证信息等参数）初始化底层连接或客户端。
     virtual Status init(std::shared_ptr<StreamLoadContext> ctx) = 0;
     // start consuming
+    // 启动数据拉取循环，将从外部流式源（如 Kafka）读取的数据写入管道中。
     virtual Status consume(std::shared_ptr<StreamLoadContext> ctx) = 0;
     // cancel the consuming process.
     // if the consumer is not initialized, or the consuming
     // process is already finished, call cancel() will
     // return ERROR
+    // 用于强行中断或取消当前的消费过程。
     virtual Status cancel(std::shared_ptr<StreamLoadContext> ctx) = 0;
     // reset the data consumer before being reused
+    // 在消费者被对象池复用之前调用，用于清空上一轮任务残留的状态，使其恢复到可重新初始化的干净状态。
     virtual Status reset() = 0;
     // return true the if the consumer match the need
+    // 检查当前的消费者实例是否匹配给定导入上下文 ctx 的需求（例如检查集群地址、Topic 等是否一致），若匹配则返回 true，允许复用。
     virtual bool match(std::shared_ptr<StreamLoadContext> ctx) = 0;
 
     const UniqueId& id() { return _id; }
@@ -81,14 +89,21 @@ public:
     }
 
 protected:
+    // 当前数据消费者的全局唯一标识符（通过 UniqueId::gen_uid() 自动生成），用于在系统中追踪和识别该消费者实例。
     UniqueId _id;
+    // 所属消费者组的唯一标识符（关联到 DataConsumerGroup）。
     UniqueId _grp_id;
+    // 指示当前消费者是否已经归属于某个消费者组（当调用 set_grp() 时被设为 true）。
     bool _has_grp;
 
     // lock to protect the following bools
+    // 互斥锁。专门用于保护线程安全，防止多线程并发访问或修改内部的布尔状态（如 _init、_cancelled）及访问时间戳时发生竞态条件。
     std::mutex _lock;
+    // 指示该消费者是否已经成功完成初始化（init）。
     bool _init;
+    // 指示该消费者的消费过程是否已经被取消（cancel）。
     bool _cancelled;
+    // 用于记录该消费者最近一次被使用或访问的时间，通常在对象池（Consumer Pool）进行闲置超时清理时作为参考依据。
     time_t _last_visit_time;
 };
 

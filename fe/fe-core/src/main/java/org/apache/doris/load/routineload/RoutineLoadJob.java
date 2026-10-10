@@ -112,6 +112,14 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * The desireTaskConcurrentNum means that user expect the number of concurrent stream load
  * The routine load job support different streaming medium such as KAFKA
  */
+// RoutineLoadJob 是 Apache Doris 项目前端（FE）模块中用于定义和抽象例行导入作业（Routine Load Job）的基类。
+// 它是一个抽象类（Abstract Class），具体的流式数据源实现（如 Kafka 的 KafkaRoutineLoadJob 或 Kinesis 的 KinesisRoutineLoadJob）均继承自该类。
+// RoutineLoadJob 的核心职责是管理单个例行导入任务的全生命周期、配置参数、执行状态、进度追踪及事务回调。主要功能包括：
+// 状态机管理：维护作业的状态流转（如 NEED_SCHEDULE、RUNNING、PAUSED、STOPPED、CANCELLED）。
+// 作业属性配置：封装导入作业所需的各项参数（如并发数、批次大小、错误率限制、列分隔符、JSON/CSV 格式化属性、过滤条件等）。
+// 任务切分与调度抽象：定义作业如何切分为具体的导入任务（Task），支持超时任务的重新生成与调度。
+// 事务与回调处理：继承自 AbstractTxnStateChangeCallback，能够监听并处理导入事务的提交或取消状态。
+// 元数据持久化：实现 Writable 接口和 Gson 序列化机制，支持将作业元数据持久化到 Doris 的 EditLog 中。
 public abstract class RoutineLoadJob
         extends AbstractTxnStateChangeCallback
         implements Writable, LoadTaskInfo, GsonPostProcessable {
@@ -131,7 +139,7 @@ public abstract class RoutineLoadJob
     protected static final String STAR_STRING = "*";
 
     public static final String WORKLOAD_GROUP = "workload_group";
-
+    // 指示是否为多表导入作业。
     @Getter
     @Setter
     private boolean isMultiTable = false;
@@ -159,57 +167,78 @@ public abstract class RoutineLoadJob
     +-------------> |               |
     system error    +---------------+
     */
+    // 定义作业的生命周期状态
     public enum JobState {
+        // 需要调度。
         NEED_SCHEDULE,
+        // 运行中。
         RUNNING,
+        // 已暂停（可能是手动暂停或因错误率超限异常暂停）。
         PAUSED,
+        // 已停止（终态）。
         STOPPED,
+        // 已取消（终态）。
         CANCELLED;
 
         public boolean isFinalState() {
             return this == STOPPED || this == CANCELLED;
         }
     }
-
+    // 作业的全局唯一 ID。
     @SerializedName("id")
     protected long id;
+    // 作业名称（Label）。
     @SerializedName("n")
     protected String name;
+    // 所属的数据库 ID 和目标表 ID。
     @SerializedName("dbid")
     protected long dbId;
     @SerializedName("tbid")
     protected long tableId;
     // this code is used to verify be task request
+    // 用于校验 BE 端任务请求的权限码。
     protected long authCode;
     //    protected RoutineLoadDesc routineLoadDesc; // optional
+    // 分区信息、列映射描述等。
     protected PartitionNamesInfo partitionNamesInfo; // optional
     protected ImportColumnDescs columnDescs; // optional
+    // 预过滤表达式、WHERE 过滤条件和删除条件。
     protected Expr precedingFilter; // optional
     protected Expr whereExpr; // optional
+    // 文本解析的分隔符、包裹符、转义符及空字段处理。
     protected Separator columnSeparator; // optional
     protected Separator lineDelimiter;
+    // 用户期望的任务并发数。
     @SerializedName("dtcn")
     protected int desireTaskConcurrentNum; // optional
+    // 当前作业状态。
     @SerializedName("st")
     protected JobState state = JobState.NEED_SCHEDULE;
+    // 数据源类型（如 KAFKA）。
     @Getter
     @SerializedName("dsrc")
     protected LoadDataSourceType dataSourceType;
     // max number of error data in max batch rows * 10
     // maxErrorNum / (maxBatchRows * 10) = max error rate of routine load job
     // if current error rate is more than max error rate, the job will be paused
+    // 最大错误行数与最大错误率。
     @SerializedName("men")
     protected long maxErrorNum = DEFAULT_MAX_ERROR_NUM; // optional
     protected double maxFilterRatio = DEFAULT_MAX_FILTER_RATIO;
+    // 执行内存上限。
     protected long execMemLimit = DEFAULT_EXEC_MEM_LIMIT;
+    // 发送批次的并行度。
     protected int sendBatchParallelism = DEFAULT_SEND_BATCH_PARALLELISM;
+    // 是否导入到单 Tablet。
     protected boolean loadToSingleTablet = DEFAULT_LOAD_TO_SINGLE_TABLET;
     // include strict mode
+    // 作业的各类扩展属性（如时区、严格模式、Workload Group 等）。
     @SerializedName("jp")
     protected Map<String, String> jobProperties = Maps.newHashMap();
 
     // sessionVariable's name -> sessionVariable's value
     // we persist these sessionVariables due to the session is not available when replaying the job.
+    // 持久化的会话变量（如 SQL Mode）。
     @SerializedName("sv")
     protected Map<String, String> sessionVariables = Maps.newHashMap();
 
@@ -219,10 +248,13 @@ public abstract class RoutineLoadJob
      * If a task can consume data from source at rate of 10MB/s, and 500B a row,
      * then we can process 100MB for 10 secs, which is 200000 rows
      */
+    // 单个批次的最大执行时间间隔（默认 10 秒）。
     @SerializedName("mbis")
     protected long maxBatchIntervalS = DEFAULT_MAX_INTERVAL_SECOND;
+    // 单个批次的最大行数。
     @SerializedName("mbr")
     protected long maxBatchRows = DEFAULT_MAX_BATCH_ROWS;
+    // 单个批次的最大字节数（默认 1GB）。
     @SerializedName("mbsb")
     protected long maxBatchSizeBytes = DEFAULT_MAX_BATCH_SIZE;
 
@@ -235,6 +267,7 @@ public abstract class RoutineLoadJob
     protected boolean memtableOnSinkNode = false;
 
     protected int currentTaskConcurrentNum;
+    // 导入进度对象。
     @SerializedName("pg")
     protected RoutineLoadProgress progress;
 
@@ -251,10 +284,10 @@ public abstract class RoutineLoadJob
     protected long pauseTimestamp = -1;
     @SerializedName("ets")
     protected long endTimestamp = -1;
-
+    // 作业的统计信息（成功行数、错误行数等）。
     @SerializedName("js")
     protected RoutineLoadStatistic jobStatistic = new RoutineLoadStatistic();
-
+    // 当前归属于该作业运行中的任务列表。
     // The tasks belong to this job
     protected List<RoutineLoadTaskInfo> routineLoadTaskInfoList = Lists.newArrayList();
 
@@ -263,6 +296,7 @@ public abstract class RoutineLoadJob
     @SerializedName("ostmt")
     protected OriginStatement origStmt;
     // User who submit this job. Maybe null for the old version job(before v1.1)
+    // 提交该作业的用户身份。
     @SerializedName("ui")
     protected UserIdentity userIdentity;
 
@@ -276,9 +310,10 @@ public abstract class RoutineLoadJob
 
     // Save the latest 3 error log URLs in memory. The corresponding first error message
     // uses the same lifecycle and should not be persisted with the job.
+    // 内存中暂存的最近错误日志 URL 与第一条错误信息。
     private transient Queue<String> errorLogUrls = EvictingQueue.create(3);
     private transient String firstErrorMsg = "";
-
+    // 云模式下的计算集群标识。
     @SerializedName("ccid")
     private String cloudClusterId;
 
@@ -359,7 +394,7 @@ public abstract class RoutineLoadJob
             sessionVariables.put(SessionVariable.SQL_MODE, String.valueOf(SqlModeHelper.MODE_DEFAULT));
         }
     }
-
+    // 解析 CreateRoutineLoadInfo 中的各项可选参数（如并发数、批次大小、内存限制、CSV/JSON 文件格式属性、Workload Group 等）并填充到作业对象中。
     protected void setOptional(CreateRoutineLoadInfo info) throws UserException {
         setRoutineLoadDesc(info.getRoutineLoadDesc());
         if (info.getDesiredConcurrentNum() != -1) {
@@ -437,7 +472,7 @@ public abstract class RoutineLoadJob
             jobProperties.put(WORKLOAD_GROUP, info.getWorkloadGroupName());
         }
     }
-
+    // 解析导入描述符（RoutineLoadDesc），提取其中的列映射、过滤条件、分隔符、分区信息、Merge 类型及 Sequence 列。
     protected void setRoutineLoadDesc(RoutineLoadDesc routineLoadDesc) {
         if (routineLoadDesc != null) {
             if (routineLoadDesc.getColumnsInfo() != null) {
@@ -797,7 +832,7 @@ public abstract class RoutineLoadJob
     public String getCloudCluster() {
         return cloudCluster;
     }
-
+    // 在加读锁的前提下，返回当前作业下正在运行的任务列表大小。
     public int getSizeOfRoutineLoadTaskInfoList() {
         readLock();
         try {
@@ -816,6 +851,8 @@ public abstract class RoutineLoadJob
     }
 
     // RoutineLoadScheduler will run this method at fixed interval, and renew the timeout tasks
+    // 由后台调度器定期调用。遍历所有运行中的任务，检查其是否超时（isTimeout()）。
+    // 对超时的任务进行废弃（UnprotectRenewTask），将其关联事务交由事务管理器中止，并生成新任务重新投入调度队列。
     public void processTimeoutTasks() {
         writeLock();
         try {
@@ -837,13 +874,13 @@ public abstract class RoutineLoadJob
     }
 
     protected abstract void updateCloudProgress() throws UserException;
-
+    // 由子类实现，负责将例行导入作业切分为指定数量的具体导入任务。
     protected abstract void divideRoutineLoadJob(int currentConcurrentTaskNum) throws UserException;
 
     public int calculateCurrentConcurrentTaskNum() throws MetaNotFoundException {
         return 0;
     }
-
+    // 统计当前作业中各个 BE 节点上正在运行的任务分布情况（返回 Map<beId, runningTaskCount>）。
     public Map<Long, Integer> getBeCurrentTasksNumMap() {
         Map<Long, Integer> beIdConcurrentTasksNum = Maps.newHashMap();
         readLock();
@@ -874,7 +911,7 @@ public abstract class RoutineLoadJob
         return this.state == JobState.PAUSED && this.pauseReason != null
                     && this.pauseReason.getCode() != InternalErrorCode.MANUAL_PAUSE_ERR;
     }
-
+    // 用于校验作业当前状态是否允许变更为目标状态（例如已停止或已取消的作业不能再进行状态转换）
     // All of private method could not be call without lock
     private void checkStateTransform(RoutineLoadJob.JobState desireState) throws UserException {
         switch (state) {
@@ -896,7 +933,7 @@ public abstract class RoutineLoadJob
         updateNumOfData(attachment.getTotalRows(), attachment.getFilteredRows(), attachment.getUnselectedRows(),
                 attachment.getReceivedBytes(), attachment.getTaskExecutionTimeMs(), false /* not replay */);
     }
-
+    // 由子类实现，用于更新云模式下的导入进度。
     protected void updateCloudProgress(RLTaskTxnCommitAttachment attachment) {
         // In the cloud mode, the reason for needing to overwrite jobStatistic is that
         // pulling the progress of meta service is equivalent to a replay operation of edit log,
@@ -1487,7 +1524,9 @@ public abstract class RoutineLoadJob
     }
 
     protected void unprotectUpdateState(JobState jobState, ErrorReason reason, boolean isReplay) throws UserException {
+        // 状态转换合法性校验
         checkStateTransform(jobState);
+        // 多路分支状态执行分发。根据传入的目标 jobState 枚举值，执行对应状态下的具体业务初始化或清理动作：
         switch (jobState) {
             case RUNNING:
                 executeRunning();
@@ -1507,11 +1546,13 @@ public abstract class RoutineLoadJob
             default:
                 break;
         }
-
+        // 清理事务回调。检查更新后的当前状态（state）是否已经达到了终态（通过 isFinalState() 判断，即 STOPPED 或 CANCELLED）。
+        // 如果是终态，说明该导入作业已经彻底结束，从全局事务管理器的回调工厂中移除该作业的事务状态回调（removeCallback(id)），避免内存泄漏和不必要的事件监听。
         if (state.isFinalState()) {
             Env.getCurrentGlobalTransactionMgr().getCallbackFactory().removeCallback(id);
         }
-
+        // 元数据持久化（写 EditLog）：
+        // 只有在非重放阶段（即用户实时操作）且目标状态不是 RUNNING 的情况下（因为 RUNNING 状态过于频繁或由调度触发，通常不直接写单次操作日志，或者由其他逻辑控制），才需要将状态变更持久化到元数据日志中。
         if (!isReplay && jobState != JobState.RUNNING) {
             if (jobState == JobState.PAUSED) {
                 Env.getCurrentEnv().getEditLog().logOpRoutineLoadJob(new RoutineLoadOperation(id, jobState, reason));

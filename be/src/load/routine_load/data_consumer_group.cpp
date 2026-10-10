@@ -37,10 +37,13 @@ namespace doris {
 bool DataConsumerGroup::_submit_all_consumers(
         std::function<void(std::shared_ptr<DataConsumer>, ConsumeFinishCallback)> consume_fn,
         std::function<void()> shutdown_fn, Status& result_st) {
+    // 遍历当前消费者组（_consumers 向量）中管理的所有数据消费者实例。
     for (auto& consumer : _consumers) {
         auto cb = [this, shutdown_fn, &result_st](const Status& st) {
             std::unique_lock<std::mutex> lock(_mutex);
+            // 将活跃计数器 _counter 自减 1。如果减到 0，说明组内的最后一个消费者也已经完成了工作。
             if (--_counter == 0) {
+                // 触发传入的关闭函数，关闭底层的消费队列。
                 shutdown_fn();
                 LOG(INFO) << "all consumers finished, shutdown queue. grp: " << _grp_id;
             }
@@ -48,6 +51,7 @@ bool DataConsumerGroup::_submit_all_consumers(
                 result_st = st;
             }
         };
+        // 将消费任务投递到线程池中异步执行。
         if (!_thread_pool.offer([consume_fn, consumer, cb] { consume_fn(consumer, cb); })) {
             LOG(WARNING) << "failed to submit consumer: " << consumer->id() << ", grp: " << _grp_id;
             return false;
@@ -60,18 +64,26 @@ bool DataConsumerGroup::_submit_all_consumers(
 Status DataConsumerGroup::_run_consume_loop(std::shared_ptr<StreamLoadContext> ctx,
                                             std::shared_ptr<io::StreamLoadPipe> pipe,
                                             Status& result_st) {
+    // 将最大时间间隔（秒）转换为毫秒，作为剩余允许运行的时间。
     int64_t left_time = ctx->max_interval_s * 1000;
+    // 初始化剩余允许消费的行数上限（max_batch_rows）。
     int64_t left_rows = ctx->max_batch_rows;
+    // 初始化剩余允许消费的字节数上限（max_batch_size）。
     int64_t left_bytes = ctx->max_batch_size;
 
     LOG(INFO) << "start consumer group: " << _grp_id << ". max time(ms): " << left_time
               << ", batch rows: " << left_rows << ", batch size: " << left_bytes << ". "
               << ctx->brief();
-
+    // 单调计时器 watch，用来精准监控当前消费批次的实际总耗时。
     MonotonicStopWatch watch;
     watch.start();
     bool eos = false;
     while (true) {
+        // 每次循环开始时，检查是否满足批次退出的 4 大终结条件之一
+        // eos：数据流已经读到末尾（如分区 EOF）。
+        // left_time <= 0：批次运行时间超时。
+        // left_rows <= 0：累计消费行数达到上限。
+        // left_bytes <= 0：累计消费字节数达到上限。
         if (eos || left_time <= 0 || left_rows <= 0 || left_bytes <= 0) {
             LOG(INFO) << "consumer group done: " << _grp_id
                       << ". consume time(ms)=" << ctx->max_interval_s * 1000 - left_time
@@ -97,10 +109,11 @@ Status DataConsumerGroup::_run_consume_loop(std::shared_ptr<StreamLoadContext> c
             ctx->receive_bytes = ctx->max_batch_size - left_bytes;
             return Status::OK();
         }
-
+        // 从内部队列中取出一个数据项，追加到管道 pipe 中，并内部扣减 left_rows（剩余行数）和 left_bytes（剩余字节数）。
         if (!_dequeue_and_process(pipe.get(), left_rows, left_bytes, result_st)) {
             eos = true;
         }
+        // 更新剩余时间
         left_time = ctx->max_interval_s * 1000 - watch.elapsed_time() / 1000 / 1000;
     }
 }
@@ -139,14 +152,20 @@ KafkaDataConsumerGroup::~KafkaDataConsumerGroup() {
     DCHECK(_queue.get_size() == 0);
 }
 
+// std::shared_ptr<io::StreamLoadPipe> pipe  流式导入数据管道（Pipe）的智能指针。它是生产者-消费者模型中的下游通道，消费者组从 Kafka 拉取到的数据最终会写入该管道，供 Doris 的执行引擎读取解析。
 Status KafkaDataConsumerGroup::start_all(std::shared_ptr<StreamLoadContext> ctx,
                                          std::shared_ptr<io::StreamLoadPipe> pipe) {
     DORIS_CHECK(std::dynamic_pointer_cast<io::KafkaConsumerPipe>(pipe) != nullptr);
     Status result_st = Status::OK();
+    // （提交偏移量）保存到当前消费者组的成员变量 _cmt_offset 中。
     _cmt_offset = ctx->kafka_info->cmt_offset;
+    // 将数据格式（如 CSV、JSON）保存到 _format 中。
     _format = ctx->format;
-
+    // 把组内的所有消费者投递到优先级线程池中并发运行：
     if (!_submit_all_consumers(
+    // 第一个 Lambda 参数（consume_fn）：定义了每个消费者要执行的具体逻辑。计算最大运行时间 max_time（将 ctx->max_interval_s 秒转换为毫秒），
+    // 并调用 actual_consume(c, &_queue, max_time, cb) 让消费者 c 开始向内部阻塞队列 _queue 拉取消息。
+    // 第二个 Lambda 参数（shutdown_fn）：当组内所有消费者都干完活退出时被调用，执行 _queue.shutdown() 关闭底层阻塞队列。
                 [this, max_time = ctx->max_interval_s * 1000](std::shared_ptr<DataConsumer> c,
                                                               ConsumeFinishCallback cb) {
                     actual_consume(c, &_queue, max_time, cb);
@@ -154,7 +173,10 @@ Status KafkaDataConsumerGroup::start_all(std::shared_ptr<StreamLoadContext> ctx,
                 [this] { _queue.shutdown(); }, result_st)) {
         return Status::InternalError("failed to submit data consumer");
     }
+    // 运行主消费循环
+    // 阻塞当前主线程，不断从内部队列 _queue 中取出 Kafka 消息并追加到 pipe 管道中，直到消费完成或出错。
     RETURN_IF_ERROR(_run_consume_loop(ctx, pipe, result_st));
+    // 将消费过程中更新后的最新提交偏移量（_cmt_offset）通过 std::move 移交给上下文对象 ctx->kafka_info->cmt_offset，以便后续的事务提交和 Offset 提交逻辑使用。
     ctx->kafka_info->cmt_offset = std::move(_cmt_offset);
     return Status::OK();
 }
@@ -162,6 +184,7 @@ Status KafkaDataConsumerGroup::start_all(std::shared_ptr<StreamLoadContext> ctx,
 bool KafkaDataConsumerGroup::_dequeue_and_process(io::StreamLoadPipe* pipe, int64_t& left_rows,
                                                   int64_t& left_bytes, Status& result_st) {
     RdKafka::Message* msg = nullptr;
+    // 尝试限时（config::blocking_queue_cv_wait_timeout_ms）从队列中获取一条 Kafka 消息。
     if (!_queue.controlled_blocking_get(&msg, config::blocking_queue_cv_wait_timeout_ms)) {
         return false;
     }
@@ -175,7 +198,7 @@ bool KafkaDataConsumerGroup::_dequeue_and_process(io::StreamLoadPipe* pipe, int6
         }
         return true;
     }
-
+    // 根据数据格式将消息追加到管道
     auto append_fn = FormatAppender::get_append_function<io::StreamLoadPipe>(_format);
     Status st = (pipe->*append_fn)(static_cast<const char*>(msg->payload()),
                                    static_cast<size_t>(msg->len()));
@@ -197,7 +220,7 @@ bool KafkaDataConsumerGroup::_dequeue_and_process(io::StreamLoadPipe* pipe, int6
 void KafkaDataConsumerGroup::_on_finish(std::shared_ptr<StreamLoadContext> ctx) {
     // cmt_offset is moved back in start_all after _run_consume_loop returns
 }
-
+// 传入共享的阻塞队列 queue 和最大允许运行时间 max_running_time_ms，开始循环从 Kafka 拉取消息，并接收返回的执行状态 st。
 void KafkaDataConsumerGroup::actual_consume(std::shared_ptr<DataConsumer> consumer,
                                             BlockingQueue<RdKafka::Message*>* queue,
                                             int64_t max_running_time_ms, ConsumeFinishCallback cb) {

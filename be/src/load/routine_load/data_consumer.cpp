@@ -67,17 +67,19 @@ static const std::string PROP_GROUP_ID = "group.id";
 // brokers, groupid
 Status KafkaDataConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
     std::unique_lock<std::mutex> l(_lock);
+    // 如果已经初始化过（_init == true），则直接返回 Status::OK()，实现初始化操作的幂等性，防止重复初始化。
     if (_init) {
         // this consumer has already been initialized.
         return Status::OK();
     }
-
+    // 创建 librdkafka 全局配置对象
     RdKafka::Conf* conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
 
     // conf has to be deleted finally
     Defer delete_conf {[conf]() { delete conf; }};
 
     std::string errstr;
+    // 定义一个名为 set_conf 的 Lambda 表达式，用于向 conf 中设置键值对
     auto set_conf = [&conf, &errstr](const std::string& conf_key, const std::string& conf_val) {
         RdKafka::Conf::ConfResult res = conf->set(conf_key, conf_val, errstr);
         if (res == RdKafka::Conf::CONF_UNKNOWN) {
@@ -97,7 +99,9 @@ Status KafkaDataConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
         VLOG_NOTICE << "set " << conf_key << ": " << conf_val;
         return Status::OK();
     };
-
+    // 设置默认的 Kafka 客户端连接属性
+    // 逐一配置 librdkafka 的核心底层参数：如 Kafka Broker 列表、开启分区 EOF 事件通知、禁用自动 Offset 提交（由 Doris 自己控制 Offset）、关闭统计回调、
+    // 设置 auto.offset.reset 为 error（避免意外越界）、启用 socket 心跳、配置重连退避时间、API 版本自动请求及回退策略等。若任一配置失败，立即返回错误。
     RETURN_IF_ERROR(set_conf("metadata.broker.list", ctx->kafka_info->brokers));
     RETURN_IF_ERROR(set_conf("enable.partition.eof", "true"));
     RETURN_IF_ERROR(set_conf("enable.auto.offset.store", "false"));
@@ -114,17 +118,20 @@ Status KafkaDataConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
     if (config::kafka_debug != "disable") {
         RETURN_IF_ERROR(set_conf("debug", config::kafka_debug));
     }
-
+    // 处理用户自定义属性与文件类型配置
+    // 遍历用户在 SQL 语句中通过 PROPERTIES 传入的自定义 Kafka 属性，存入 _custom_properties 中。
     for (auto& item : ctx->kafka_info->properties) {
         _custom_properties.emplace(item.first, item.second);
 
         // AWS properties (aws.*) are Doris-specific for MSK IAM authentication
         // and should not be passed to librdkafka
+        // AWS 属性过滤：若属性以 aws. 开头（专用于 Doris 的 MSK IAM 认证），跳过不传给 librdkafka。
         if (starts_with(item.first, "aws.")) {
             LOG(INFO) << "Skipping AWS property for librdkafka: " << item.first;
             continue;
         }
-
+        // 文件属性解析（FILE: 格式）：如果配置值以 FILE: 开头（例如加密证书、凭证文件等），
+        // 将其解析为 FILE:file_id:md5 格式，通过 Doris 的 small_file_mgr 将远端小文件下载到本地并获取实际文件路径 file_path，然后将该路径传给配置项；常规属性则直接设置。
         if (starts_with(item.second, "FILE:")) {
             // file property should has format: FILE:file_id:md5
             std::vector<std::string> parts =
@@ -149,6 +156,7 @@ Status KafkaDataConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
     // if not specified group id, generate a random one.
     // ATTN: In the new version, we have set a group.id on the FE side for jobs that have not set a groupid,
     // but in order to ensure compatibility, we still do a check here.
+    // 检查用户是否自定义了 group.id。如果没有，为了兼容性与防止冲突，系统会自动生成一个唯一的 group.id（由当前 BE 的 IP 结合随机 UUID 组成），并将其设置到 Kafka 配置中。
     if (!_custom_properties.contains(PROP_GROUP_ID)) {
         std::stringstream ss;
         ss << BackendOptions::get_localhost() << "_";
@@ -157,7 +165,7 @@ Status KafkaDataConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
         _custom_properties.emplace(PROP_GROUP_ID, group_id);
     }
     LOG(INFO) << "init kafka consumer with group id: " << _custom_properties[PROP_GROUP_ID];
-
+    // 向 Kafka 配置中注册全局事件回调对象 _k_event_cb，用于捕获和处理 librdkafka 运行过程中的各类底层事件（如错误日志、统计信息等）。
     if (conf->set("event_cb", &_k_event_cb, errstr) != RdKafka::Conf::CONF_OK) {
         std::stringstream ss;
         ss << "PAUSE: failed to set 'event_cb'";
@@ -166,6 +174,8 @@ Status KafkaDataConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
     }
 
     // Set up AWS MSK IAM authentication if configured
+    // 检查并尝试从属性中创建 AWS MSK IAM 的 OAuth 认证回调实例 (_aws_msk_oauth_callback)
+    // 如果配置了 AWS MSK 认证，则开启 SASL 异步队列支持（enable_sasl_queue），并设置 OAuth 令牌刷新回调函数。
     _aws_msk_oauth_callback = AwsMskIamOAuthCallback::create_from_properties(
             _custom_properties, ctx->kafka_info->brokers);
     if (_aws_msk_oauth_callback) {
@@ -184,6 +194,7 @@ Status KafkaDataConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
     }
 
     // create consumer
+    // 创建 Kafka 消费者实例
     _k_consumer = RdKafka::KafkaConsumer::create(conf, errstr);
     if (!_k_consumer) {
         LOG(WARNING) << "PAUSE: failed to create kafka consumer: " << errstr;
@@ -191,6 +202,7 @@ Status KafkaDataConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
     }
 
     // If AWS MSK IAM auth is enabled, inject initial token and enable background refresh
+    // 如果启用了 AWS MSK IAM 认证，立即触发一次令牌刷新（refresh_now）并启用 librdkafka 的 SASL 后台回调自动刷新机制。
     if (_aws_msk_oauth_callback) {
         RETURN_IF_ERROR(_aws_msk_oauth_callback->refresh_now(_k_consumer));
 
@@ -243,21 +255,25 @@ Status KafkaDataConsumer::assign_topic_partitions(
 
     return Status::OK();
 }
-
+// BlockingQueue<RdKafka::Message*>* queue  阻塞队列指针。它是生产者-消费者模型中的共享队列。当前 Kafka 消费者拉取到的消息（RdKafka::Message*）会被放入该队列中，供上层管道（Pipeline）或其他线程异步取出并解析写入 Doris。
+// int64_t max_running_time_ms  最大允许运行时间（毫秒数）。限制了单个批次内该消费者从 Kafka 拉取数据的最大持续时间。一旦超时，消费循环将主动退出。
 Status KafkaDataConsumer::group_consume(BlockingQueue<RdKafka::Message*>* queue,
                                         int64_t max_running_time_ms) {
+    // 初始化剩余运行时间
     int64_t left_time = max_running_time_ms;
     LOG(INFO) << "start kafka consumer: " << _id << ", grp: " << _grp_id
               << ", max running time(ms): " << left_time;
-
+    // 分别统计从 Kafka 接收到的消息数和成功放入阻塞队列的消息数。
     int64_t received_rows = 0;
     int64_t put_rows = 0;
+    // 初始化重试策略（最多重试 3 次，基础退避时间 200ms），用于处理网络瞬时中断等情况。
     RetryPolicy retry_policy(3, 200);
     Status st = Status::OK();
+    // watch 监控整个消费过程的总耗时，consumer_watch 监控每次调用 Kafka 拉取消息的延迟。
     MonotonicStopWatch consumer_watch;
     MonotonicStopWatch watch;
     watch.start();
-
+    // 进入 while (true) 无限循环，开始持续从 Kafka 拉取数据。
     while (true) {
         {
             std::unique_lock<std::mutex> l(_lock);
@@ -265,7 +281,7 @@ Status KafkaDataConsumer::group_consume(BlockingQueue<RdKafka::Message*>* queue,
                 break;
             }
         }
-
+        // 检查剩余时间 left_time 是否小于等于 0。若超时则退出循环，完成当前批次。
         if (left_time <= 0) {
             break;
         }
@@ -273,13 +289,14 @@ Status KafkaDataConsumer::group_consume(BlockingQueue<RdKafka::Message*>* queue,
         bool done = false;
         // consume 1 message at a time
         consumer_watch.start();
+        // 尝试拉取消息，超时时间为 1000 毫秒（1秒）。将返回的指针包裹在 std::unique_ptr 中以便自动内存管理。
         std::unique_ptr<RdKafka::Message> msg(_k_consumer->consume(1000 /* timeout, ms */));
         consumer_watch.stop();
 
         DorisMetrics::instance()->routine_load_get_msg_count->increment(1);
         DorisMetrics::instance()->routine_load_get_msg_latency->increment(
                 consumer_watch.elapsed_time() / 1000 / 1000);
-
+        // 支持测试环境下的 Debug 注入点，用于模拟 Offset out of range（偏移量越界）错误并提前终止。
         DBUG_EXECUTE_IF("KafkaDataConsumer.group_consume.out_of_range", {
             done = true;
             std::stringstream ss;
@@ -292,16 +309,21 @@ Status KafkaDataConsumer::group_consume(BlockingQueue<RdKafka::Message*>* queue,
         });
 
         switch (msg->err()) {
+        // 正常消息处理分支 ERR_NO_ERROR
         case RdKafka::ERR_NO_ERROR:
             retry_policy.reset();
+            // 记录当前正在消费的分区 ID
             if (_consuming_partition_ids.count(msg->partition()) <= 0) {
                 _consuming_partition_ids.insert(msg->partition());
             }
+            // 累加消费字节数指标
             DorisMetrics::instance()->routine_load_consume_bytes->increment(msg->len());
+            // 如果消息长度为 0，直接忽略（防止空消息导致后续解析异常）
             if (msg->len() == 0) {
                 // ignore msg with length 0.
                 // put empty msg into queue will cause the load process shutting down.
                 break;
+            // 尝试将消息放入阻塞队列 queue 中
             } else if (!queue->controlled_blocking_put(msg.get(),
                                                        config::blocking_queue_cv_wait_timeout_ms)) {
                 // queue is shutdown
@@ -357,7 +379,7 @@ Status KafkaDataConsumer::group_consume(BlockingQueue<RdKafka::Message*>* queue,
             st = Status::InternalError<false>(msg->errstr());
             break;
         }
-
+        // 更新剩余时间与循环终结检查
         left_time = max_running_time_ms - watch.elapsed_time() / 1000 / 1000;
         if (done) {
             break;

@@ -79,21 +79,32 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
+// RoutineLoadManager 是 Apache Doris 中用于统一管理例行导入作业（Routine Load Job）的核心元数据管理与调度决策组件。其主要职责包括：
+// 生命周期与元数据管理：创建、存储、查询、暂停（Pause）、恢复（Resume）、停止（Stop）、修改（Alter）以及清理（Clean）各类 Routine Load 作业（如 Kafka、Kinesis 数据源）。
+// BE 资源与并发分配：维护全集群 Backend（BE）节点的并发任务上限与实时负载情况，为任务调度（Task Scheduling）寻找合适的 BE 节点，并实现一定程度的负载均衡与 Cache 复用。
+// 元数据持久化与回放：实现 Writable 接口，负责将创建、修改、操作日志通过 EditLog 写入二进制 Metadata，并在 FE 节点重启或主备同步时回放（Replay）日志。
+// 权限与安全隔离：与 Doris 访问控制（AccessManager）结合，在提交、暂停、恢复、修改作业时检查用户对目标数据库及表的操作权限（LOAD 权限）。
+// 多表/多任务事务映射：记录 Multi-Load 事务 ID（Txn ID）与 Routine Load Job ID 的关联，支持事务级别的回调与追踪。
 public class RoutineLoadManager implements Writable {
     private static final Logger LOG = LogManager.getLogger(RoutineLoadManager.class);
 
     // Long is beId, integer is the size of tasks in be
+    // 映射表（Key: beId, Value: maxConcurrentTasks），记录每个可用 BE 节点当前允许运行的最大 Routine Load 并发任务数。默认为 Config.max_routine_load_task_num_per_be。
     private Map<Long, Integer> beIdToMaxConcurrentTasks = Maps.newHashMap();
 
     // routine load job meta
+    // 以全局唯一 jobId 为 Key 的核心 ConcurrentMap，保存当前 FE 内存中所有的 Routine Load 作业对象。
     private Map<Long, RoutineLoadJob> idToRoutineLoadJob = Maps.newConcurrentMap();
+    // 二级映射表（Outer Key: dbId, Inner Key: jobName, Value: 具有该名称的 RoutineLoadJob 列表）。
+    // 由于历史作业可能同名，因此 Value 为 List；用于支持按 dbName + jobName 快速检索作业。
     private Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newConcurrentMap();
-
+    // 映射表（Key: txnId, Value: routineLoadJobId），用于关联 Multi-Load 任务中的事务 ID 与对应的例行导入作业 ID。
     private ConcurrentHashMap<Long, Long> multiLoadTaskTxnIdToRoutineLoadJobId = new ConcurrentHashMap<>();
-
+    // 公平的读写重入锁，保证并发查询（读锁）与修改/修改状态（写锁）时元数据一致性，防止 EditLog 乱序产生空指针或元数据冲突
     private ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
 
     // Map<beId, timestamp when added to blacklist>
+    // 并发映射表（Key: beId, Value: Timestamp），记录被加入黑名单的 BE 节点及其加入时间，防止频繁异常的 BE 被持续调度。
     private Map<Long, Long> blacklist = new ConcurrentHashMap<>();
 
     private void readLock() {
@@ -118,21 +129,23 @@ public class RoutineLoadManager implements Writable {
     public Map<Long, Long> getBlacklist() {
         return blacklist;
     }
-
+    // 获取当前系统内所有的 RoutineLoadJob 对象列表（包含已停止/历史作业）。
     public List<RoutineLoadJob> getAllRoutineLoadJobs() {
         return new ArrayList<>(idToRoutineLoadJob.values());
     }
-
+    // 过滤并返回当前所有未处于终止状态（非 FINAL_STATE，即除 STOPPED/CANCELLED 外）的活动作业列表。
     public List<RoutineLoadJob> getActiveRoutineLoadJobs() {
         return idToRoutineLoadJob.values().stream()
                 .filter(job -> !job.state.isFinalState())
                 .collect(Collectors.toList());
     }
 
+    // 向 multiLoadTaskTxnIdToRoutineLoadJobId 写入映射关系，将某个事务 ID 绑定到其所属的 Job ID。
     public void addMultiLoadTaskTxnIdToRoutineLoadJobId(long txnId, long routineLoadJobId) {
         multiLoadTaskTxnIdToRoutineLoadJobId.put(txnId, routineLoadJobId);
     }
 
+    // 根据事务 ID 反查并返回对应的 RoutineLoadJob 实例。如果查不到或为 0 则返回 null。
     public RoutineLoadJob getRoutineLoadJobByMultiLoadTaskTxnId(long txnId) {
         long routineLoadJobId = multiLoadTaskTxnIdToRoutineLoadJobId.get(txnId);
         if (routineLoadJobId == 0) {
@@ -140,11 +153,12 @@ public class RoutineLoadManager implements Writable {
         }
         return idToRoutineLoadJob.get(routineLoadJobId);
     }
-
+    // 移除指定的事务 ID 映射记录，释放内存。
     public void removeMultiLoadTaskTxnIdToRoutineLoadJobId(long txnId) {
         multiLoadTaskTxnIdToRoutineLoadJobId.remove(txnId);
     }
-
+    // 刷新 beIdToMaxConcurrentTasks 映射。通过 SystemInfoService 筛选出处于存活、未退役（Decommission）且导入可用（isLoadAvailable）的 BE 节点，
+    // 并设置其最大并发任务数为配置项 Config.max_routine_load_task_num_per_be。
     public void updateBeIdToMaxConcurrentTasks() {
         beIdToMaxConcurrentTasks = Env.getCurrentSystemInfo().getAllBackendIds(true).stream()
                 .filter(beId -> {
@@ -156,11 +170,13 @@ public class RoutineLoadManager implements Writable {
     }
 
     // this is not real-time number
+    // 计算并返回当前全集群所有可用 BE 节点能够承载的最大并发 Routine Load 任务总数（即各个 BE 上限之和）。
     public int getTotalMaxConcurrentTaskNum() {
         return beIdToMaxConcurrentTasks.values().stream().mapToInt(i -> i).sum();
     }
 
     // return the map of be id -> running tasks num
+    // 遍历处于 RUNNING 状态的所有 Routine Load 作业，汇总并返回每个 BE 上当前正在运行的任务数量 Map（Map<beId, currentRunningTasks>）
     private Map<Long, Integer> getBeCurrentTasksNumMap() {
         Map<Long, Integer> beCurrentTaskNumMap = Maps.newHashMap();
         for (RoutineLoadJob routineLoadJob : getRoutineLoadJobByState(
@@ -177,10 +193,11 @@ public class RoutineLoadManager implements Writable {
         return beCurrentTaskNumMap;
 
     }
-
+    // 创建 Routine Load 作业的公共入口。
     public void createRoutineLoadJob(CreateRoutineLoadInfo info, ConnectContext ctx)
             throws UserException {
         // check load auth
+        // 校验当前连接用户对目标表的 LOAD 权限；
         if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(),
                 InternalCatalog.INTERNAL_CATALOG_NAME,
                 info.getDBName(),
@@ -192,7 +209,7 @@ public class RoutineLoadManager implements Writable {
                     info.getDBName(),
                     info.getDBName() + ": " + info.getTableName());
         }
-
+        // 根据 info.getTypeName() 判断数据源（Kafka / Kinesis），调用对应类（如 KafkaRoutineLoadJob.fromCreateInfo）生成 Job 实例；
         RoutineLoadJob routineLoadJob = null;
         LoadDataSourceType type = LoadDataSourceType.valueOf(info.getTypeName());
         switch (type) {
@@ -205,29 +222,32 @@ public class RoutineLoadManager implements Writable {
             default:
                 throw new UserException("Unknown data source type: " + type);
         }
-
+        // 附加原始 SQL 语句和 Comment，最后调用 addRoutineLoadJob 注册作业。
         routineLoadJob.setOrigStmt(ctx.getStatementContext().getOriginStatement());
         routineLoadJob.setComment(info.getComment());
         addRoutineLoadJob(routineLoadJob, info.getDBName(),
                 info.getTableName());
     }
-
+    // 将生成的 Job 注册到系统中，并持久化元数据。
     public void addRoutineLoadJob(RoutineLoadJob routineLoadJob, String dbName, String tableName)
                     throws UserException {
+        // 加写锁；
         writeLock();
         try {
             // check if db.routineLoadName has been used
+            // 校验作业名称在同 DB 下是否已被未结束的作业使用（isNameUsed）；
             if (isNameUsed(routineLoadJob.getDbId(), routineLoadJob.getName())) {
                 throw new DdlException("Name " + routineLoadJob.getName() + " already used in db "
                         + dbName);
             }
+            // 校验处于活跃状态（NEED_SCHEDULE, RUNNING, PAUSED）的作业数是否超过 Config.max_routine_load_job_num 上限；
             if (getRoutineLoadJobByState(Sets.newHashSet(RoutineLoadJob.JobState.NEED_SCHEDULE,
                     RoutineLoadJob.JobState.RUNNING, RoutineLoadJob.JobState.PAUSED)).size()
                     > Config.max_routine_load_job_num) {
                 throw new DdlException("There are more than " + Config.max_routine_load_job_num
                         + " routine load jobs are running. exceed limit.");
             }
-
+            // 调用 unprotectedAddJob 添加至内存结构；
             unprotectedAddJob(routineLoadJob);
             Env.getCurrentEnv().getEditLog().logCreateRoutineLoadJob(routineLoadJob);
         } finally {
@@ -237,7 +257,7 @@ public class RoutineLoadManager implements Writable {
         LOG.info("create routine load job: id: {}, job name: {}, db name: {}, table name: {}",
                  routineLoadJob.getId(), routineLoadJob.getName(), dbName, tableName);
     }
-
+    // 无锁地将 Job 放置到 idToRoutineLoadJob 和 dbToNameToRoutineLoadJob 内存 Map 中，并将作业注册到全局事务管理器的 Callback 工厂中。
     private void unprotectedAddJob(RoutineLoadJob routineLoadJob) {
         idToRoutineLoadJob.put(routineLoadJob.getId(), routineLoadJob);
 
@@ -249,7 +269,7 @@ public class RoutineLoadManager implements Writable {
         // add txn state callback in factory
         Env.getCurrentGlobalTransactionMgr().getCallbackFactory().addCallback(routineLoadJob);
     }
-
+    // 判断指定 DB 下该作业名称是否已被其他非终态（!isFinalState()）的 Routine Load 作业占用。
     // TODO(ml): Idempotency
     private boolean isNameUsed(Long dbId, String name) {
         if (dbToNameToRoutineLoadJob.containsKey(dbId)) {
@@ -264,7 +284,7 @@ public class RoutineLoadManager implements Writable {
         }
         return false;
     }
-
+    // 根据 dbName 和 jobName 检索 Job 并校验当前上下文用户的权限。支持单表与多表（isMultiTable）权限检查。
     public RoutineLoadJob checkPrivAndGetJob(String dbName, String jobName)
             throws MetaNotFoundException, DdlException, AnalysisException {
         RoutineLoadJob routineLoadJob = getJob(dbName, jobName);
@@ -307,6 +327,7 @@ public class RoutineLoadManager implements Writable {
     }
 
     // get all jobs which state is not in final state from specified database
+    // 获取指定 DB 下所有非终态的 Job，并自动过滤掉当前用户没有 LOAD 权限的单表作业。
     public List<RoutineLoadJob> checkPrivAndGetAllJobs(String dbName)
             throws MetaNotFoundException, DdlException {
 
@@ -335,9 +356,13 @@ public class RoutineLoadManager implements Writable {
 
         return result;
     }
-
+    // 表示用户发起的“暂停例行导入（Routine Load）作业”的命令对象。它封装了执行该操作所需的所有元数据和请求参数，主要包括：
+    // 目标数据库名 (dbFullName)：指示要操作的作业属于哪一个 Database。
+    // 作业名称 / Label (label)：指示要暂停的具体作业名称（支持单个作业操作）。
+    // 是否批量操作 (isAll())：一个布尔标志，指示用户是希望暂停指定数据库下的所有活动例行导入作业，还是仅仅暂停某一个特定的作业。
     public void pauseRoutineLoadJob(PauseRoutineLoadCommand pauseRoutineLoadCommand)
             throws UserException {
+        // 初始化一个空的 RoutineLoadJob 列表。用于存放接下来需要被暂停的一个或多个作业实例。
         List<RoutineLoadJob> jobs = Lists.newArrayList();
         // it needs lock when getting routine load job,
         // otherwise, it may cause the editLog out of order in the following scenarios:
@@ -345,8 +370,11 @@ public class RoutineLoadManager implements Writable {
         // thread B: change job state and persist in editlog according to meta
         // thread A: persist in editlog
         // which will cause the null pointer exception when replaying editLog
+        // 注释指出了加读锁的原因——防止在多线程并发场景下出现 EditLog 乱序。
+        // 例如，线程 A 正在创建作业并准备写日志，而线程 B 获取了元数据并修改状态先持久化了 EditLog，这会导致后续 FE 重放（Replay）元数据时发生空指针异常（NullPointerException）。
         readLock();
         try {
+            // 判断用户是否执行的是批量暂停命令（PAUSE ROUTINE LOAD FOR ALL ...）。
             if (pauseRoutineLoadCommand.isAll()) {
                 jobs = checkPrivAndGetAllJobs(pauseRoutineLoadCommand.getDbFullName());
             } else {
@@ -357,9 +385,13 @@ public class RoutineLoadManager implements Writable {
         } finally {
             readUnlock();
         }
-
+        // 遍历前面收集到的需要暂停的作业列表 jobs，针对每个作业逐一执行暂停逻辑，并使用 try-catch 捕获单个作业暂停失败的异常，保证“批量暂停时部分失败不影响其他作业”。
         for (RoutineLoadJob routineLoadJob : jobs) {
             try {
+                // 更新单个作业的状态为暂停（PAUSED）。
+                // 参数 1：目标状态 JobState.PAUSED。
+                // 参数 2：错误原因（ErrorReason），其中包含内部错误码 MANUAL_PAUSE_ERR 以及详细描述信息（记录是由哪个登录用户手动暂停的）。
+                // 参数 3：false 表示这不是在重放元数据日志（isReplay = false），而是由当前节点实时发起的操作（会触发内部写入 EditLog 持久化及向集群广播状态变更）。
                 routineLoadJob.updateState(RoutineLoadJob.JobState.PAUSED,
                     new ErrorReason(InternalErrorCode.MANUAL_PAUSE_ERR,
                         "User " + ConnectContext.get().getQualifiedUser() + " pauses routine load job"),
@@ -445,7 +477,8 @@ public class RoutineLoadManager implements Writable {
         }
         return sizeOfTasks;
     }
-
+    // 基于 RoutineLoadManager 内部维护的 BE 节点最大并发任务限制表（beIdToMaxConcurrentTasks）以及当前正在运行的任务情况（通过 getBeCurrentTasksNumMap() 获取），
+    // 全局计算并返回当前整个集群中所有后端（BE）节点上剩余的例行导入空闲槽位（Idle Slots）总数。
     public int getClusterIdleSlotNum() {
         readLock();
         try {
