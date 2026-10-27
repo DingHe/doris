@@ -70,36 +70,42 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
+// 负责集群节点（主要是 Backend / BE 节点）管理、系统拓扑维护、健康状态追踪以及副本调度策略选择的核心服务类。
+// 集群节点生命周期管理：统一维护集群中所有 BE 节点的增删改查（如 addBackend、dropBackend、decommissionBackend），并负责将节点的变更操作记录到元数据日志（EditLog）中。
+// 多维节点查询与匹配：提供按 ID、IP、心跳端口、Be 端口等多种维度的节点查找方式，支持区分存活节点、下线节点、混部节点（Mix）及计算节点（CN）。
+// 分片与副本放置策略（Replica Allocation / Selection）：基于 ReplicaAllocation 和 BeSelectionPolicy（后端选择策略），为建表或扩缩容时的 Tablet 创建、Round-Robin 轮询选择提供最优的后端节点组合。
+// 版本与心跳跟踪：维护每个 BE 的上报版本（Report Version）以及路径信息引用（PathHash to DiskInfo），确保元数据的一致性和并发安全性。
 public class SystemInfoService {
     private static final Logger LOG = LogManager.getLogger(SystemInfoService.class);
-
+    // 默认集群名称。
     public static final String DEFAULT_CLUSTER = "default_cluster";
-
+    // 无可用导入后端时的标准提示错误信息。
     public static final String NO_BACKEND_LOAD_AVAILABLE_MSG =
             "No backend available for load, please check the status of your backends.";
-
+    // 无可用扫描节点后端时的标准提示错误信息。
     public static final String NO_SCAN_NODE_BACKEND_AVAILABLE_MSG =
             "No backend available as scan node, please check the status of your backends.";
-
+    // 未使用有效云集群时的提示信息。
     public static final String NOT_USING_VALID_CLUSTER_MSG =
             "Not using valid cloud clusters, please use a cluster before issuing any queries";
-
+    // 特定的错误码常量。
     public static final String ERROR_E230 = "E-230";
-
+    // 需要触发重新规划（Replan）的错误消息集合。
     public static final ImmutableSet<String> NEED_REPLAN_ERRORS = ImmutableSet.of(
             NO_SCAN_NODE_BACKEND_AVAILABLE_MSG,
             ERROR_E230,
             ComputeGroupException.FailedTypeEnum.COMPUTE_GROUPS_NO_ALIVE_BE.toString()
     );
-
+    // 节点 ID 到 Backend 对象的不可变映射。使用 volatile 和不可变集合保证高并发读写时的线程安全。
     protected volatile ImmutableMap<Long, Backend> idToBackendRef = ImmutableMap.of();
+    // 节点 ID 到其最新上报版本（Report Version）的原子长整型映射。
     protected volatile ImmutableMap<Long, AtomicLong> idToReportVersionRef = ImmutableMap.of();
-
+    // 磁盘路径哈希（PathHash）到 DiskInfo 的映射。
     private volatile ImmutableMap<Long, DiskInfo> pathHashToDiskInfoRef = ImmutableMap.of();
 
     public void invalidateCloudColocatePlacement(GroupId groupId) {
     }
-
+    // 封装了主机的网络地址信息（host 和 port）
     public static class HostInfo implements Comparable<HostInfo> {
         public String host;
         public int port;
@@ -168,6 +174,7 @@ public class SystemInfoService {
     }
 
     // sort host backends list by num of backends, descending
+    // 静态比较器，用于按后端列表的大小进行降序排序。
     private static final Comparator<List<Backend>> hostBackendsListComparator = new Comparator<List<Backend>>() {
         @Override
         public int compare(List<Backend> list1, List<Backend> list2) {
@@ -180,6 +187,7 @@ public class SystemInfoService {
     };
 
     // for deploy manager
+    // 使用默认的后端标签（Tag.DEFAULT_BACKEND_TAG）批量添加后端节点。
     public void addBackends(List<HostInfo> hostInfos, boolean isFree)
             throws UserException {
         addBackends(hostInfos, Tag.DEFAULT_BACKEND_TAG.toMap());
@@ -189,6 +197,8 @@ public class SystemInfoService {
      * @param hostInfos : backend's ip, hostName and port
      * @throws DdlException
      */
+    // 批量添加后端节点的入口。
+    // 遍历检查要添加的节点是否已存在（避免重复添加）；通过 ClusterGuard 校验集群许可时间有效性和最大节点数限制；校验通过后逐个调用底层 addBackend。
     public void addBackends(List<HostInfo> hostInfos, Map<String, String> tagMap) throws UserException {
         for (HostInfo hostInfo : hostInfos) {
             // check is already exist
@@ -223,6 +233,7 @@ public class SystemInfoService {
     }
 
     // Final entry of adding backend
+    // 添加 BE 节点的最终底层执行逻辑。
     private void addBackend(String host, int heartbeatPort, Map<String, String> tagMap) {
         Backend newBackend = new Backend(Env.getCurrentEnv().getNextId(), host, heartbeatPort);
         // update idToBackend
@@ -313,7 +324,7 @@ public class SystemInfoService {
         // backends is changed, regenerated tablet number metrics
         MetricRepo.generateBackendsTabletMetrics();
     }
-
+    // 将指定的后端节点标记为 decommissioned（下线中/数据迁移中状态），并记录状态变更日志到 EditLog。
     public void decommissionBackend(Backend backend) throws UserException {
         // set backend's state as 'decommissioned'
         // for decommission operation, here is no decommission job. the system handler will check
@@ -483,13 +494,13 @@ public class SystemInfoService {
         }
         return hosts.size();
     }
-
+    // 用于对 Backend 列表进行排序。
     class BeIdComparator implements Comparator<Backend> {
         public int compare(Backend a, Backend b) {
             return Long.compare(a.getId(), b.getId());
         }
     }
-
+    // 用于对 Backend 列表进行排序。
     class BeHostComparator implements Comparator<Backend> {
         public int compare(Backend a, Backend b) {
             return a.getHost().compareTo(b.getHost());
@@ -540,41 +551,62 @@ public class SystemInfoService {
      * @return return the selected backend ids group by tag.
      * @throws DdlException
      */
+    // 极其核心的副本放置与后端节点选择方法。当系统需要为创建 Tablet（分片）选择一组最合适的 BE 节点时，就会调用该方法。
+    // ReplicaAllocation replicaAlloc：副本分配策略对象。它描述了每个 Tag（如机房、可用区）下需要放置多少个副本（例如 tag.location.zone1: 2, tag.location.zone2: 1）。
+    // Map<Tag, Integer> nextIndexs： 轮询创建 Tablet 时的下一个后端索引缓存（用于支持 enable_round_robin_create_tablet 特性），确保不同分片能够均匀分布在各个 BE 上。
+    // TStorageMedium storageMedium： 期望的存储介质类型（如 SSD 或 HDD）。
+    // boolean isStorageMediumSpecified： 标记用户是否在 SQL 中显式指定了存储介质。如果是显式指定的，当该介质没有可用节点时，系统不会自动尝试切换到另一种介质重试。
+    // boolean isOnlyForCheck： 指示本次调用是否仅用于可用性检查（例如在 DDL 阶段预先校验是否有足够的可用节点）。如果是 true，则在找不到节点时不会触发跨存储介质的自动重试逻辑。
+
     public Pair<Map<Tag, List<Long>>, TStorageMedium> selectBackendIdsForReplicaCreation(
             ReplicaAllocation replicaAlloc, Map<Tag, Integer> nextIndexs,
             TStorageMedium storageMedium, boolean isStorageMediumSpecified,
             boolean isOnlyForCheck)
             throws DdlException {
+        // 获取当前集群中所有的后端节点快照
         Map<Long, Backend> copiedBackends = Maps.newHashMap(getAllClusterBackendsNoException());
+        // 创建用来存放最终选定结果的 chosenBackendIds 映射。
         Map<Tag, List<Long>> chosenBackendIds = Maps.newHashMap();
+        // 提取副本分配策略中的 Tag 与副本数映射 allocMap。
         Map<Tag, Short> allocMap = replicaAlloc.getAllocMap();
+        // 初始化已选中的总副本计数器 totalReplicaNum 为 0。
         short totalReplicaNum = 0;
-
+        // 存活节点数量初步校验。
         int aliveBackendNum = (int) copiedBackends.values().stream().filter(Backend::isAlive).count();
         if (aliveBackendNum < replicaAlloc.getTotalReplicaNum()) {
             throw new DdlException("replication num should be less than the number of available backends. "
                     + "replication num is " + replicaAlloc.getTotalReplicaNum()
                     + ", available backend num is " + aliveBackendNum);
         } else {
+            // 初始化一个存放失败条目的列表
             List<String> failedEntries = Lists.newArrayList();
-
+            // 遍历每一个 Tag 及其对应的副本数要求
             for (Map.Entry<Tag, Short> entry : allocMap.entrySet()) {
                 Tag tag = entry.getKey();
+                // 遍历每一个 Tag 及其对应的副本数要求
+                // 要求节点必须调度可用
+                // 需要检查磁盘空间占用
+                // 绑定当前的 Tag 并设置期望的 storageMedium
                 BeSelectionPolicy.Builder builder = new BeSelectionPolicy.Builder()
                         .needScheduleAvailable().needCheckDiskUsage().addTags(Sets.newHashSet(entry.getKey()))
                         .setStorageMedium(storageMedium);
+                // 如果正在运行单元测试或者开启了配置项 allow_replica_on_same_host（允许在同一台宿主机上放置多个副本），则调用 allowOnSameHost()。
                 if (FeConstants.runningUnitTest || Config.allow_replica_on_same_host) {
                     builder.allowOnSameHost();
                 }
+                // 如果开启了轮询创建 Tablet（enable_round_robin_create_tablet），则为构建器启用轮询，并传入对应 Tag 上一次的轮询索引位置。
                 if (Config.enable_round_robin_create_tablet) {
                     builder.setEnableRoundRobin(true);
                     builder.setNextRoundRobinIndex(nextIndexs.getOrDefault(tag, -1));
                 }
-
+                // 并调用 selectBackendIdsByPolicy 方法为当前 Tag 挑选指定数量 (entry.getValue()) 的后端节点 ID。
                 BeSelectionPolicy policy = builder.build();
                 List<Long> beIds = selectBackendIdsByPolicy(policy, entry.getValue());
                 // first time empty, retry with different storage medium
                 // if only for check, no need to retry different storage medium to get backend
+                // 存储介质自动降级/升级重试机制：
+                // 如果初次挑选节点结果为空（beIds.isEmpty()），
+                // 且满足“指定了存储介质、用户没有强制显式指定该介质（!isStorageMediumSpecified）、且不是仅检查模式（!isOnlyForCheck）”的条件：
                 TStorageMedium originalStorageMedium = storageMedium;
                 if (beIds.isEmpty() && storageMedium != null && !isStorageMediumSpecified && !isOnlyForCheck) {
                     storageMedium = (storageMedium == TStorageMedium.HDD) ? TStorageMedium.SSD : TStorageMedium.HDD;
@@ -585,10 +617,12 @@ public class SystemInfoService {
                     policy = builder.build();
                     beIds = selectBackendIdsByPolicy(policy, entry.getValue());
                 }
+                // 如果开启了轮询创建，将策略更新后的最新轮询索引保存回 nextIndexs 中，供下一次建表/建分片使用。
                 if (Config.enable_round_robin_create_tablet) {
                     nextIndexs.put(tag, policy.nextRoundRobinIndex);
                 }
                 // after retry different storage medium, it's still empty
+                // 如果 beIds 仍然为空，说明即使重试也无法满足该 Tag 的副本需求，记录错误日志并将失败信息加入 failedEntries。
                 if (beIds.isEmpty()) {
                     LOG.error("failed backend(s) for policy: {} real medium {}", policy, originalStorageMedium);
                     String errorReplication = "replication tag: " + entry.getKey()
@@ -596,6 +630,7 @@ public class SystemInfoService {
                             + ", storage medium: " + originalStorageMedium;
                     failedEntries.add(errorReplication);
                 } else {
+                    // 如果成功选出了节点，则将该 Tag 与对应的节点 ID 列表放入 chosenBackendIds 中，并累加已选出的总副本数 totalReplicaNum。
                     chosenBackendIds.put(entry.getKey(), beIds);
                     totalReplicaNum += beIds.size();
                 }

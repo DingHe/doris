@@ -74,48 +74,68 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+// 核心的属性解析与校验工具类
+// 负责解析、校验、转换和处理在执行 DDL（如 CREATE TABLE、ALTER TABLE、CREATE PARTITION 等）或管理操作时，用户传入的各种 PROPERTIES 属性参数。
+// 集中化属性校验与规范化：Apache Doris 的表、分区、存储策略等支持丰富的自定义配置（如副本数、Bloom Filter、存储介质、压缩算法、Compaction 策略、Binlog 配置等）。PropertyAnalyzer 统一接收这些 Map<String, String> 格式的原始字符串属性，将其转换成 Doris 内部识别的数据结构（如 DataProperty、ReplicaAllocation 等）。
+// 合法性检查与防错：在解析过程中，该类对每个参数进行严格的边界和类型检查。如果用户输入了非法的数值、超出范围的 TTL、或者不支持的存储策略，它会抛出明确的 AnalysisException 异常，防止错误配置下发到底层存储和执行引擎。
+// 参数清理：当某个属性被成功解析并消费后，它会负责从属性 Map 中将该 Key 移除，方便后续检查是否还有“未识别或非法”的冗余参数。
 public class PropertyAnalyzer {
-
+    // 前缀索引（短key）的列数
     public static final String PROPERTIES_SHORT_KEY = "short_key";
+    // 副本数量
     public static final String PROPERTIES_REPLICATION_NUM = "replication_num";
+    // 副本分配规则（支持多Tag精细化副本调度）。
     public static final String PROPERTIES_REPLICATION_ALLOCATION = "replication_allocation";
+    // 导入时最少成功的副本数。
     public static final String PROPERTIES_MIN_LOAD_REPLICA_NUM = "min_load_replica_num";
+    // 存储类型（通常为 COLUMN 列式存储）。
     public static final String PROPERTIES_STORAGE_TYPE = "storage_type";
+    // 存储介质类型（HDD 或 SSD）。
     public static final String PROPERTIES_STORAGE_MEDIUM = "storage_medium";
+    // 冷热数据降冷（Cooldown）时间。
     public static final String PROPERTIES_STORAGE_COOLDOWN_TIME = "storage_cooldown_time";
     // base time for the data in the partition
+    // 分区中数据的基准时间。
     public static final String PROPERTIES_DATA_BASE_TIME = "data_base_time_ms";
     // for 1.x -> 2.x migration
     public static final String PROPERTIES_VERSION_INFO = "version_info";
     // for restore
+    // Schema 版本号（多用于恢复和变更）。
     public static final String PROPERTIES_SCHEMA_VERSION = "schema_version";
+    // 分区 ID
     public static final String PROPERTIES_PARTITION_ID = "partition_id";
+    // 可见版本号
     public static final String PROPERTIES_VISIBLE_VERSION = "visible_version";
+    // 是否处于原子恢复状态。
     public static final String PROPERTIES_IN_ATOMIC_RESTORE = "in_atomic_restore";
-
+    // Bloom Filter（布隆过滤器）索引列。
     public static final String PROPERTIES_BF_COLUMNS = "bloom_filter_columns";
+    // 布隆过滤器的误判率（FPP，范围通常在 0.0001 到 0.05 之间）。
     public static final String PROPERTIES_BF_FPP = "bloom_filter_fpp";
-
+    // 列分隔符。
     public static final String PROPERTIES_COLUMN_SEPARATOR = "column_separator";
     public static final String PROPERTIES_LINE_DELIMITER = "line_delimiter";
-
+    // Colocate Join 组标识，使不同表的数据按相同规则分布在相同 BE 上。
     public static final String PROPERTIES_COLOCATE_WITH = "colocate_with";
 
     public static final String PROPERTIES_TIMEOUT = "timeout";
+    // 数据压缩算法（如 LZ4, ZSTD 等）。
     public static final String PROPERTIES_COMPRESSION = "compression";
 
     // row store page size, default 16KB
+    // 行存 Page 大小（默认 16KB / 16384L）。
     public static final String PROPERTIES_ROW_STORE_PAGE_SIZE = "row_store_page_size";
     public static final long ROW_STORE_PAGE_SIZE_DEFAULT_VALUE = 16384L;
 
+    // 列存数据 Page 大小（默认 64KB / 65536L）。
     public static final String PROPERTIES_STORAGE_PAGE_SIZE = "storage_page_size";
     public static final long STORAGE_PAGE_SIZE_DEFAULT_VALUE = 65536L;
-
+    // 字典编码 Page 大小（默认 256KB / 262144L）。
     public static final String PROPERTIES_STORAGE_DICT_PAGE_SIZE = "storage_dict_page_size";
     public static final long STORAGE_DICT_PAGE_SIZE_DEFAULT_VALUE = 262144L;
-
+    // 是否启用轻量级 Schema 变更。
     public static final String PROPERTIES_ENABLE_LIGHT_SCHEMA_CHANGE = "light_schema_change";
-
+    // 分布类型（如 Hash / Random）。
     public static final String PROPERTIES_DISTRIBUTION_TYPE = "distribution_type";
     public static final String PROPERTIES_SEND_CLEAR_ALTER_TASK = "send_clear_alter_tasks";
     /*
@@ -123,41 +143,49 @@ public class PropertyAnalyzer {
      * v1: alpha rowset
      * v2: beta rowset
      */
+    // 存储格式版本（v1 对应 alpha rowset，v2 对应 beta rowset）。
     public static final String PROPERTIES_STORAGE_FORMAT = "storage_format";
-
+    // 倒排索引存储格式。
     public static final String PROPERTIES_INVERTED_INDEX_STORAGE_FORMAT = "inverted_index_storage_format";
-
+    // 是否开启内存表（加速查询）
     public static final String PROPERTIES_INMEMORY = "in_memory";
-
+    // 文件缓存 TTL 秒数（最大限制为 MAX_FILE_CACHE_TTL_SECONDS）。
     public static final String PROPERTIES_FILE_CACHE_TTL_SECONDS = "file_cache_ttl_seconds";
     public static final long MAX_FILE_CACHE_TTL_SECONDS = Long.MAX_VALUE / 2L;
 
     // _auto_bucket can only set in create table stmt rewrite bucket and can not be changed
+    // 建表时自动分桶标志（不可更改）。
     public static final String PROPERTIES_AUTO_BUCKET = "_auto_bucket";
+    // 预估分区大小。
     public static final String PROPERTIES_ESTIMATE_PARTITION_SIZE = "estimate_partition_size";
-
+    // Tablet 类型（memory 内存型或 disk 磁盘型）。
     public static final String PROPERTIES_TABLET_TYPE = "tablet_type";
-
+    // 严格范围检查
     public static final String PROPERTIES_STRICT_RANGE = "strict_range";
+    // 使用临时分区名。
     public static final String PROPERTIES_USE_TEMP_PARTITION_NAME = "use_temp_partition_name";
+    // 类型属性。
     public static final String PROPERTIES_TYPE = "type";
     // This is common prefix for function column
+    // 函数列公共前缀
     public static final String PROPERTIES_FUNCTION_COLUMN = "function_column";
+    // Sequence 列的数据类型（用于 Unique Key 模型）。
     public static final String PROPERTIES_SEQUENCE_TYPE = "sequence_type";
+    // Sequence 列名。
     public static final String PROPERTIES_SEQUENCE_COL = "sequence_col";
-
+    // Sequence 映射规则。
     public static final String PROPERTIES_SEQUENCE_MAPPING = "sequence_mapping";
-
+    // 交换表操作属性。
     public static final String PROPERTIES_SWAP_TABLE = "swap";
-
+    // 节点 Tag 归属位置。
     public static final String TAG_LOCATION = "tag.location";
-
+    // 禁用查询。
     public static final String PROPERTIES_DISABLE_QUERY = "disable_query";
-
+    // 禁用导入。
     public static final String PROPERTIES_DISABLE_LOAD = "disable_load";
-
+    // 远端冷热存储策略名称。
     public static final String PROPERTIES_STORAGE_POLICY = "storage_policy";
-
+    // 是否禁用自动 Compaction。
     public static final String PROPERTIES_DISABLE_AUTO_COMPACTION = "disable_auto_compaction";
 
     // Legacy persisted switch for flatten-nested variant behavior before it was deprecated.
@@ -177,7 +205,8 @@ public class PropertyAnalyzer {
     public static final String PROPERTIES_ROW_STORE_COLUMNS = "row_store_columns";
 
     public static final String PROPERTIES_SKIP_WRITE_INDEX_ON_LOAD = "skip_write_index_on_load";
-
+    // Compaction 策略（如 size_based 基于大小，time_series 基于时间序列，binlog）。
+    // 对应的时间序列 Compaction 目标大小、文件数阈值、时间阈值、空 Rowset 阈值、层级阈值、垂直 Compaction 列组大小等默认常数。
     public static final String PROPERTIES_COMPACTION_POLICY = "compaction_policy";
 
     public static final String PROPERTIES_TIME_SERIES_COMPACTION_GOAL_SIZE_MBYTES =
@@ -234,7 +263,9 @@ public class PropertyAnalyzer {
     // query performance significantly.
     // For the detail design, see the [DISP-018](https://cwiki.apache.org/confluence/
     // display/DORIS/DSIP-018%3A+Support+Merge-On-Write+implementation+for+UNIQUE+KEY+data+model)
+    // Unique Key 模型是否启用写时合并（Merge-on-Write）。
     public static final String ENABLE_UNIQUE_KEY_MERGE_ON_WRITE = "enable_unique_key_merge_on_write";
+    // 是否跳过 Bitmap 列。
     public static final String ENABLE_UNIQUE_KEY_SKIP_BITMAP_COLUMN = "enable_unique_key_skip_bitmap_column";
     private static final Logger LOG = LogManager.getLogger(PropertyAnalyzer.class);
     public static final String COMMA_SEPARATOR = ",";
@@ -300,16 +331,22 @@ public class PropertyAnalyzer {
     // stream properties
     public static final String PROPERTIES_STREAM_TYPE = "type";
     public static final String PROPERTIES_STREAM_SHOW_INITIAL_ROWS = "show_initial_rows";
-
+    // 定义了属性重写的动作类型
     public enum RewriteType {
+        // 强制写入属性（无论原来是否存在）
         PUT,      // always put property
+        // 仅当属性原本存在时才替换其值。
         REPLACE,  // replace if exists property
+        // 删除指定的属性。
         DELETE,   // delete property
     }
-
+    // 封装了需要重写的属性及其行为。
     public static class RewriteProperty {
+        // 重写类型（RewriteType）
         RewriteType rewriteType;
+        // 属性键。
         String key;
+        // 属性值。
         String value;
 
         private RewriteProperty(RewriteType rewriteType, String key, String value) {
@@ -363,6 +400,7 @@ public class PropertyAnalyzer {
     }
 
     private static class SingletonHolder {
+        // 通过 EnvFactory.getInstance().createPropertyAnalyzer() 初始化的全局唯一的 PropertyAnalyzer 实例。
         private static final PropertyAnalyzer INSTANCE = EnvFactory.getInstance().createPropertyAnalyzer();
     }
 
@@ -378,26 +416,38 @@ public class PropertyAnalyzer {
      * @return new DataProperty
      * @throws AnalysisException property has invalid key->value
      */
+    // 解析与校验数据属性（DataProperty）
+    // 主要用于在执行建表、修改分区（Alter Partition）等 DDL 操作时，对用户传入的存储相关属性（如存储介质、降冷时间、冷热存储策略、可变性等）进行解析、合法性校验、默认值填充以及安全限制检查，
+    // 并最终组装成 Doris 内部的 DataProperty 对象。
+    // Map<String, String> properties： 作用：用户在 SQL DDL 语句中通过 PROPERTIES (...) 传入的原始配置键值对集合。
+    // final DataProperty oldDataProperty： 已有的旧数据属性对象（例如在修改分区属性时，继承表或原分区的配置）。
     public static DataProperty analyzeDataProperty(Map<String, String> properties, final DataProperty oldDataProperty)
             throws AnalysisException {
+        // 如果传入的属性 properties 为空或者为 null，说明用户没有做任何修改，直接返回原有的 oldDataProperty。
         if (properties == null || properties.isEmpty()) {
             return oldDataProperty;
         }
-
+        // 初始化为旧的存储介质（SSD 或 HDD）
         TStorageMedium storageMedium = oldDataProperty.getStorageMedium();
+        // 初始化为旧的降冷时间戳。
         long cooldownTimestamp = oldDataProperty.getCooldownTimeMs();
+        // 记录旧的远端存储策略名称。
         final String oldStoragePolicy = oldDataProperty.getStoragePolicy();
         // When we create one table with table's property set storage policy,
         // the properties wouldn't contain storage policy so the hasStoragePolicy would be false,
         // then we would just set the partition's storage policy the same as the table's
         String newStoragePolicy = oldStoragePolicy;
+        // 标记本次请求中用户是否显式指定了存储策略。
         boolean hasStoragePolicy = false;
+        // 标记用户是否显式指定了存储介质。
         boolean storageMediumSpecified = false;
+        // 标记数据是否处于同步状态中。
         boolean isBeingSynced = false;
-
+        // 遍历用户传入的 properties。如果 Key 匹配存储介质 storage_medium，则校验其值是否为 SSD 或 HDD（忽略大小写）：
         for (Map.Entry<String, String> entry : properties.entrySet()) {
             String key = entry.getKey();
             String value = entry.getValue();
+            // 如果 Key 匹配存储介质 storage_medium，则校验其值是否为 SSD 或 HDD（忽略大小写）
             if (key.equalsIgnoreCase(PROPERTIES_STORAGE_MEDIUM)) {
                 if (value.equalsIgnoreCase(TStorageMedium.SSD.name())) {
                     storageMedium = TStorageMedium.SSD;
@@ -408,6 +458,7 @@ public class PropertyAnalyzer {
                 } else {
                     throw new AnalysisException("Invalid storage medium: " + value);
                 }
+            // 解析降冷时间 storage_cooldown_tim
             } else if (key.equalsIgnoreCase(PROPERTIES_STORAGE_COOLDOWN_TIME)) {
                 try {
                     DateLiteral dateLiteral = DateLiteralUtils.createDateLiteral(value,
@@ -417,6 +468,7 @@ public class PropertyAnalyzer {
                     LOG.warn("dateLiteral failed, use max cool down time", e);
                     cooldownTimestamp = DataProperty.MAX_COOLDOWN_TIME_MS;
                 }
+            // 匹配 storage_policy：将 hasStoragePolicy 设为 true，并更新 newStoragePolicy 为用户指定的值。
             } else if (key.equalsIgnoreCase(PROPERTIES_STORAGE_POLICY)) {
                 hasStoragePolicy = true;
                 newStoragePolicy = value;
@@ -424,7 +476,7 @@ public class PropertyAnalyzer {
                 isBeingSynced = Boolean.parseBoolean(value);
             }
         } // end for properties
-
+        // 清理已消费的属性 Key，防止它们残留而触发外层的“未知属性”报错。最后通过断言确保 storageMedium 不为空。
         properties.remove(PROPERTIES_STORAGE_MEDIUM);
         properties.remove(PROPERTIES_STORAGE_COOLDOWN_TIME);
         properties.remove(PROPERTIES_STORAGE_POLICY);
@@ -452,6 +504,7 @@ public class PropertyAnalyzer {
         }
 
         // when isBeingSynced property is set to true, the storage policy will be ignored
+        // 如果数据正处于同步状态中 (isBeingSynced = true)，则自动忽略并清空存储策略。
         if (isBeingSynced) {
             hasStoragePolicy = false;
             newStoragePolicy = "";
@@ -511,7 +564,7 @@ public class PropertyAnalyzer {
         }
         return dataProperty;
     }
-
+    // 解析前缀索引（短 Key / Short Key）的列数（short_key）
     public static short analyzeShortKeyColumnCount(Map<String, String> properties) throws AnalysisException {
         short shortKeyColumnCount = (short) -1;
         if (properties != null && properties.containsKey(PROPERTIES_SHORT_KEY)) {
@@ -555,7 +608,7 @@ public class PropertyAnalyzer {
         }
         return replicationNum;
     }
-
+    // 解析导入时最少成功的副本数（min_load_replica_num）
     public static short analyzeMinLoadReplicaNum(Map<String, String> properties) throws AnalysisException {
         short minLoadReplicaNum = -1;
         if (properties != null && properties.containsKey(PROPERTIES_MIN_LOAD_REPLICA_NUM)) {
@@ -573,7 +626,7 @@ public class PropertyAnalyzer {
         }
         return minLoadReplicaNum;
     }
-
+    // 解析存储底层类型（storage_type），默认返回列式存储（TStorageType.COLUMN）
     public static TStorageType analyzeStorageType(Map<String, String> properties) throws AnalysisException {
         // default is COLUMN
         TStorageType tStorageType = TStorageType.COLUMN;
@@ -590,7 +643,7 @@ public class PropertyAnalyzer {
 
         return tStorageType;
     }
-
+    // 解析 Tablet 类型（tablet_type），用于区分是磁盘型（disk）还是内存型（memory）
     public static TTabletType analyzeTabletType(Map<String, String> properties) throws AnalysisException {
         // default is TABLET_TYPE_DISK
         TTabletType tTabletType = TTabletType.TABLET_TYPE_DISK;
@@ -621,7 +674,7 @@ public class PropertyAnalyzer {
         }
         return version;
     }
-
+    // 解析并校验文件缓存的 TTL（Time-To-Live）秒数。确保输入的数值在合法范围内（$0$ 到 MAX_FILE_CACHE_TTL_SECONDS），防止底层 BE 发生整数溢出。
     public static long analyzeTTL(Map<String, String> properties) throws AnalysisException {
         long ttlSeconds = 0;
         if (properties != null && properties.containsKey(PROPERTIES_FILE_CACHE_TTL_SECONDS)) {

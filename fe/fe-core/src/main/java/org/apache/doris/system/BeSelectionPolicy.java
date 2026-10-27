@@ -36,32 +36,45 @@ import java.util.stream.Collectors;
 /**
  * Selection policy for building BE nodes
  */
+// 核心的后端节点选择策略类
+// 采用经典的 Builder 模式（建造者模式），用于封装为 Tablet 创建、查询、导入等操作挑选 BE 节点时的各种过滤和偏好规则。
+// 统一封装节点选择条件：在分布式系统中，挑选节点需要考虑多维度的限制（如节点是否存活、是否被下线、磁盘空间是否超限、节点所属的 Tag 标签、存储介质类型、是否允许在同一台宿主机上分布多个副本等）。BeSelectionPolicy 将这些复杂的过滤条件聚合成一个策略对象。
+// 过滤与候选集生成：提供 isMatch() 和 getCandidateBackends() 方法，对集群中所有的 Backend 节点进行精准筛选与洗牌，选出满足特定业务场景的最优候选节点列表。
 public class BeSelectionPolicy {
     private static final Logger LOG = LogManager.getLogger(BeSelectionPolicy.class);
-
+    // 要求节点必须是调度可用的
     public boolean needScheduleAvailable = false;
+    // 要求节点必须是查询可用的
     public boolean needQueryAvailable = false;
+    // 要求节点必须是导入可用的
     public boolean needLoadAvailable = false;
+    // 要求节点不能处于下线或下线迁移状态
     public boolean needNonDecommissioned = false;
     // Resource tag. Empty means no need to consider resource tag.
+    // 资源标签集合。如果非空，则只有标签匹配的节点才能被选中（为空时表示不限制 Tag）。
     public Set<Tag> resourceTags = Sets.newHashSet();
     // storage medium. null means no need to consider storage medium.
+    // 期望的存储介质类型（如 SSD 或 HDD）。为 null 时表示不限制介质。
     public TStorageMedium storageMedium = null;
     // Check if disk usage reaches limit. false means no need to check.
+    // 期望的存储介质类型（如 SSD 或 HDD）。为 null 时表示不限制介质。
     public boolean checkDiskUsage = false;
     // If set to false, do not select backends on same host.
+    // 是否允许在同一台宿主机（Host）上选择多个后端节点。
     public boolean allowOnSameHost = false;
-
+    // 是否优先选择纯计算节点（Compute Node / CN）。
     public boolean preferComputeNode = false;
+    // 期望选出的后端节点数量。
     public int expectBeNum = 0;
-
+    // 是否启用轮询（Round-Robin）方式选择节点。
     public boolean enableRoundRobin = false;
     // if enable round robin, choose next be from nextRoundRobinIndex
     // call SystemInfoService::selectBackendIdsByPolicy will update nextRoundRobinIndex
+    // 启用轮询时的下一个起始索引位置。
     public int nextRoundRobinIndex = -1;
-
+    // 优先考虑的主机位置列表。若匹配到会优先采用。
     public List<String> preferredLocations = new ArrayList<>();
-
+    // 要求节点必须处于存活状态
     public boolean requireAliveBe = false;
 
     private BeSelectionPolicy() {
@@ -150,7 +163,7 @@ public class BeSelectionPolicy {
             return policy;
         }
     }
-
+    // 判断单个 Backend 节点是否满足当前策略的所有过滤规则。
     private boolean isMatch(Backend backend) {
         // Compute node is only used when preferComputeNode is set.
         if (!preferComputeNode && backend.isComputeNode()) {
@@ -159,7 +172,7 @@ public class BeSelectionPolicy {
             }
             return false;
         }
-
+        // 校验各项可用性开关（如 needScheduleAvailable、needQueryAvailable、needLoadAvailable、needNonDecommissioned、resourceTags、storageMedium、requireAliveBe），若不满足则返回 false。
         if (needScheduleAvailable && !backend.isScheduleAvailable()
                 || needQueryAvailable && !backend.isQueryAvailable()
                 || needLoadAvailable && !backend.isLoadAvailable()
@@ -191,7 +204,7 @@ public class BeSelectionPolicy {
         }
         return true;
     }
-
+    // 核心候选后端过滤与挑选方法。
     public List<Backend> getCandidateBackends(Collection<Backend> backends) {
         List<Backend> filterBackends = backends.stream().filter(this::isMatch)
                 .collect(Collectors.toList());

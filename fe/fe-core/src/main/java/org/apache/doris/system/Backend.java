@@ -62,90 +62,115 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * This class extends the primary identifier of a Backend with ephemeral state,
  * eg usage information, current administrative state etc.
  */
+// Backend 是一个核心的系统管理类，用于描述和管理集群中的 Backend（简称 BE，即计算与存储节点）。
+// 它不仅记录了节点的静态网络配置、端口和物理资源信息，还追踪了节点的动态运行状态（如存活状态、心跳信息、磁盘空间、负载以及各种可用性开关等）。
+// 统一管理 BE 节点生命周期与元数据：维护 BE 的唯一标识（ID）、主机地址、各种网络端口（心跳端口、RPC 端口、Web 服务的 Http 端口、Brpc 端口等）。
+// 心跳检测与健康监控：通过心跳（Heartbeat）机制定期与 BE 交互，收集 BE 的运行状态、CPU 核心数、物理内存、磁盘健康状况及剩余空间，判定节点是否存活（Alive）。
+// 调度与负载评估：为 Doris 的分片调度器提供决策依据。通过判断 BE 是否可用（如 isQueryAvailable、isScheduleAvailable、isLoadAvailable），决定是否能向其分发查询、写入任务或创建副本。
+// 元数据持久化：实现了 Writable 接口，支持通过 Gson 序列化并记录到 EditLog 中，确保集群重启后节点状态能够正确恢复。
 public class Backend implements Writable {
     private static final Logger LOG = LogManager.getLogger(Backend.class);
 
     // Represent a meaningless IP
     public static final String DUMMY_IP = "0.0.0.0";
-
+    // 节点的全局唯一标识 ID。
     @SerializedName("id")
     private long id;
+    // 节点的 IP 地址或主机名。
     @SerializedName("host")
     private volatile String host;
+    // 当前 BE 运行的软件版本号。
     private String version;
-
+    // 心跳服务端口。
     @SerializedName("heartbeatPort")
     private int heartbeatPort; // heartbeat
+    // BE 内部服务端口。
     @SerializedName("bePort")
     private volatile int bePort; // be
+    // Web 服务 / HTTP 访问端口。
     @SerializedName("httpPort")
     private volatile int httpPort; // web service
+    // BE 的 RPC 端口。
     @SerializedName("beRpcPort")
     private volatile int beRpcPort; // be rpc port
+    // Baidu RPC 端口，用于高效的数据传输和通信。
     @SerializedName("brpcPort")
     private volatile int brpcPort = -1;
+    // Arrow Flight SQL 服务端口。
     @SerializedName("arrowFlightSqlPort")
     private volatile int arrowFlightSqlPort = -1;
-
+    // 上次收到心跳更新的时间戳。
     @SerializedName("lastUpdateMs")
     private volatile long lastUpdateMs;
+    // BE 进程上次启动的时间戳（也用作进程纪元 process epoch）。
     @SerializedName("lastStartTime")
     private volatile long lastStartTime;
+    // 节点存活起始时间戳。
     @SerializedName("liveSince")
     private volatile long liveSince;
+    // 节点当前的存活状态（布尔原子类）。
     @SerializedName("isAlive")
     private AtomicBoolean isAlive;
-
+    // 标记节点是否已被下线（Decommissioned）
     @SerializedName("isDecommissioned")
     private AtomicBoolean isDecommissioned;
-
+    // 标记节点是否正处于下线迁移过程中（默认 false）。
     private AtomicBoolean isDecommissioning = new AtomicBoolean(false);
 
     // rootPath -> DiskInfo
+    // 根路径（RootPath）到 DiskInfo 的不可变映射，记录了该 BE 上所有挂载磁盘的容量、状态与介质类型。
     @SerializedName("disksRef")
     private volatile ImmutableMap<String, DiskInfo> disksRef;
-
+    // 上次累积发布任务数。
     private Long lastPublishTaskAccumulatedNum = 0L;
-
+    // 当前运行中的任务数。
     private Long runningTasks = 0L;
-
+    // 最近一次心跳失败时的错误信息
     private String heartbeatErrMsg = "";
 
     // This is used for the first time we init pathHashToDishInfo in SystemInfoService.
     // after init it, this variable is set to true.
+    // 标记是否已经完成了路径信息的初次初始化。
     private boolean initPathInfo = false;
-
+    // 最近一次丢失心跳的时间。
     private long lastMissingHeartbeatTime = -1;
     // the max tablet compaction score of this backend.
     // this field is set by tablet report, and just for metric monitor, no need to persist.
+    // 该 BE 上 Tablet 的最大 Compaction 得分（主要用于指标监控）。
     private volatile long tabletMaxCompactionScore = 0;
 
     // additional backendStatus information for BE, display in JSON format
+    // 封装了 BE 的额外状态信息（如是否禁用查询、禁用导入、是否关闭、当前 Fragment 数量等）。
     @SerializedName("backendStatus")
     private BackendStatus backendStatus = new BackendStatus();
     // the locationTag is also saved in tagMap, use a single field here to avoid
     // creating this everytime we get it.
+    // 位置标签（默认值 Tag.DEFAULT_BACKEND_TAG）。
     @SerializedName(value = "locationTag", alternate = {"tag"})
     private Tag locationTag = Tag.DEFAULT_BACKEND_TAG;
-
+    // 节点角色标签（默认值 Tag.DEFAULT_NODE_ROLE_TAG）
     @SerializedName("nodeRole")
     private Tag nodeRoleTag = Tag.DEFAULT_NODE_ROLE_TAG;
 
     // tag type -> tag value.
     // A backend can only be assigned to one tag type, and each type can only have one value.
+    // 标签类型的键值对映射，用于支持多 Tag 隔离及云原生属性。
     @SerializedName("tagMap")
     private Map<String, String> tagMap = Maps.newHashMap();
-
+    // 平滑升级过程中的源/目标节点标记。
     private boolean isSmoothUpgradeSrc = false; // This be process is old process when doing smooth upgrade
     private boolean isSmoothUpgradeDst = false; // This be process is new process when doing smooth upgrade
 
     // cpu cores
+    // CPU 核心数。
     @SerializedName("cpuCores")
     private int cpuCores = 1;
     // The physical memory available for use by BE.
+    // BE 可用的物理内存大小。
     @SerializedName("beMemory")
     private long beMemory = 0;
     // from config::pipeline_executor_size , default equal cpuCores
+    // Pipeline 执行器大小（通常等于 CPU 核心数）。
     @SerializedName("pipelineExecutorSize")
     private int pipelineExecutorSize = 1;
 
@@ -155,8 +180,9 @@ public class Backend implements Writable {
     // will be marked as dead.
     // And once it back to alive, reset this counter.
     // No need to persist, because only master FE handle heartbeat.
+    // 心跳连续失败计数器。超过配置阈值后会被判定为死亡。
     private int heartbeatFailureCounter = 0;
-
+    // 下一次强制写入 EditLog 的心跳时间（带随机偏移，避免集中写入）。
     private long nextForceEditlogHeartbeatTime = System.currentTimeMillis() + (new SecureRandom()).nextInt(60 * 1000);
 
     public Backend() {
@@ -699,7 +725,7 @@ public class Backend implements Writable {
         }
         return exceedLimit;
     }
-
+    // 核心磁盘更新方法。解析从 BE 汇报上来的最新磁盘状态，识别新增、删除或状态变更的磁盘，触发路径信息更新并写 EditLog。
     public void updateDisks(Map<String, TDisk> backendDisks) {
         ImmutableMap<String, DiskInfo> disks = disksRef;
         // The very first time to init the path info
@@ -868,6 +894,8 @@ public class Backend implements Writable {
      * handle Backend's heartbeat response.
      * return true if any port changed, or alive state is changed.
      */
+    // 核心心跳响应处理方法。解析 BE 返回的心跳响应：若心跳成功（HbStatus.OK），则更新版本号、各项端口、服务状态、内存、心跳时间戳；
+    // 若节点由死转生，则更新启动时间戳（lastStartTime）与存活状态，并返回状态或端口是否发生过改变。
     public boolean handleHbResponse(BackendHbResponse hbResponse, boolean isReplay) {
         boolean isChanged = false;
         if (hbResponse.getStatus() == HbStatus.OK) {
