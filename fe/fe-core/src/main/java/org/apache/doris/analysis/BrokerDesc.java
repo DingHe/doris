@@ -44,11 +44,20 @@ import java.util.Map;
 //   "username" = "user0",
 //   "password" = "password0"
 // )
+// 门用于解析、封装和管理 SQL 语句中通过 WITH BROKER "broker0" (...)
+// 或其他存储配置（如 S3、HDFS 等）指定的连接凭证、属性参数和存储后端类型，并负责为底层的导入任务提供文件路径规范化、文件类型映射以及元数据的持久化读写。
+// 存储与 Broker 属性封装：解析用户在导入 SQL 中指定的存储配置（如用户名、密码、AccessKey、SecretKey 等）。
+// 动态存储适配器绑定：根据传入的属性或存储类型，自动识别并绑定对应的 StorageAdapter（如 S3 适配器、Broker 适配器等）。
+// 文件路径校验与规范化：提供 getFileLocation 方法，确保文件路径 URI 符合底层存储客户端的要求。
+// RPC 协议类型转换：将 Doris 内部的存储类型映射为 Thrift 层识别的 TFileType（如 FILE_S3、FILE_HDFS、FILE_BROKER 等），供 BE（Backend）节点执行加载时使用。
 public class BrokerDesc extends StorageDesc implements Writable {
 
     // just for multi load
+    // 专门用于标识多并发导入（Multi Load）的特殊 Broker 标识符。
     public static final String MULTI_LOAD_BROKER = "__DORIS_MULTI_LOAD_BROKER__";
+    // 用于在多并发导入中标识关联的后端节点 Key。
     public static final String MULTI_LOAD_BROKER_BACKEND_KEY = "__DORIS_MULTI_LOAD_BROKER_BACKEND__";
+    // 标记该描述符是否已转换为 S3 存储类型。
     @Deprecated
     @SerializedName("cts3")
     private boolean convertedToS3 = false;

@@ -36,13 +36,19 @@ import java.util.Map;
  *        |
  *  The broker's StorageBackend.StorageType desc
  */
+// 专门用于描述和管理外部存储系统（如 S3、OSS、COS、Broker 等）的连接属性与配置。
+// 统一存储配置封装：在用户提交涉及外部存储交互的 SQL 命令（如 Broker Load、外部表访问等）时，封装存储的名称、存储类型（StorageType）以及详细的连接凭证和参数属性（Properties）。
+// SPI 适配器懒加载绑定：引入了 StorageAdapter（存储适配器门面），根据传入的配置属性或存储类型，懒加载并绑定对应的底层存储实现，简化云存储（S3/BOS/OSS 等）和 Broker 交互的逻辑。
+// 元数据持久化恢复：支持通过 Gson 序列化和反序列化持久化存储属性，并通过 gsonPostProcess() 在反序列化后自动恢复非序列化的适配器状态。
 public class StorageDesc extends ResourceDesc implements GsonPostProcessable {
-
+    // 存储后端的类型枚举
     @Deprecated
     @SerializedName("st")
     protected StorageBackend.StorageType storageType;
 
     /** SPI facade binding; lazily bound from the raw properties. Not Gson-serialized. */
+    // SPI 适配器门面对象。
+    // 通过原始属性配置懒加载绑定，用于屏蔽不同底层存储（如各种云存储客户端）的具体实现细节。
     protected StorageAdapter storageAdapter;
 
     public StorageDesc() {

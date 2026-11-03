@@ -82,77 +82,100 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-
+// LoadJob 是负责管理和调度数据导入任务（如 Broker Load、Insert、Copy 等）的核心抽象基类
+// 定义了导入任务从创建、执行、加载、提交到完成或失败的整个生命周期管理框架，并与 Doris 的全局事务管理器（GlobalTransactionMgr）紧密结合，确保导入过程的一致性和可靠性。
+// 主要承担以下职责
+// 生命周期管理：维护导入任务的状态机（如 PENDING、LOADING、COMMITTED、FINISHED、CANCELLED 等）。
+// 事务协同：作为事务状态变更回调类（继承自 AbstractTxnStateChangeCallback），监听并响应 Doris 内部全局事务的提交、中止等事件。
+// 并发控制：利用读写锁（ReentrantReadWriteLock）保证多线程并发访问和修改任务状态时的线程安全性。
+// 属性与配置管理：管理导入任务所需的各类参数（超时时间、内存限制、最大过滤比例、时区等）及鉴权信息。
+// 统计与监控：记录任务进度、扫描行数/字节数、错误行信息（Error Tablets）、耗时等统计指标，支持通过 SQL 命令（如 SHOW LOAD）展示。
 public abstract class LoadJob extends AbstractTxnStateChangeCallback
                 implements LoadTaskCallback, Writable, GsonPostProcessable {
 
     private static final Logger LOG = LogManager.getLogger(LoadJob.class);
-
+    // 正常行数
     public static final String DPP_NORMAL_ALL = "dpp.norm.ALL";
+    // 异常行数
     public static final String DPP_ABNORMAL_ALL = "dpp.abnorm.ALL";
+    // 未选中行数
     public static final String UNSELECTED_ROWS = "unselected.rows";
-
+    // 导入作业的唯一标识 ID（全局唯一）
     @SerializedName("id")
     protected long id;
+    // 目标数据库的 ID
     // input params
     @SerializedName("did")
     protected long dbId;
+    // 导入作业的标签（Label），用于防止重复导入
     @SerializedName("lb")
     protected String label;
+    // 作业当前所处的生命周期状态
     @SerializedName("st")
     protected JobState state = JobState.PENDING;
+    // 导入任务类型（如 EtlJobType 定义的 Broker、Copy、Insert 等）
     @SerializedName("jt")
     protected EtlJobType jobType;
     // the auth info could be null when load job is created before commit named 'Persist auth info in load job'
+    // 鉴权信息对象，用于检查用户是否有对目标表执行 LOAD 的权限。
     @SerializedName("ai")
     protected AuthorizationInfo authorizationInfo;
-
+    // 作业创建的时间戳（毫秒）
     @SerializedName("ct")
     protected long createTimestamp = System.currentTimeMillis();
+    // 开始加载数据的时间戳（默认 -1）
     @SerializedName("lst")
     protected long loadStartTimestamp = -1;
+    // 作业完成（成功或失败）的时间戳（默认 -1）
     @SerializedName("ft")
     protected long finishTimestamp = -1;
-
+    // 关联的 Doris 全局事务 ID
     @SerializedName("txid")
     protected long transactionId;
+    // 失败信息对象（FailMsg），记录取消或失败的类型及具体原因。
     @SerializedName("fm")
     protected FailMsg failMsg;
+    // 并发映射表（Map），保存了该作业包含的所有子任务（LoadTask ID 到任务对象的映射）。
     protected Map<Long, LoadTask> idToTasks = Maps.newConcurrentMap();
+    // 记录已完成的子任务 ID 集合
     protected Set<Long> finishedTaskIds = Sets.newHashSet();
+    // 加载状态对象（EtlStatus），包含详细的计数器、追踪链接和错误信息。
     @SerializedName("lsts")
     protected EtlStatus loadingStatus = new EtlStatus();
     // 0: the job status is pending
     // n/100: n is the number of task which has been finished
     // 99: all of tasks have been finished
     // 100: txn status is visible and load has been finished
+    // 进度值（0-100）：0 表示 PENDING；n/100 表示已完成 n 个任务；99 表示所有任务完成；100 表示事务可见且导入结束。
     @SerializedName("pgs")
     protected int progress;
 
     // non-persistence
     // This param is set true during txn is committing.
     // During committing, the load job could not be cancelled.
+    // 非持久化标志位。当事务正在提交时设为 true，此时作业不能被取消。
     protected boolean isCommitting = false;
-
+    // 可重入读写锁（公平锁），用于保护作业内部状态和属性的并发修改。
     protected ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
-
+    // 请求唯一 ID，用于检查导入开始请求是否为重复请求。
     // this request id is only used for checking if a load begin request is a duplicate request.
     protected TUniqueId requestId;
-
+    // 导入统计对象，用于追踪扫描的行数、字节数等明细。
     protected LoadStatistic loadStatistic = new LoadStatistic();
 
     // This map is used to save job property.
+    // 保存作业属性参数的 Map（如超时时间、内存限制、过滤比例等）。
     @SerializedName("jp")
     private Map<String, Object> jobProperties = Maps.newHashMap();
-
+    // 错误 Tablet 信息列表，记录导入过程中出错的 Tablet 及其错误原因。
     protected List<ErrorTabletInfo> errorTabletInfos = Lists.newArrayList();
-
+    // 提交该导入作业的用户身份（UserIdentity）。
     @SerializedName("ui")
     protected UserIdentity userInfo = UserIdentity.UNKNOWN;
-
+    // 导入作业的备注信息（默认为空字符串）。
     @SerializedName("cmt")
     protected String comment = "";
-
+    // 关联的 Pipeline Workload Group 配置列表（用于资源隔离）。
     protected List<TPipelineWorkloadGroup> tWorkloadGroups = null;
 
     public LoadJob(EtlJobType jobType) {
@@ -416,7 +439,8 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback
             writeUnlock();
         }
     }
-
+    // 内部状态更新核心逻辑。包含防重入保护（若已处于终态则拒绝更新），
+    // 并根据目标状态分发到对应方法（UNKNOWN、LOADING、COMMITTED、FINISHED）。
     protected boolean unprotectedUpdateState(JobState jobState) {
         if (this.state.isFinalState()) {
             // This is a simple self-protection mechanism to prevent jobs
@@ -607,16 +631,24 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback
      * @param failMsg
      * @param abortTxn true: abort txn when cancel job, false: only change the state of job and ignore abort txn
      */
+    // 用于在无需加显式锁和不记录 EditLog（元数据日志）的情况下，强制取消 Broker 导入作业的核心清理方法。
+    // 记录取消日志、更新加载状态与失败原因、清理和重置任务列表、终止底层所有运行中的 Coordinator（调度协调器）、清理事务回调工厂，并根据参数决定是否中止（Abort）关联的分布式事务，最终将作业状态变更为 CANCELLED。
     protected void unprotectedExecuteCancel(FailMsg failMsg, boolean abortTxn) {
         LOG.warn(new LogBuilder(LogKey.LOAD_JOB, id).add("transaction_id", transactionId)
                 .add("error_msg", "Failed to execute load with error: " + failMsg.getMsg()).build());
 
         // clean the loadingStatus
+        // 2. 清理并更新加载状态详情
+        // 将 loadingStatus（用于客户端展示的 ETL 状态）设置为 CANCELLED（已取消），
+        // 并把具体的失败原因设置进去。
         loadingStatus.setState(TEtlState.CANCELLED);
         loadingStatus.setFailMsg(failMsg.getMsg());
         // get load ids of all loading tasks, we will cancel their coordinator process later
+        // 3. 收集所有正在加载的子任务的 Load ID
+        // 创建一个列表用来存放所有运行中任务的唯一标识（TUniqueId loadId）。
         List<TUniqueId> loadIds = Lists.newArrayList();
         for (LoadTask loadTask : idToTasks.values()) {
+            // 如果当前任务属于 LoadLoadingTask（加载阶段的具体子任务），则提取出其对应的 loadId。
             if (loadTask instanceof LoadLoadingTask) {
                 loadIds.add(((LoadLoadingTask) loadTask).getLoadId());
             }
@@ -654,6 +686,10 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback
         }
 
         // cancel all running coordinators, so that the scheduler's worker thread will be released
+        // 7. 取消所有运行中的协调器（Coordinator），释放调度器线程资源
+        // 遍历前面收集到的所有 loadIds：
+        // 通过 QeProcessorImpl 获取对应的 Coordinator 实例，如果不为空，则调用 coordinator.cancel(...) 发送取消指令，
+        // 从而让底层正在向 BE 发送 RPC 或等待计算的调度器工作线程快速释放，避免资源泄漏。
         for (TUniqueId loadId : loadIds) {
             Coordinator coordinator = QeProcessorImpl.INSTANCE.getCoordinator(loadId);
             if (coordinator != null) {

@@ -781,11 +781,18 @@ void Block::set_columns(MutableColumns&& columns) {
         data[i].column = std::move(columns[i]);
     }
 }
-
+// 克隆当前 Block 的列结构元数据（包括列名和数据类型），而不复制或分配任何实际的列数据内容（数据指针被初始化为 nullptr），并支持通过索引偏移量（column_offset）来选择或重排特定的列。
+// const std::vector<int>* column_offset  列索引偏移量映射数组的指针（可空）。
+// 如果传入一个非空的 vector<int>，其中的每个整数代表当前 Block 中某一个列的下标索引。该方法会严格按照这个索引列表指定的顺序和范围来构建新 Block 的列骨架（常用于只需要提取部分特定列或调整列顺序的场景）。
+// 如果传入 nullptr，则表示全量克隆当前 Block 中的所有列结构。
 Block Block::clone_without_columns(const std::vector<int>* column_offset) const {
     Block res;
-
+    // // 2. 分支一：如果指定了列偏移量映射（column_offset != nullptr）
     if (column_offset != nullptr) {
+        // 向目标 Block (res) 中插入一个 ColumnWithTypeAndName（列、类型与名字的组合体）元数据结构：
+        // - `nullptr`：数据指针设为空，实现“不拷贝实际数据”的轻量化骨架克隆。
+        // - `data[(*column_offset)[i]].type`：通过 offset 映射找到原 Block 对应列的数据类型并复制。
+        // - `data[(*column_offset)[i]].name`：通过 offset 映射找到原 Block 对应列的列名并复制。
         size_t num_columns = column_offset->size();
         for (size_t i = 0; i < num_columns; ++i) {
             res.insert({nullptr, data[(*column_offset)[i]].type, data[(*column_offset)[i]].name});

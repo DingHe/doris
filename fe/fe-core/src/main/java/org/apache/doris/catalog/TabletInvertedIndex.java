@@ -49,17 +49,25 @@ import java.util.stream.Collectors;
  * Checkpoint thread is no need to modify this inverted index, because this inverted index will not be wrote
  * into images, all meta data are in catalog, and the inverted index will be rebuild when FE restart.
  */
+// 极其核心的数据分片倒排索引抽象基类
+// 在内存中维护了一套倒排索引结构（Key 为 Tablet ID，Value 为该 Tablet 关联的元数据或副本信息）。
+// 由于所有元数据原本就完整保存在 Catalog（目录树）中，该倒排索引不需要写入 Image 文件中，当 FE 节点重启时会自动进行重建。
+// 分片与元数据的快速反查：通过 Tablet ID 快速获取其所属的数据库、表、分区、物化视图以及存储介质等元数据（TabletMeta）。
+// 多并发读写保护：使用 StampedLock（乐观读写锁）保障高并发场景下对倒排索引操作的线程安全。
+// 集群副本调度与汇报桥梁：定义了集群节点汇报（tabletReport）、副本增删、均衡调度（Skew Balancer）等接口规范。
 public abstract class TabletInvertedIndex {
     private static final Logger LOG = LogManager.getLogger(TabletInvertedIndex.class);
-
+    // 表示“不存在”的默认整型占位符（-1）。
     public static final int NOT_EXIST_VALUE = -1;
-
+    // 默认的“不存在的 Tablet 元数据”对象，所有字段均初始化为 NOT_EXIST_VALUE（HDD 介质），用于在查询不到 TabletMeta 时作为安全兜底返回。
     public static final TabletMeta NOT_EXIST_TABLET_META = new TabletMeta(NOT_EXIST_VALUE, NOT_EXIST_VALUE,
             NOT_EXIST_VALUE, NOT_EXIST_VALUE, NOT_EXIST_VALUE, TStorageMedium.HDD);
-
+    // 邮戳锁（StampedLock），提供高效的读写锁分离机制，用于控制对内存中倒排索引的并发访问。
     private StampedLock lock = new StampedLock();
 
     // tablet id -> tablet meta
+    // 核心倒排映射表（采用高性能的 Fastutil 内存映射结构）。
+    // Key 为 tabletId（长整型），Value 为对应的 TabletMeta（Tablet 元数据对象）。
     protected Long2ObjectOpenHashMap<TabletMeta> tabletMetaMap = new Long2ObjectOpenHashMap<>();
 
     public TabletInvertedIndex() {
@@ -80,7 +88,8 @@ public abstract class TabletInvertedIndex {
     protected void writeUnlock(long stamp) {
         this.lock.unlockWrite(stamp);
     }
-
+    // BE 节点心跳/状态汇报处理方法
+    // 用于处理来自后端节点的 Tablet 状态同步、版本比对、迁移、恢复及孤儿分片清理等。
     public void tabletReport(long backendId, Map<Long, TTablet> backendTablets,
                              Map<Long, Long> backendPartitionsVersion,
                              final HashMap<Long, TStorageMedium> storageMediumMap,
@@ -119,7 +128,7 @@ public abstract class TabletInvertedIndex {
             readUnlock(stamp);
         }
     }
-
+    // 根据 tabletId 获取该分片在各个 BE 节点上的所有副本（Replica）列表。
     public abstract List<Replica> getReplicas(Long tabletId);
 
     // always add tablet before adding replicas

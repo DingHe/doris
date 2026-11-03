@@ -88,40 +88,47 @@ namespace doris {
   * - as 'mutable_ptr' should be unique, it's refcount is redundant - probably it would be better
   *   to use std::unique_ptr for it somehow.
   */
+// 写时复制模板类
+// 提供一套侵入式引用计数（Intrusive Reference Counting）与写时复制（Copy-on-Write）机制。它允许多个不可变指针（Ptr）高效共享同一个大型对象（例如大数据量的列对象）而无需复制；
+// 当需要对对象进行修改（Mutate）时，如果该对象被多个指针共享，系统会自动触发 clone() 深拷贝出一个独占的副本，从而保证函数式编程的不可变性与线程安全性。
 template <typename Derived>
 class COW {
+    // 原子引用计数器。记录当前对象被多少个智能指针所共享，确保在多线程环境下的线程安全。
     std::atomic_uint ref_counter;
 
 protected:
+    // 默认构造函数
     COW() : ref_counter(0) {}
-
+    // 拷贝构造函数
     COW(COW const&) : ref_counter(0) {}
-
+    // 拷贝赋值运算符
     COW& operator=(COW const&) { return *this; }
-
+    // 增加引用计数
     void add_ref() { ++ref_counter; }
-
+    // 减少引用计数（原子自减 --ref_counter）。当计数归零时，通过 delete static_cast<const Derived*>(this) 自动销毁对象。
     void release_ref() {
         if (--ref_counter == 0) {
             delete static_cast<const Derived*>(this);
         }
     }
-
+    // 向下转型辅助方法，将 COW 基类指针转换为具体的派生类（Derived*）指针。
     Derived* derived() { return static_cast<Derived*>(this); }
 
     const Derived* derived() const { return static_cast<const Derived*>(this); }
-
+    // 侵入式智能指针
+    // 模仿 boost::intrusive_ptr 实现的高性能引用计数智能指针，分为不可变指针 Ptr 和可变指针 MutablePtr 的底层支撑。
     template <typename T>
     class intrusive_ptr {
     public:
+        // 默认构造函数，初始化指针为空。
         intrusive_ptr() : t(nullptr) {}
-
+        // 带指针和是否增加引用计数参数的构造函数。
         intrusive_ptr(T* t, bool add_ref = true) : t(t) {
             if (t && add_ref) {
                 ((std::remove_const_t<T>*)t)->add_ref();
             }
         }
-
+        // 拷贝构造函数，自动对目标对象调用 add_ref()
         template <typename U>
         intrusive_ptr(intrusive_ptr<U> const& rhs) : t(rhs.get()) {
             if (t) {
@@ -134,19 +141,19 @@ protected:
                 ((std::remove_const_t<T>*)t)->add_ref();
             }
         }
-
+        // 析构函数，自动调用 release_ref()
         ~intrusive_ptr() {
             if (t) {
                 ((std::remove_const_t<T>*)t)->release_ref();
             }
         }
-
+        // 拷贝赋值与移动赋值运算符，通过惯用法（Copy-and-Swap）保证异常安全。
         template <typename U>
         intrusive_ptr& operator=(intrusive_ptr<U> const& rhs) {
             intrusive_ptr(rhs).swap(*this);
             return *this;
         }
-
+        // 移动构造函数，剥离原指针所有权。
         intrusive_ptr(intrusive_ptr&& rhs) : t(rhs.t) { rhs.t = nullptr; }
 
         intrusive_ptr& operator=(intrusive_ptr&& rhs) {
@@ -177,27 +184,27 @@ protected:
             intrusive_ptr(rhs).swap(*this);
             return *this;
         }
-
+        // 重置智能指针，释放旧对象并绑定新对象。
         void reset() { intrusive_ptr().swap(*this); }
 
         void reset(T* rhs) { intrusive_ptr(rhs).swap(*this); }
 
         void reset(T* rhs, bool add_ref) { intrusive_ptr(rhs, add_ref).swap(*this); }
-
+        // 返回裸指针 T*
         T* get() const { return t; }
-
+        // 剥离指针所有权但不减少引用计数，返回裸指针。
         T* detach() {
             T* ret = t;
             t = nullptr;
             return ret;
         }
-
+        // 交换两个指针。
         void swap(intrusive_ptr& rhs) {
             T* tmp = t;
             t = rhs.t;
             rhs.t = tmp;
         }
-
+        // 解引用与成员访问操作符（区分 const 与非 const 左值/右值引用）。
         T& operator*() const& { return *t; }
 
         T&& operator*() const&& { return const_cast<std::remove_const_t<T>&&>(*t); }
@@ -413,6 +420,8 @@ public:
   */
 class IColumn;
 class Field;
+// 继承辅助类
+// 专门配合 Doris 向量化列（IColumn）使用的辅助派生模板类。它简化了具体列类型（如 ColumnInt32、ColumnString 等）的样板代码，自动注入了针对 IColumn 的类型转换、数据切片选择（Selector）、多列插入等重载方法。
 template <typename Base, typename Derived>
 class COWHelper : public Base {
 public:

@@ -31,20 +31,32 @@ import org.apache.commons.lang3.StringUtils;
 
 // {"progress": "", "backendId": "", "taskSignature": "", "numOfErrorData": "",
 // "numOfTotalData": "", "taskId": "", "jobId": ""}
+// 当例行导入（Routine Load）的一个消费任务（Task）拉取并成功向后端（BE）写入一批数据、准备提交分布式事务时，
+// BE 会将该任务的执行统计指标（如导入行数、接收字节数、错误信息等）以及最新的数据源消费进度（如 Kafka 的 Partition Offset 偏移量）通过该类打包并回传给前端（FE），
+// 便 FE 更新作业状态、统计指标并推进消费进度。
+// 例行导入指标上报：记录例行导入单次任务的执行统计数据（如成功行数、过滤行数、消耗时间、接收字节数等）。
+// 消费进度同步（Offset 推进）：封装数据源的消费进度（支持 Kafka 或 Kinesis），供 FE 在事务提交成功后更新例行导入的消费位点。
 public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
-
+    // 例行导入作业（Routine Load Job）的唯一标识 ID。
     private long jobId;
+    // 例行导入具体某个消费任务（Task）的唯一全局 ID（Thrift TUniqueId 结构）。
     private TUniqueId taskId;
     @SerializedName(value = "fr")
+    // 被过滤掉的坏行数（例如数据格式不匹配、校验失败等被过滤的数据行数）。
     private long filteredRows;
     @SerializedName(value = "lr")
+    // 成功加载并写入存储引擎的数据行数。
     private long loadedRows;
     @SerializedName(value = "ur")
+    // 未被选中的行数（例如由于 SQL 的 WHERE 条件过滤而未参与导入的行数）。
     private long unselectedRows;
+    // 当前任务接收到的原始数据总字节数（Bytes）。
     @SerializedName(value = "rb")
     private long receivedBytes;
+    // 任务执行耗时（单位：毫秒）。
     @SerializedName(value = "tet")
     private long taskExecutionTimeMs;
+    // 例行导入的消费进度对象。多态支持 Kafka 进度（KafkaProgress）或 Kinesis 进度（KinesisProgress），记录当前的 Partition 消费 Offset。
     @SerializedName(value = "pro")
     private RoutineLoadProgress progress;
     private String errorLogUrl;

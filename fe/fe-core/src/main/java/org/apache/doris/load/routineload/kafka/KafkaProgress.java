@@ -45,22 +45,30 @@ import java.util.concurrent.locks.ReentrantLock;
  * the data before offset was already loaded in Doris
  */
 // {"partitionIdToOffset": {}}
+// Kafka 例行导入消费进度管理类
+// 专门用于跟踪和管理 Kafka 例行导入（Routine Load）作业中各个 Kafka 分区（Partition）的消费位点（Offset）进度。
+// 位点追踪与管理：在内存中维护 Kafka 分区 ID 到消费位点（Offset）的映射关系（partitionIdToOffset）。需要注意的是，这里保存的 Offset 通常是下一个需要被消费的消息位点。
+// 进度更新与事务闭环：当一个导入任务（Task）成功提交事务时，根据返回的附加信息（RLTaskTxnCommitAttachment）自动推进各个分区的消费位点。
+// 运维展示与 Lag 监控：提供可读的进度转换、JSON 序列化以及消费者延迟（Lag）计算方法，供 SHOW ROUTINE LOAD 等运维命令展示消费状态。
 public class KafkaProgress extends RoutineLoadProgress {
     private static final Logger LOG = LogManager.getLogger(KafkaProgress.class);
-
+    // 字符串常量，对应底层特殊位点起始值（-2），表示从 Kafka 分区最早的数据开始消费。
     public static final String OFFSET_BEGINNING = "OFFSET_BEGINNING"; // -2
+    // 字符串常量，对应底层特殊位点结束值（-1），表示从 Kafka 分区最新的数据开始消费。
     public static final String OFFSET_END = "OFFSET_END"; // -1
     // OFFSET_ZERO is just for show info, if user specified offset is 0
+    // 展示专用的字符串常量，当用户指定的初始位点为 0 时用于运维展示。
     public static final String OFFSET_ZERO = "OFFSET_ZERO";
-
+    // 分别对应 -2 和 -1 的数值常量，用于底层逻辑判断。
     public static final long OFFSET_BEGINNING_VAL = -2;
     public static final long OFFSET_END_VAL = -1;
 
     // (partition id, begin offset)
     // the offset saved here is the next offset need to be consumed
+    // 核心并发映射表。Key 为 Kafka 分区 ID（Integer），Value 为对应的消费位点 Offset（Long）。
     @SerializedName(value = "pito")
     private ConcurrentMap<Integer, Long> partitionIdToOffset = Maps.newConcurrentMap();
-
+    // 公平可重入锁（ReentrantLock(true)），用于在云模式（Cloud Mode）下保障多线程并发更新进度时的线程安全性。
     private ReentrantLock lock = new ReentrantLock(true);
 
     public KafkaProgress() {

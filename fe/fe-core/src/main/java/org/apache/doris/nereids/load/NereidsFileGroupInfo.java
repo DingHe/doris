@@ -62,6 +62,10 @@ import java.util.stream.IntStream;
 /**
  * NereidsFileGroupInfo
  */
+// 用于管理和调度文件导入任务（File Group Metadata & Scan Range Planning）的核心辅助类
+// 封装文件组（File Group）的元数据、文件状态列表（TBrokerFileStatus）、存储配置（BrokerDesc）以及目标表信息。
+// 同时，它负责计算文件扫描的并发度（实例数）、判断文件是否可切分（Splittable）、以及为 Doris 的分布式扫描节点（Scan Node）切分并生成底层的扫描范围位置（TScanRangeLocations），
+// 从而指导后端（BE）高效并行读取外部数据文件（如 HDFS、S3 或本地文件）。
 public class NereidsFileGroupInfo {
     private static final Logger LOG = LogManager.getLogger(NereidsFileGroupInfo.class);
 
@@ -69,29 +73,46 @@ public class NereidsFileGroupInfo {
      * JobType
      */
     public enum JobType {
+        // 批量导入作业（如 Broker Load）。
         BULK_LOAD,
+        // 流式导入作业（Stream Load）。
         STREAM_LOAD
     }
-
+    // 标识当前是批量导入还是流式导入。
     private FileGroupInfo.JobType jobType;
-
+    // 当前导入任务的全局唯一标识。
     private TUniqueId loadId;
+    // 所属的导入作业 ID。
     private long loadJobId;
+    // 关联的分布式事务 ID。
     private long txnId;
+    // 导入的目标表对象。
     private Table targetTable;
+    // 外部存储系统的访问凭证与配置描述符。
     private BrokerDesc brokerDesc;
+    // Nereids 格式的文件组描述，包含路径、列映射、过滤条件等。
     private NereidsBrokerFileGroup fileGroup;
+    // 该文件组下所有源文件的状态列表（包含文件路径、大小、是否可分片等）。
     private List<TBrokerFileStatus> fileStatuses;
+    // 添加的文件总数。
     private int filesAdded;
+    // 是否开启严格模式。
     private boolean strictMode;
+    // 导入任务的并发度。
     private int loadParallelism;
     // set by getFileStatusAndCalcInstance
+    // 计算得出的文件扫描实例（Scanner 任务）数量（默认初始化为 1）。
     private int numInstances = 1;
+    // 每个扫描实例平均处理的字节数（默认初始化为 0）。
     private long bytesPerInstance = 0;
     // used for stream load, FILE_LOCAL or FILE_STREAM
+    // 文件的存储类型（如 HDFS、LOCAL、S3 等）。
     private TFileType fileType;
+    // 隐藏列列表。
     private List<String> hiddenColumns = null;
+    // 唯一键表的更新模式（默认为 UPSERT）。
     private TUniqueKeyUpdateMode uniqueKeyUpdateMode = TUniqueKeyUpdateMode.UPSERT;
+    // Sequence 列的映射名称。
     private String sequenceMapCol = null;
 
     /**
@@ -193,11 +214,15 @@ public class NereidsFileGroupInfo {
     /**
      * getFileStatusAndCalcInstance
      */
+    // 计算当前文件组需要切分多少个扫描实例（numInstances）以及每个实例负责的字节数（bytesPerInstance）
     public void getFileStatusAndCalcInstance(FederationBackendPolicy backendPolicy) throws UserException {
+        // 若文件数为 0，则抛出异常。
         if (filesAdded == 0) {
             throw new UserException("No source file in this table(" + targetTable.getName() + ").");
         }
-
+        // Bulk Load 分支：累加所有文件的总字节数（totalBytes）；
+        // 根据配置项 min_bytes_per_broker_scanner 计算基础实例数；
+        // 结合集群可用 BE 节点数与 loadParallelism 计算总并发度上限；并受控于最大并发配置 max_broker_concurrency；确保实例数至少为 1。
         if (jobType == FileGroupInfo.JobType.BULK_LOAD) {
             long totalBytes = 0;
             for (TBrokerFileStatus fileStatus : fileStatuses) {
@@ -215,6 +240,7 @@ public class NereidsFileGroupInfo {
                         "Scan bytes per file scanner exceed limit: " + Config.max_bytes_per_broker_scanner);
             }
         } else {
+        // 流式导入无需切分，固定 numInstances = 1，bytesPerInstance = Long.MAX_VALUE。
             // stream load, not need to split
             numInstances = 1;
             bytesPerInstance = Long.MAX_VALUE;
@@ -225,6 +251,10 @@ public class NereidsFileGroupInfo {
     /**
      * createScanRangeLocations
      */
+    // 判断文件是否支持分片（Splittable），并分流调用对应的切分实现。
+    // 遍历所有文件，检查其格式类型（如 CSV、JSON）以及压缩类型（如 PLAIN）。
+    // 只有纯文本、未压缩且支持分片的 CSV 或 JSON 文件才会被认定为 isSplittable = true。
+    // 随后根据该标志位分别调用 createScanRangeLocationsSplittable 或 createScanRangeLocationsUnsplittable。
     public void createScanRangeLocations(NereidsParamCreateContext context,
             FederationBackendPolicy backendPolicy,
             List<TScanRangeLocations> scanRangeLocations) throws UserException {
@@ -258,6 +288,8 @@ public class NereidsFileGroupInfo {
     /**
      * createScanRangeLocationsUnsplittable
      */
+    // 针对不可分片的文件，将文件整体分配给不同的实例。
+    // 获取所有文件的大小，调用静态方法 assignFilesToInstances 将文件均衡分配到多个组中；为每个组创建 TScanRangeLocations 并在其中填充每个文件的范围描述（TFileRangeDesc）。
     public void createScanRangeLocationsUnsplittable(NereidsParamCreateContext context,
             FederationBackendPolicy backendPolicy,
             List<TScanRangeLocations> scanRangeLocations)
@@ -290,6 +322,8 @@ public class NereidsFileGroupInfo {
     /**
      * assignFilesToInstances
      */
+    // 利用优先队列（PriorityQueue）实现文件大小的贪心均衡分配。
+    // 按文件大小从大到小排序，每次将文件分配给当前累计字节数最小的实例组，确保各个实例负载均衡。
     public static List<List<Integer>> assignFilesToInstances(List<Long> fileSizes, int instances) {
         int n = Math.min(fileSizes.size(), instances);
         PriorityQueue<Pair<Long, List<Integer>>> pq = new PriorityQueue<>(n, Comparator.comparingLong(Pair::key));
@@ -309,6 +343,8 @@ public class NereidsFileGroupInfo {
     /**
      * createScanRangeLocationsSplittable
      */
+    // 针对可分片的文件（如大 CSV），按照 bytesPerInstance 将单个文件切分为多个连续的字节范围（Range）。
+    // 遍历文件状态，计算剩余未分配的字节数；若超出 bytesPerInstance 则进行截断切分并生成一个 TFileRangeDesc 存入当前 Scan 范围，随后新建下一个 Location；否则将整个文件或剩余部分并入当前范围。
     public void createScanRangeLocationsSplittable(NereidsParamCreateContext context,
             FederationBackendPolicy backendPolicy,
             List<TScanRangeLocations> scanRangeLocations) throws UserException {
@@ -360,7 +396,9 @@ public class NereidsFileGroupInfo {
             scanRangeLocations.add(curLocations);
         }
     }
-
+    // 为扫描范围指定具体的执行后端（BE）和 Broker 地址。
+    // 从 backendPolicy 获取下一个可用的后端 BE；初始化 TFileScanRange，若为 Broker 存储则从 Broker 管理器获取对应的 Host/Port 并加入参数中；
+    // 构建外部扫描范围（TExternalScanRange）与位置信息（TScanRangeLocation），如果是 Bulk Load 则绑定选中的 BE 节点 ID 与网络地址。
     protected TScanRangeLocations newLocations(TFileScanRangeParams params, BrokerDesc brokerDesc,
             FederationBackendPolicy backendPolicy) throws UserException {
 
@@ -416,7 +454,8 @@ public class NereidsFileGroupInfo {
         }
         return formatType;
     }
-
+    // 构建底层的 Thrift 文件范围描述符（TFileRangeDesc），供 BE 读取时使用。
+    // Bulk Load：设置文件路径、起始偏移量（startOffset）、切片大小（size）、总文件大小、路径隐式列（ColumnsFromPath）及其 Null 信息；若为 HDFS 文件，利用 LocationPath 解析并设置 FsName（scheme://authority 形式）。
     private TFileRangeDesc createFileRangeDesc(long curFileOffset, TBrokerFileStatus fileStatus, long rangeBytes,
             List<String> columnsFromPath, List<String> columnsFromPathKeys, List<Boolean> columnsFromPathIsNull) {
         TFileRangeDesc rangeDesc = new TFileRangeDesc();

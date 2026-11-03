@@ -67,11 +67,18 @@ import java.util.TreeSet;
 /**
  * process column mapping expressions, delete conditions and sequence columns
  */
+// 专门负责处理数据导入任务中列映射表达式、删除条件（Delete Conditions）、序列列（Sequence Columns）以及 Hadoop 兼容函数重写的核心提供者类。
+// 解析导入作业中用户指定的列描述符（Column Descriptors）与文件组信息，自动填充和重写列映射表达式、处理隐藏列（如删除标记、跳过位图、序列列），校验 HLL 等特殊类型约束，并将兼容性的 Hadoop 函数（如 replace_value、strftime、alignment_timestamp 等）转换为标准的 Doris 函数，
+// 最终为生成导入计划构建并输出上下文参数（NereidsParamCreateContext）。
 public class NereidsLoadScanProvider {
     private static final Logger LOG = LogManager.getLogger(NereidsLoadScanProvider.class);
+    // 常量字符串，表示 HLL（HyperLogLog）类型的哈希计算函数名。
     private static final String HLL_HASH = "hll_hash";
+    // 常量字符串，表示从 Base64 字符串反序列化构建 HLL 的函数名。
     private static final String HLL_FROM_BASE64 = "hll_from_base64";
+    // 当前文件组的元数据信息封装对象（包含目标表、Broker 描述、文件状态等）。
     private NereidsFileGroupInfo fileGroupInfo;
+    // 在唯一键部分更新（Partial Update）场景下，用户显式指定需要更新输入的列名集合。
     private Set<String> partialUpdateInputColumns;
 
     public NereidsLoadScanProvider(NereidsFileGroupInfo fileGroupInfo, Set<String> partialUpdateInputColumns) {
@@ -82,30 +89,39 @@ public class NereidsLoadScanProvider {
     /**
      * creating a NereidsParamCreateContext contains column mapping expressions and scan slots
      */
+    // 核心入口方法。
+    // 负责创建并初始化整个导入查询的参数上下文（NereidsParamCreateContext）
     public NereidsParamCreateContext createLoadContext() throws UserException {
         NereidsParamCreateContext context = new NereidsParamCreateContext();
         context.fileGroup = fileGroupInfo.getFileGroup();
         NereidsLoadTaskInfo.NereidsImportColumnDescs columnDescs = new NereidsLoadTaskInfo.NereidsImportColumnDescs();
         columnDescs.descs = context.fileGroup.getColumnExprList();
+        // 处理并追加删除条件。
         handleDeleteCondition(columnDescs.descs, context.fileGroup);
+        // 处理并追加顺序/版本列（Sequence Column）。
         handleSequenceColumn(columnDescs.descs, context.fileGroup);
+        // 填充表达式映射表、生成扫描槽（Scan Slots）并执行列映射重写、Hadoop 函数转换及校验。
         fillContextExprMap(columnDescs.descs, context);
         return context;
     }
-
+    // 根据导入的合并类型（Merge Type）生成对应的删除标记列描述符。
     private void handleDeleteCondition(List<NereidsImportColumnDesc> columnDescList, NereidsBrokerFileGroup fileGroup) {
+        // 若合并类型为 MERGE（即根据指定条件动态判定是否删除），则新增一个基于删除条件的 __DORIS_DELETE_SIGN__ 列描述符。
         if (fileGroup.getMergeType() == LoadTask.MergeType.MERGE) {
             columnDescList.add(
                     NereidsImportColumnDesc.newDeleteSignImportColumnDesc(fileGroup.getDeleteCondition()));
         } else if (fileGroup.getMergeType() == LoadTask.MergeType.DELETE) {
+            // 若合并类型为 DELETE（即整批文件全部标记为删除），则新增一个值为 1 的 __DORIS_DELETE_SIGN__ 列描述符。
             columnDescList.add(NereidsImportColumnDesc.newDeleteSignImportColumnDesc(new IntegerLiteral(1)));
         }
     }
-
+    // 针对具有序列列（Sequence Column）的 Unique Key 表，自动检查并补全序列列的映射关系。
     private void handleSequenceColumn(List<NereidsImportColumnDesc> columnDescList, NereidsBrokerFileGroup fileGroup)
             throws UserException {
         TableIf targetTable = fileGroupInfo.getTargetTable();
+        // 检查目标表是否为 OlapTable 且启用了序列列。
         if (targetTable instanceof OlapTable && ((OlapTable) targetTable).hasSequenceCol()) {
+            // 检查用户是否在列定义中显式指定了该列，或者满足 shouldAddSequenceColumn（如无显式列定义或仅有 delete sign）。若满足则自动向描述符中追加 __DORIS_SEQUENCE_COL__ 映射到对应的序列列。
             OlapTable olapTable = (OlapTable) targetTable;
             String sequenceCol = olapTable.getSequenceMapCol();
             if (sequenceCol != null) {
@@ -114,9 +130,11 @@ public class NereidsLoadScanProvider {
                         .filter(c -> c.getColumnName().equalsIgnoreCase(finalSequenceCol)).findAny();
                 // if `columnDescs.descs` is empty, that means it's not a partial update load, and user not specify
                 // column name.
+                // 若满足则自动向描述符中追加 __DORIS_SEQUENCE_COL__ 映射到对应的序列列。
                 if (foundCol.isPresent() || shouldAddSequenceColumn(columnDescList)) {
                     columnDescList.add(new NereidsImportColumnDesc(Column.SEQUENCE_COL,
                             new UnboundSlot(sequenceCol)));
+                // 若未指定且不是固定部分更新，则检查该序列列是否有默认值且是否为 CURRENT_TIMESTAMP，否则抛出异常提示用户必须指定序列列。
                 } else if (!fileGroupInfo.isFixedPartialUpdate()) {
                     Column seqCol = olapTable.getFullSchema().stream()
                             .filter(col -> col.getName().equals(olapTable.getSequenceMapCol()))
@@ -127,6 +145,7 @@ public class NereidsLoadScanProvider {
                                 + " has sequence column, need to specify the sequence column");
                     }
                 }
+            // 若文件组本身指定了 sequenceCol 且非灵活部分更新，则强制追加该序列列的映射。
             } else if (!fileGroupInfo.isFlexiblePartialUpdate()) {
                 sequenceCol = fileGroup.getSequenceCol();
                 columnDescList.add(new NereidsImportColumnDesc(Column.SEQUENCE_COL, new UnboundSlot(sequenceCol)));

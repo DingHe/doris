@@ -23,10 +23,16 @@ import com.google.common.collect.Lists;
 import com.google.gson.Gson;
 
 import java.util.List;
+// 副本写入提交信息封装类
+// 当后端（BE）节点完成数据的本地写入、准备提交事务时，BE 会向前端（FE）汇报哪些数据分片（Tablet）在哪些节点上写入成功。
+// TabletCommitInfo 就是专门用于在 FE 端接收和解析这种“Tablet 与 Backend 对应成功关系”的数据载体。
+// BE 与 FE 之间的提交桥梁：封装了底层 RPC（Thrift 协议）传输上来的副本写入成功汇报信息。
+// Quorum 校验的数据输入源：在事务的预提交（Pre-Commit）和提交（Commit）阶段，DatabaseTransactionMgr 会收集这些 TabletCommitInfo 列表，以此来核对每个 Tablet 成功写入的副本数量是否满足多数派（Quorum）要求。
 
 public class TabletCommitInfo {
-
+    // 数据分片（Tablet）的唯一标识 ID。用于标识哪一个具体的分片成功完成了数据写入。
     private long tabletId;
+    // 后端节点（Backend, BE）的唯一标识 ID。用于标识该分片的副本是在哪一台 BE 机器上成功完成写入的。
     private long backendId;
 
     public TabletCommitInfo(long tabletId, long backendId) {

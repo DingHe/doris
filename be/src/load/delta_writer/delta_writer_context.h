@@ -57,9 +57,18 @@ struct WriteRequest {
     std::string storage_vault_id;
     bool enable_table_memtable_backpressure = false;
 };
-
+// 在 Doris 的数据写入链路中（例如导入任务或 Insert 语句向 Tablet 灌入数据时），上游通常会产生一个包含大量行数的全量 Block。
+// 但并不是 Block 中的每一行都需要全部写入，或者需要按特定的行索引顺序写入。
+// TabletAddRowsPayload 就是用来精准控制和承载这些待写入行元数据的载荷容器。
 struct TabletAddRowsPayload {
+    // 行过滤与选择（Row Selection）：通过 row_idxs 指定输入 Block 中哪些行是有效且需要被写入当前 MemTable 的。
+    // 待写入行的索引数组。
+    // 存储了一组由 uint32_t 表示的行号（Row Indices）。这些行号对应于输入 Block（input_block）中的行位置。在执行 MemTable::insert() 时，Doris 不会盲目复制整个 Block 的所有行，
+    // 而是根据 row_idxs 中指定的行索引，精准地把需要写入的行通过 add_rows 批量拷贝到 MemTable 的内部可变块中。这种设计完美支持了上游算子（如过滤条件、质量校验）筛选后的稀疏或按需写入
     DorisVector<uint32_t> row_idxs;
+    // 行级 Binlog 关联（Row-level Binlog LSN）：通过 row_binlog_lsns 携带每一行数据对应的逻辑日志序列号（LSN），用于支持行级 Binlog 同步与数据流复制。
+    // 当开启了行级 Binlog 功能（即 _need_row_binlog_lsn 为 true）时，每一行被写入的数据都会被赋予一个唯一的 Binlog 序列号。
+    // 这个数组与 row_idxs 严格一一对应，用于在 MemTable 内部记录和追踪每行数据的变更日志，供后续生态（如 CDC、主备同步、流式计算等）消费。
     DorisVector<int64_t> row_binlog_lsns = {};
 };
 

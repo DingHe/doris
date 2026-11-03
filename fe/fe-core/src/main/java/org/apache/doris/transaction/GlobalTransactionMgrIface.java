@@ -45,7 +45,18 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
 
+// 全局事务管理器的核心接口定义类
+// 为整个 Doris 系统中的分布式事务（包括各种导入任务如 Broker Load、Stream Load、Insert 语句等）制定了统一的契约规范
+// 主要承担以下职责：
+// 定义分布式事务生命周期契约：规范了事务从开启（Begin）、预提交（Pre-Commit）、提交并发布（Commit & Publish）、中止（Abort）到最终完成（Finish）的全套标准操作。
+// 多数据库与元数据管理：提供数据库事务管理器（Database Transaction Manager）的挂载、卸载及配额更新接口。
+// 状态查询与运维监控：支持通过标签、状态、ID 等多种维度检索事务状态，为系统运维和排查提供数据接口。
+// 日志重放（Replay）与高可用支持：定义了各类事务状态变更的重放方法，确保 FE 节点主备切换时事务状态的一致性。
+
 public interface GlobalTransactionMgrIface extends Writable {
+    // 校验事务或导入任务的超时时间是否合法
+    // 检查超时秒数是否低于系统最小导入超时时间（minLoadTimeoutSecond），
+    // 或高于最大导入超时时间（maxLoadTimeoutSecond，针对流式导入和普通导入有不同配置限制），若不合法则抛出 AnalysisException。
     default void checkValidTimeoutSecond(long timeoutSecond, int maxLoadTimeoutSecond,
                                          int minLoadTimeOutSecond, LoadJobSourceType sourceType)
             throws AnalysisException {
@@ -66,30 +77,32 @@ public interface GlobalTransactionMgrIface extends Writable {
             }
         }
     }
-
+    // 设置编辑日志（EditLog）对象，用于将事务操作持久化到元数据日志中。
     public void setEditLog(EditLog editLog);
-
+    // 获取事务状态变更回调工厂（TxnStateCallbackFactory），用于注册和管理如 LoadJob 这样的事务回调监听器。
     public TxnStateCallbackFactory getCallbackFactory();
-
+    // 为指定的数据库 ID 添加对应的数据库级事务管理器。
     public void addDatabaseTransactionMgr(Long dbId);
-
+    // 移除指定数据库 ID 的事务管理器（通常在数据库被 Dropped 时调用）
     public void removeDatabaseTransactionMgr(Long dbId);
 
+    // 基础事务开启方法。
+    // 根据数据库 ID、涉及表列表、Label、协调者信息、作业源类型及超时时间，向全局事务管理器申请并开启一个新事务，返回生成的 transactionId。
     public long beginTransaction(long dbId, List<Long> tableIdList, String label, TxnCoordinator coordinator,
             LoadJobSourceType sourceType, long timeoutSecond)
             throws AnalysisException, LabelAlreadyUsedException, BeginTransactionException, DuplicatedRequestException,
             QuotaExceedException, MetaNotFoundException;
-
+    // 带有请求 ID（requestId）和监听器 ID 的扩展事务开启方法，用于支持幂等性检查和重复请求拦截。
     public long beginTransaction(long dbId, List<Long> tableIdList, String label, TUniqueId requestId,
             TxnCoordinator coordinator, LoadJobSourceType sourceType, long listenerId, long timeoutSecond)
             throws AnalysisException, LabelAlreadyUsedException, BeginTransactionException, DuplicatedRequestException,
             QuotaExceedException, MetaNotFoundException;
-
+    // 两阶段提交（2PC）中的预提交阶段。在所有数据写入完成后锁定表并预提交事务，但不立即发布生效。
     public void preCommitTransaction2PC(Database db, List<Table> tableList, long transactionId,
             List<TabletCommitInfo> tabletCommitInfos, long timeoutMillis,
             TxnCommitAttachment txnCommitAttachment)
             throws UserException;
-
+    // 在不加表锁的情况下提交事务。通常在外部已经由调用方显式加锁的安全上下文中使用。
     @Deprecated
     public void commitTransactionWithoutLock(long dbId, List<Table> tableList,
             long transactionId, List<TabletCommitInfo> tabletCommitInfos)
@@ -98,12 +111,14 @@ public interface GlobalTransactionMgrIface extends Writable {
     public void commitTransactionWithoutLock(long dbId, List<Table> tableList, long transactionId,
             List<TabletCommitInfo> tabletCommitInfos, TxnCommitAttachment txnCommitAttachment)
             throws UserException;
-
+    // 标准的事务提交方法。
+    // 传入数据库对象、表列表、事务 ID、Tablet 提交信息及附件，执行常规提交。
     public void commitTransaction(DatabaseIf db, List<Table> tableList, long transactionId,
             List<TabletCommitInfo> tabletCommitInfos, long timeoutMillis,
             TxnCommitAttachment txnCommitAttachment)
             throws UserException;
-
+    // 提交并发布事务（Commit & Publish）。
+    // 这是 Doris 最常用的事务提交方式，不仅提交事务，还会触发版本发布（Publish Version），使导入的数据对用户立即可见。
     public boolean commitAndPublishTransaction(DatabaseIf db, List<Table> tableList, long transactionId,
             List<TabletCommitInfo> tabletCommitInfos, long timeoutMillis)
             throws UserException;
@@ -123,10 +138,10 @@ public interface GlobalTransactionMgrIface extends Writable {
         return commitAndPublishTransaction(db, tableList, transactionId, tabletCommitInfos, timeoutMillis,
                 txnCommitAttachment);
     }
-
+    // 两阶段提交中的正式提交阶段（针对已经预提交成功的 2PC 事务）
     public void commitTransaction2PC(Database db, List<Table> tableList, long transactionId, long timeoutMillis)
             throws UserException;
-
+    // 根据事务 ID 中止（取消）指定的分布式事务，并记录中止原因。
     public void abortTransaction(Long dbId, Long transactionId, String reason) throws UserException;
 
     public void abortTransaction(Long dbId, Long txnId, String reason,
@@ -135,26 +150,28 @@ public interface GlobalTransactionMgrIface extends Writable {
     public void abortTransaction(Long dbId, String label, String reason) throws UserException;
 
     public void abortTransaction2PC(Long dbId, long transactionId, List<Table> tableList) throws UserException;
-
+    // 获取所有准备好进行版本发布的事务状态列表。
     public List<TransactionState> getReadyToPublishTransactions();
 
+    // 获取指定数据库下所有已提交（Committed）但尚未发布的事务列表。
     public List<TransactionState> getCommittedTransactions(long dbId) throws AnalysisException;
-
+    // 检查指定表或分区是否存在已提交的事务。
     public boolean existCommittedTxns(Long dbId, Long tableId, Long partitionId);
-
+    // 完成事务收尾。
+    // 更新分区可见版本（Visible Versions）并清理后端分区映射关系。
     public void finishTransaction(long dbId, long transactionId, Map<Long, Long> partitionVisibleVersions,
             Map<Long, Set<Long>> backendPartitions) throws UserException;
-
+    // 检查指定事务 ID 之前的历史事务是否全部完成，用于保证事务串行化或顺序一致性。
     public boolean isPreviousTransactionsFinished(long endTransactionId, long dbId, List<Long> tableIdList)
             throws AnalysisException;
 
     public boolean isPreviousTransactionsFinished(long endTransactionId, long dbId, long tableId,
             long partitionId) throws AnalysisException;
-
+    // 后台定时清理过期和超时的悬挂事务。
     public void removeExpiredAndTimeoutTxns();
 
     public void cleanLabel(Long dbId, String label, boolean isReplay) throws Exception;
-
+    // 动态更新多表运行中事务关联的表 ID 列表。
     public void updateMultiTableRunningTransactionTableIds(Long dbId, Long transactionId, List<Long> tableIds)
             throws UserException;
 
@@ -212,9 +229,9 @@ public interface GlobalTransactionMgrIface extends Writable {
     public Long getNextTransactionId() throws UserException;
 
     public void readFields(DataInput in) throws IOException;
-
+    // 重放更新/插入事务状态的元数据日志。
     public void replayUpsertTransactionState(TransactionState transactionState) throws Exception;
-
+    // 重放删除事务状态的元数据日志。
     public void replayDeleteTransactionState(TransactionState transactionState) throws Exception;
 
     public void replayBatchRemoveTransactions(BatchRemoveTransactionsOperation operation) throws Exception;

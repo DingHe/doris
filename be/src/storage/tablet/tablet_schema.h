@@ -404,6 +404,11 @@ using TabletIndexPtr = std::shared_ptr<TabletIndex>;
 using TabletIndexes = std::vector<std::shared_ptr<TabletIndex>>;
 using PathSet = phmap::flat_hash_set<std::string>;
 
+// TabletSchema 是管理和描述分片（Tablet）表结构及元数据的核心类。
+// 每一个 Tablet 在磁盘上存储数据或在内存中进行计算时，都需要依赖 TabletSchema 来明确数据的列结构、类型、键类型（KeysType）、索引分布（如倒排索引、Bloom Filter 等）以及各种特殊控制标记（如 Delete Sign、Sequence 列、Variant 动态子列等）。
+// 结构蓝图与元数据容器：它完整记录了一张表或分片在某个历史版本（Schema Version）下的列定义（TabletColumn）和索引定义（TabletIndex）。
+// 多维映射与快速查找：通过内部维护的大量哈希映射（如字段名到索引、字段唯一 ID 到索引、路径到索引等），提供极高性能的列元数据检索能力。
+// 支持复杂模型与演进：完美支撑 Doris 的 Duplicate、Aggregate、Unique 三种键模型，以及现代化的高级特性（如半结构化 Variant 列、倒排索引、部分更新、行存（Row Store）等）。
 class TabletSchema : public MetadataAdder<TabletSchema> {
 public:
     enum class ColumnType { NORMAL = 0, DROPPED = 1, VARIANT = 2 };
@@ -774,18 +779,25 @@ private:
     friend bool operator==(const TabletSchema& a, const TabletSchema& b);
     friend bool operator!=(const TabletSchema& a, const TabletSchema& b);
     TabletSchema(const TabletSchema&) = default;
-
+    // 表的键类型（如 DUP_KEYS 重复键、AGG_KEYS 聚合键、UNIQUE_KEYS 唯一键）。
     KeysType _keys_type = DUP_KEYS;
+    // 排序类型（默认词典序 LEXICAL）。
     SortType _sort_type = SortType::LEXICAL;
+    // 排序列的数量。
     size_t _sort_col_num = 0;
+    // 存储所有列对象的智能指针列表（包含普通列、隐藏列、Variant 提取列等）。
     std::vector<TabletColumnPtr> _cols;
-
+    // 存储所有索引对象（如倒排索引、BloomFilter 等）的列表。
     std::vector<TabletIndexPtr> _indexes;
+    // 字段名称到列在 _cols 中下标索引的映射。
     std::unordered_map<StringRef, int32_t, StringRefHash> _field_name_to_index;
+    // 列唯一 ID（Unique ID）到列下标的映射。
     std::unordered_map<int32_t, int32_t> _field_uniqueid_to_index;
+    // 半结构化 Variant 类型的内部路径到列下标的映射。
     std::unordered_map<PathInDataRef, int32_t, PathInDataRef::Hash> _field_path_to_index;
 
     // index_type/col_unique_id/suffix -> idxs in _indexes
+
     using IndexKey = std::tuple<IndexType, int32_t, std::string>;
     struct IndexKeyHash {
         size_t operator()(const IndexKey& t) const {
@@ -799,52 +811,79 @@ private:
             return seed;
         }
     };
+    // 复合索引键映射（基于 IndexKey 结构体，用于快速通过列 ID 和后缀查找对应的索引）。
     std::unordered_map<IndexKey, std::vector<size_t>, IndexKeyHash> _col_id_suffix_to_index;
-
+    // 总列数。
     int32_t _num_columns = 0;
+    // Variant 类型的列数。
     size_t _num_variant_columns = 0;
+    // 虚拟列数。
     size_t _num_virtual_columns = 0;
+    // 排序列/键列的总数。
     size_t _num_key_columns = 0;
+    // 集群键（Cluster Key）的唯一 ID 列表。
     std::vector<uint32_t> _cluster_key_uids;
+    // 可空列的数量。
     size_t _num_null_columns = 0;
+    // 短键索引（Short Key Index）包含的列数。
     size_t _num_short_key_columns = 0;
+    // 每个数据块的行数。
     size_t _num_rows_per_row_block = 0;
+    // 数据压缩算法类型（如 LZ4F、ZSTD 等）。
     CompressKind _compress_kind = COMPRESS_NONE;
     segment_v2::CompressionTypePB _compression_type = segment_v2::CompressionTypePB::LZ4F;
+    // 行存页大小、普通数据页大小及字典页大小。
     long _row_store_page_size = segment_v2::ROW_STORE_PAGE_SIZE_DEFAULT_VALUE;
     long _storage_page_size = segment_v2::STORAGE_PAGE_SIZE_DEFAULT_VALUE;
     long _storage_dict_page_size = segment_v2::STORAGE_DICT_PAGE_SIZE_DEFAULT_VALUE;
+    // 下一个可分配的列唯一 ID。
     size_t _next_column_unique_id = 0;
+    // 自增列名称。
     std::string _auto_increment_column;
-
+    // 是否开启布隆过滤器及其误判率（FPP）。
     bool _has_bf_fpp = false;
     double _bf_fpp = 0;
+    // 是否为内存表。
     bool _is_in_memory = false;
+    // 删除标记列（Delete Sign）在列列表中的索引。
     int32_t _delete_sign_idx = -1;
+    // 顺序/版本列（Sequence Col）的索引。
     int32_t _sequence_col_idx = -1;
+    // 版本列索引。
     int32_t _version_col_idx = -1;
+    // 各类 TSO 和 Binlog 相关的隐藏列索引。
     int32_t _skip_bitmap_col_idx = -1;
     int32_t _commit_tso_col_idx = -1;
     int32_t _binlog_tso_col_idx = -1;
     int32_t _binlog_lsn_col_idx = -1;
     int32_t _binlog_op_col_idx = -1;
+    // Schema 的版本号。
     int32_t _schema_version = -1;
+    // 表 ID 和数据库 ID。
     int64_t _table_id = -1;
     int64_t _db_id = -1;
+    // 是否禁用自动 Compaction。
     bool _disable_auto_compaction = false;
+    // 是否启用整行存储（Row Store）。
     bool _store_row_column = false;
+    // 导入时是否跳过索引写入。
     bool _skip_write_index_on_load = false;
+    // 倒排索引存储格式（V1/V2）。
     InvertedIndexStorageFormatPB _inverted_index_storage_format = InvertedIndexStorageFormatPB::V1;
 
     // Contains column ids of which columns should be encoded into row store.
     // ATTN: For compability reason empty cids means all columns of tablet schema are encoded to row column
+    // 需要编码进行存的列唯一 ID 集合。
     std::vector<int32_t> _row_store_column_unique_ids;
+    // 旧版 Variant 嵌套展平开关。
     bool _deprecated_enable_variant_flatten_nested = false;
-
+    // 虚拟列索引到唯一 ID 的映射。
     std::map<size_t, int32_t> _vir_col_idx_to_unique_id;
+    // 被剪枝（Pruned）列的数据类型映射。
     std::map<int32_t, DataTypePtr> _pruned_columns_data_type;
 
     // value: extracted path set and sparse path set
+    // Variant 子路径集合信息。
     std::unordered_map<int32_t, PathsSetInfo> _path_set_info_map;
 
     // key: field_pattern
@@ -856,8 +895,10 @@ private:
     // Persisted tablet storage format. Authoritative source for "is this tablet V3?"
     // decisions in the segment write paths. Old PBs without this field are upgraded in
     // init_from_pb() by deriving V3 from any of the three legacy V3-flavor flags.
+    // 分片存储格式（持久化标识 V2/V3）。
     TabletStorageFormatPB _storage_format {TabletStorageFormatPB::TABLET_STORAGE_FORMAT_V2};
     // Sequence column unique id mapping to value columns unique id
+    // Sequence 列与受其影响的值列之间的双向索引/UID 映射关系。
     std::unordered_map<uint32_t, std::vector<uint32_t>> _seq_col_uid_to_value_cols_uid;
     // Value column unique id mapping to sequence column unique id(also map sequence column it self)
     std::unordered_map<uint32_t, uint32_t> _value_col_uid_to_seq_col_uid;

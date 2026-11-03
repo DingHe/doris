@@ -156,36 +156,61 @@ bool ColumnStr<T>::has_enough_capacity(const IColumn& src) const {
            (this->get_offsets().capacity() - this->get_offsets().size() >
             src_concrete.get_offsets().size());
 }
-
+// 从另一个同类型的源字符串列中，连续截取指定范围（从 start 开始、长度为 length）的字符串数据（包括其字符内容和偏移量），高效地追加到当前列的末尾。
+// const IColumn& src 源列的引用。虽然传入的是抽象基类 IColumn，但在内部会通过类型断言将其转换为具体泛型类型的字符串列（ColumnStr<uint32_t> 或
+// size_t start 起始行号（下标）。表示从源列的第几行开始进行连续拷贝。
 template <typename T>
 void ColumnStr<T>::insert_range_from(const IColumn& src, size_t start, size_t length) {
+    // 1. 边界防御：长度为 0 直接返回
+    // 如果请求拷贝的长度为 0，说明无需做任何操作，直接提前退出，避免无效的性能开销。
     if (length == 0) {
         return;
     }
+    // 2. 定义内部通用 Lambda 闭包（do_insert）
+    // 为了同时适配 uint32_t（常规 String）和 uint64_t（超大 String64）两种偏移量类型，
+    // 这里使用泛型 Lambda 接收具体类型的源列对象（src_concrete）。
     auto do_insert = [&](const auto& src_concrete) {
+        // 3. 获取源列的偏移量数组与字符缓冲区
+        // src_offsets 记录了每一行字符串在内存中的起止位置偏移；
+        // src_chars 存储了所有字符串拼接起来的连续二进制字符流。
         const auto& src_offsets = src_concrete.get_offsets();
         const auto& src_chars = src_concrete.get_chars();
+        // 4. 越界检查
+        // 如果起始位置加长度超出了源列偏移量数组的总大小，说明参数非法，抛出内部错误异常。
         if (start + length > src_offsets.size()) {
             throw doris::Exception(
                     doris::ErrorCode::INTERNAL_ERROR,
                     "Parameter out of bound in IColumnStr<T>::insert_range_from method.");
         }
+        // 5. 计算字符切片的起始偏移与总字节长度
+        // nested_offset：获取目标切片前一个位置的偏移量，作为本次拷贝在字符缓冲区中的起始读取位置。
+        // （注：Doris 的 PaddedPODArray 支持安全访问 -1 索引，用于处理从第 0 行开始的情况）。
         auto nested_offset = src_offsets[static_cast<ssize_t>(start) - 1];
+        // nested_length：计算从 start 到 start + length - 1 这段区间内所有字符串累加起来的总字节数。
         auto nested_length = src_offsets[start + length - 1] - nested_offset;
-
+        // 6. 字符缓冲区扩容与底层内存拷贝
         size_t old_chars_size = chars.size();
+        // 检查合并后的字符长度是否合法（防止超出单列容量限制）
         check_chars_length(old_chars_size + nested_length, offsets.size() + length, size());
+        // 将当前目标列的字符缓冲区扩容，腾出空间容纳新追加的字符
         chars.resize(old_chars_size + nested_length);
+        // 使用高性能的 std::memcpy，将源列字符缓冲区中对应区间（从 nested_offset 开始，长度为 nested_length）
+        // 的所有二进制数据一次性整块复制到目标列末尾。
         memcpy(&chars[old_chars_size], &src_chars[nested_offset], nested_length);
-
+        // 7. 优化分支：判断是否可以直接整块拷贝偏移量数组
         using OffsetsType = std::decay_t<decltype(src_offsets)>;
+        // 如果目标列与源列的偏移量类型完全一致（如都是 uint32_t），且是从头开始拷贝（start == 0 且当前目标列为空），
+        // 则无需逐个调整偏移量，直接通过 assign 把源列的偏移量数组整体拷贝过来。
         if (std::is_same_v<T, typename OffsetsType::value_type> && start == 0 && offsets.empty()) {
             offsets.assign(src_offsets.begin(), src_offsets.begin() + length);
         } else {
+            // 8. 常规追加分支：逐个计算并转换偏移量
             size_t old_size = offsets.size();
             auto prev_max_offset = offsets.back(); /// -1th index is Ok, see PaddedPODArray
             offsets.resize(old_size + length);
-
+            // 核心偏移量换算：
+            // 将源列中对应行的绝对偏移量减去基准偏移（nested_offset），使其归一化为从 0 开始的相对长度；
+            // 然后再加上目标列原有的最大偏移量（prev_max_offset），确保追加进去的字符串在目标列中偏移量连续递增。
             for (size_t i = 0; i < length; ++i) {
                 // if Offsets is uint32, size will not exceed range of uint32, cast is OK.
                 offsets[old_size + i] =
@@ -195,6 +220,9 @@ void ColumnStr<T>::insert_range_from(const IColumn& src, size_t start, size_t le
     };
     // insert_range_from maybe called by ColumnArray::insert_indices_from(which is used by hash join operator),
     // so we need to support both ColumnStr<uint32_t> and ColumnStr<uint64_t>
+    // 9. 类型分发与安全断言
+    // 根据源列是否为 64 位字符串列（is_column_string64()），
+    // 分别通过 assert_cast 安全地将其转换为 ColumnStr<uint64_t> 或 ColumnStr<uint32_t>，并传入闭包执行。
     if (src.is_column_string64()) {
         do_insert(assert_cast<const ColumnStr<uint64_t>&>(src));
     } else {

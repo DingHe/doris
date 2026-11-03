@@ -180,42 +180,55 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+// 整个 Doris FE（Frontend）与 BE（Backend）交互的神经中枢
+// 负责将由 Planner 生成的分布式执行计划（Plan Fragments）、描述符表（Descriptor Table）、运行时过滤条件（Runtime Filters）以及各种全局配置进行组装，
+// 通过 RPC 将任务下发给集群中对应的各个 BE 节点并发执行；
+// 同时，它还负责收集执行状态、管理查询队列、接收 Profile、处理错误上报、汇总结果数据（如 Query Result 或 Load Commit Infos）以及处理取消和资源回收。
 public class Coordinator implements CoordInterface {
     private static final Logger LOG = LogManager.getLogger(Coordinator.class);
-
+    // 当前 FE 节点的本地 IP 地址。
     public static final String localIP = FrontendOptions.getLocalHostAddress();
 
     // Random is used to shuffle instances of partitioned
+    // 用于随机打散分片实例的随机数生成器。
     private static final Random instanceRandom = new SecureRandom();
-
+    // 用于处理后端 RPC 回调的守护线程池（核心线程数 32，最大 100）。
     public static ExecutorService backendRpcCallbackExecutor = ThreadPoolManager.newDaemonProfileThreadPool(
             32, 100, "backend-rpc-callback", true);
 
     // Overall status of the entire query; set to the first reported fragment error
     // status or to CANCELLED, if Cancel() is called.
+    // 整个查询的整体状态（记录第一个发生的错误或 CANCELLED 状态）。
     private Status queryStatus = new Status();
 
     // save of related backends of this query
+    // 相关 BE 的网络地址到 Backend ID 的映射。
     private Map<TNetworkAddress, Long> addressToBackendID = Maps.newHashMap();
-
+    // Backend ID 到 Backend 对象的映射。
     protected ImmutableMap<Long, Backend> idToBackend = ImmutableMap.of();
-
+    // Thrift 格式的描述符表（Descriptor Table）。
     private final TDescriptorTable descTable;
+    // Nereids 优化器专属的分布式计划映射。
     private FragmentIdMapping<DistributedPlan> distributedPlans;
 
     // scan node id -> TFileScanRangeParams
+    // 每个 Fragment 对应的执行参数映射。
     private Map<Integer, TFileScanRangeParams> fileScanRangeParamsMap = Maps.newHashMap();
 
     // Why do we use query global?
     // When `NOW()` function is in sql, we need only one now(),
     // but, we execute `NOW()` distributed.
     // So we make a query global value here to make one `now()` value in one query process.
+    // 查询全局变量（如 NOW() 函数的时间戳、时区等）。
     private final TQueryGlobals queryGlobals = new TQueryGlobals();
+    // 查询选项配置（包含内存限制、超时时间、并行度等）。
     private TQueryOptions queryOptions;
+    // 当前 Coordinator 的网络地址（IP + RPC 端口）。
     private TNetworkAddress coordAddress;
     // fe audit log in connected FE,if a query is forward
     // we should send the connected FE to be,
     // then be report query statistics to the connected FE
+    // 当前连接的 FE 地址（处理 Forward 查询时会带上，用于 BE 回传统计）。
     private TNetworkAddress currentConnectFE;
 
     // protects all fields below
@@ -225,50 +238,63 @@ public class Coordinator implements CoordInterface {
     // coordinator still needs to wait for cleanup on remote fragments (e.g. queries
     // with limit)
     // Once this is set to true, errors from remote fragments are ignored.
+    // 标记是否已返回所有查询结果（对于 LIMIT 等查询，结果返回后可忽略后续远程 Fragment 的错误）。
     private boolean returnedAllResults = false;
 
     // populated in computeFragmentExecParams()
+    // 每个 Fragment 对应的执行参数映射。
     private final Map<PlanFragmentId, FragmentExecParams> fragmentExecParamsMap = Maps.newHashMap();
-
+    // 由 Planner 生成的分布式执行计划片段列表。
     private final List<PlanFragment> fragments;
-
+    // 每个 BE 节点对应的 Pipeline 执行上下文映射。
     private Map<Long, PipelineExecContexts> beToPipelineExecCtxs = Maps.newHashMap();
-
+    // Fragment 与 BE 组合维度的 Pipeline 执行上下文。
     private final Map<Pair<Integer, Long>, PipelineExecContext> pipelineExecContexts = new HashMap<>();
+    // 需要状态检查的 Pipeline 执行上下文列表。
     private final List<PipelineExecContext> needCheckPipelineExecContexts = Lists.newArrayList();
+    // 结果接收器列表。
     private List<ResultReceiver> receivers = Lists.newArrayList();
+    // 结果接收消费者。
     private ResultReceiverConsumer receiverConsumer;
+    // 查询涉及的所有扫描节点列表。
     private final List<ScanNode> scanNodes;
+    // 扫描范围（Scan Range）的总数。
     private int scanRangeNum = 0;
     // number of instances of this query, equals to
     // number of backends executing plan fragments on behalf of this query;
     // set in computeFragmentExecParams();
     // same as backend_exec_states_.size() after Exec()
+    // 执行该查询的所有实例 ID 集合。
     private final Set<TUniqueId> instanceIds = Sets.newHashSet();
-
+    // 已接收的行数统计。
     private int numReceivedRows = 0;
-
+    // 导入（Load）过程中的数据路径、计数器、追踪链接和首个错误信息。
     private List<String> deltaUrls;
     private Map<String, String> loadCounters;
     private String trackingUrl;
     private String firstErrorMsg;
     // related txnId and label of group commit
     // Final reports race with status readers, so the transaction identity must be safely published.
+    // 导入（Load）过程中的数据路径、计数器、追踪链接和首个错误信息。
     private volatile long txnId;
     private String label;
 
     // for export
+    // Export 任务导出的文件列表。
     private List<String> exportFiles;
-
+    // Tablet 提交信息与错误 Tablet 信息列表。
     private final List<TTabletCommitInfo> commitInfos = Lists.newArrayList();
     private final List<TErrorTabletInfo> errorTabletInfos = Lists.newArrayList();
 
     // Input parameter
+    // 关联的后台作业 ID（例如 Broker Load 或 Export 任务的 Job ID，默认 -1）。
     private long jobId = -1; // job which this task belongs to
+    // 当前查询或任务的全局唯一标识 ID。
     private TUniqueId queryId;
 
     // a timestamp represent the absolute timeout
     // eg, System.currentTimeMillis() + executeTimeoutS * 1000
+    // 代表绝对超时时间的绝对时间戳（毫秒）。
     private long timeoutDeadline;
 
     private boolean enableShareHashTableForBroadcastJoin = false;
@@ -282,12 +308,15 @@ public class Coordinator implements CoordInterface {
     private TUniqueId runtimeFilterMergeInstanceId;
     // Runtime filter ID to the target instance address of the fragment,
     // that is expected to use this runtime filter, the instance address is not repeated
+    // 运行时过滤器的目标参数与构建者数量映射。
     private Map<RuntimeFilterId, List<FRuntimeFilterTargetParam>> ridToTargetParam = Maps.newHashMap();
     // The runtime filter that expects the instance to be used
+    // 分配的运行时过滤条件与 TopN 过滤条件。
     private List<RuntimeFilter> assignedRuntimeFilters = new ArrayList<>();
     private List<TopnFilter> topnFilters = new ArrayList<>();
     // Runtime filter ID to the builder instance number
     private Map<RuntimeFilterId, Integer> ridToBuilderNum = Maps.newHashMap();
+    // 当前连接的上下文对象（包含用户、会话变量等）。
     private ConnectContext context;
 
     private StatsErrorEstimator statsErrorEstimator;
@@ -320,7 +349,7 @@ public class Coordinator implements CoordInterface {
     private List<TPipelineWorkloadGroup> tWorkloadGroups = Lists.newArrayList();
 
     private final ExecutionProfile executionProfile;
-
+    // 工作负载队列（Workload Group Queue）相关的限流排队标记与队列对象。
     private volatile QueueToken queueToken = null;
     private QueryQueue queryQueue = null;
 
@@ -752,14 +781,18 @@ public class Coordinator implements CoordInterface {
         TPipelineFragmentParams fragmentParams = tExecPlanFragmentParams.values().stream().findFirst().get();
         return fragmentParams;
     }
-
+    // 判断当前查询是否需要进入工作负载组（Workload Group）的并发排队队列中等待执行资源。
     private boolean shouldQueue() {
+        // Doris 集群的全局配置，表示是否启用了查询排队功能。若未开启，则直接不排队。
+        // 检查当前会话变量是否设置了“绕过工作负载组（Bypass Workload Group）”。如果用户显式指定绕过，则不排队。
+        // 检查当前查询是否已经被取消。如果已经取消，则无需再进入队列排队。
         boolean ret = Config.enable_query_queue && !context.getSessionVariable()
                 .getBypassWorkloadGroup() && !isQueryCancelled();
         if (!ret) {
             return false;
         }
         // a query with ScanNode need not queue only when all its scan node is SchemaScanNode
+        // 包含 ScanNode 的查询，只有当它包含的所有扫描节点全部都是 SchemaScanNode（即查询系统的元数据表，如 information_schema 下的表）时，才不需要排队。
         for (ScanNode scanNode : this.scanNodes) {
             boolean isSchemaScanNode = scanNode instanceof SchemaScanNode;
             if (!isSchemaScanNode) {
@@ -774,34 +807,46 @@ public class Coordinator implements CoordInterface {
     // 'Request' must contain at least a coordinator plan fragment (ie, can't
     // be for a query like 'SELECT 1').
     // A call to Exec() must precede all other member function calls.
+    // 整个分布式查询或导入任务异步执行的总入口
+    // 当上层调用该方法时，它会负责处理工作负载组（Workload Group）的资源隔离、并发队列排队（Query Queue）、获取排队令牌（Queue Token），并最终转入内部执行核心。
     @Override
     public void exec() throws Exception {
         // LoadTask does not have context, not controlled by queue now
         if (context != null) {
+        // 如果是后台导入任务（如 LoadTask，它没有 ConnectContext），则不受此处的会话队列控制。
+            // 如果开启了工作负载组（资源组）功能，则执行后续的队列与资源绑定逻辑。
             if (Config.enable_workload_group) {
+                // 通过当前环境的负载组管理器（WorkloadGroupMgr），根据会话上下文（context）获取该查询应该归属的 Workload Group 列表（wgs）。
                 List<WorkloadGroup> wgs = Env.getCurrentEnv().getWorkloadGroupMgr()
                         .getWorkloadGroup(context);
+                // 将获取到的 Java 端 WorkloadGroup 对象流式转换为 Thrift 协议对象（TPipelineWorkloadGroup）。
                 List<TPipelineWorkloadGroup> wgList = wgs.stream()
                         .map(e -> e.toThrift())
                         .collect(Collectors.toList());
                 this.setTWorkloadGroups(wgList);
+                // 判断当前查询是否需要进入排队队列（例如：包含普通 ScanNode 且满足排队条件）。
                 if (this.shouldQueue()) {
+                    // 若需要排队但找不到任何 Workload Group，则抛出 UserException 异常。
                     if (wgs.size() < 1) {
                         // This logic is actually useless, because when could not find query queue, it will
                         // throw exception during workload group manager.
                         throw new UserException("could not find query queue");
                     }
                     // AllBackendComputeGroup may assocatiate with multiple workload groups
+                    // 获取资源组对应的查询队列
                     queryQueue = wgs.get(0).getQueryQueue();
+                    // 根据会话变量中配置的槽位数（wgQuerySlotCount）从队列中申请一个执行令牌（QueueToken）。
                     queueToken = queryQueue.getToken(context.getSessionVariable().wgQuerySlotCount);
                     queueToken.get(DebugUtil.printId(queryId),
                             this.queryOptions.getExecutionTimeout() * 1000);
                 }
+                // 如果成功获取了 Workload Group，将其名称设置到会话上下文（context）中用于审计和跟踪；若未开启工作负载组功能，则将会话中的工作负载组名称置为空字符串。
                 context.setWorkloadGroupName(wgs.get(0).getName());
             } else {
                 context.setWorkloadGroupName("");
             }
         }
+        // 排队成功、资源准备就绪后，正式调用核心内部执行方法 execInternal()，开始构建并向各个后端（BE）节点并发下发分布式执行计划。
         execInternal();
     }
 
@@ -824,8 +869,10 @@ public class Coordinator implements CoordInterface {
             LOG.error("error happens when scannode stop ", t);
         }
     }
-
+    // 通过排队校验后，驱动整个分布式查询或导入任务核心准备与下发的内部方法
+    // 计算分片分配与执行参数、注册查询实例、初始化结果接收器（ResultReceiver）或导入进度追踪器，并最终通过 RPC 将 Pipeline 执行上下文（Fragment Params）正式发送到各个后端（BE）节点上执行。
     protected void execInternal() throws Exception {
+        // Debug 日志输出：如果开启了 Debug 日志且扫描节点或计划片段不为空，则将首个扫描节点和首个 Fragment 的 Thrift 结构打印到日志中，便于调试排查。
         if (LOG.isDebugEnabled() && !scanNodes.isEmpty()) {
             LOG.debug("debug: in Coordinator::exec. query id: {}, planNode: {}",
                     DebugUtil.printId(queryId), scanNodes.get(0).treeToThrift());
@@ -835,18 +882,22 @@ public class Coordinator implements CoordInterface {
             LOG.debug("debug: in Coordinator::exec. query id: {}, fragment: {}",
                     DebugUtil.printId(queryId), fragments.get(0).toThrift());
         }
-
+        // 执行核心的前置准备，包含计算扫描范围（Scan Range）在各 BE 节点间的分配策略，以及生成各个 Fragment 的执行参数。
         processFragmentAssignmentAndParams();
-
+        // 打印当前查询涉及的所有 Fragment 及其分配实例的详细日志。
         traceInstance();
-
+        // 将当前 Query ID 及其总实例数（instanceIds.size()）注册到查询处理器（QeProcessorImpl）中，以便统一管理和接收来自 BE 的执行状态上报。
         QeProcessorImpl.INSTANCE.registerInstances(queryId, instanceIds.size());
 
         // create result receiver
+        // 获取顶层 Sink：
+        // 获取顶层根 Fragment（Top Fragment）的 ID 及其执行参数，并拿到其输出的数据 Sink（topDataSink）。
         PlanFragmentId topId = fragments.get(0).getFragmentId();
         FragmentExecParams topParams = fragmentExecParamsMap.get(topId);
         DataSink topDataSink = topParams.fragment.getSink();
         this.timeoutDeadline = System.currentTimeMillis() + queryOptions.getExecutionTimeout() * 1000L;
+        // 判断顶层 Sink 是否为普通结果输出（ResultSink）或文件导出（ResultFileSink）。
+        // 若是，则读取会话配置检查是否开启了并行结果 Sink（Parallel Result Sink）或并行 Outfile。
         if (topDataSink instanceof ResultSink || topDataSink instanceof ResultFileSink) {
             Boolean enableParallelResultSink = false;
             if (topDataSink instanceof ResultSink) {
@@ -856,16 +907,20 @@ public class Coordinator implements CoordInterface {
             }
 
             Set<TNetworkAddress> addrs = new HashSet<>();
+            // 遍历顶层实例的执行参数，
+            // 对每个唯一的 BE 主机地址创建结果接收器。
             for (FInstanceExecParam param : topParams.instanceExecParams) {
                 if (addrs.contains(param.host)) {
                     continue;
                 }
                 addrs.add(param.host);
+                // 若常规客户端连接，则创建 ResultReceiver 并加入接收器列表（receivers），用于从 BE 拉取计算结果。
                 if (context.isReturnResultFromLocal()) {
                     receivers.add(new ResultReceiver(queryId, param.instanceId, addressToBackendID.get(param.host),
                             toBrpcHost(param.host), this.timeoutDeadline,
                             context.getSessionVariable().getMaxMsgSizeOfResultReceiver(), enableParallelResultSink));
                 } else {
+                    // 若使用 Arrow Flight SQL 连接，则配置相应的 Endpoint 位置信息。
                     Preconditions.checkState(context.getConnectType().equals(ConnectType.ARROW_FLIGHT_SQL));
                     TUniqueId finstId;
                     if (enableParallelResultSink) {
@@ -881,7 +936,7 @@ public class Coordinator implements CoordInterface {
 
             LOG.info("dispatch result sink of query {} to {}", DebugUtil.printId(queryId),
                     topParams.instanceExecParams.get(0).host);
-
+            // Outfile 额外处理：若是通过 Broker 导出的 ResultFileSink，会自动去 Broker 管理器中查找对应的 Broker 地址并绑定到 Sink 中。
             if (topDataSink instanceof ResultFileSink
                     && ((ResultFileSink) topDataSink).getStorageType() == StorageBackend.StorageType.BROKER) {
                 // set the broker address for OUTFILE sink
@@ -892,6 +947,8 @@ public class Coordinator implements CoordInterface {
                 topResultFileSink.setBrokerAddr(broker.host, broker.port);
             }
         } else {
+            // 导入任务分支（Load Process）：
+            // 如果顶层 Sink 不是 ResultSink/ResultFileSink（例如 OlapTableSink，代表这是一场导入任务）：
             // This is a load process.
             this.queryOptions.setIsReportSuccess(true);
             deltaUrls = Lists.newArrayList();
@@ -903,6 +960,7 @@ public class Coordinator implements CoordInterface {
         }
 
         updateProfileIfPresent(profile -> profile.setAssignFragmentTime());
+        // 正式通过 RPC 将 Pipeline 执行上下文和任务参数并发推送到集群中的所有目标 BE 节点上，启动实际计算。
         sendPipelineCtx();
     }
 
@@ -3652,9 +3710,11 @@ public class Coordinator implements CoordInterface {
         }
         return result;
     }
-
+    // 获取当前查询、导入或任务中所有参与计算的后端（BE）节点的网络地址列表（IP 和端口）。
     @Override
     public List<TNetworkAddress> getInvolvedBackends() {
+        // beToPipelineExecCtxs 是 Coordinator 中保存“后端 ID（Long）到 Pipeline 执行上下文（PipelineExecContexts）”的映射。
+        // 通过遍历它的键，可以获取所有参与当前作业执行的后端 BE 的唯一 ID（backendId）。
         List<TNetworkAddress> backendAddresses = Lists.newArrayList();
         for (Long backendId : this.beToPipelineExecCtxs.keySet()) {
             Backend backend = idToBackend.get(backendId);

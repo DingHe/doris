@@ -165,19 +165,29 @@ public class TransactionState implements Writable {
             }
         }
     }
-
+    // 事务协调者/发起者信息类
+    // 用于记录和追踪每一个分布式事务是由哪个节点、哪种来源以及在什么时间发起的。
+    // 主要承担以下职责：
+    // 事务溯源与审计：精准记录 Doris 内部分布式事务的“出身”（例如是由前端 Frontend 节点发起，还是后端 Backend 节点发起，具体 IP 是多少）。
+    // 故障排查与监控：在发生事务冲突、超时或悬挂（Pending）时，运维人员可以通过协调者信息快速定位是哪个节点在执行该导入或写入操作。
+    // 元数据持久化：支持通过 Gson 序列化存储到元数据日志（Edit Log）中，确保 FE 节点重启或主备切换时事务源信息不丢失。
     public static class TxnCoordinator {
+        // 事务来源类型枚举（TxnSourceType），用于区分该事务是由前端（FE）、后端（BE）还是其他途径触发的。
         @SerializedName(value = "sourceType")
         public TxnSourceType sourceType;
         // backendId for backend, 0 for frontend
+        // 协调者节点的唯一标识 ID。根据源码注释：如果是后端节点发起，则存入对应的 backendId；如果是前端节点发起，则通常设为 0。
         @SerializedName(value = "id")
         public long id = 0;
+        // 协调者节点的 IP 地址字符串。用于标识具体是哪台机器提交了该事务。
         @SerializedName(value = "ip")
         public String ip;
+        // 协调者节点的 IP 地址字符串。用于标识具体是哪台机器提交了该事务。
         // frontend/backend start time
         @SerializedName(value = "st")
         public long startTime = 0;
         // True if this txn if created by system(such as writing data to audit table)
+        // 如果该事务是由系统内部自动创建的（例如向系统审计表写入数据、内部表维护等），则该值为 true；普通用户 SQL 触发的事务则为 false。
         @SerializedName(value = "ii")
         public boolean isFromInternal = false;
 

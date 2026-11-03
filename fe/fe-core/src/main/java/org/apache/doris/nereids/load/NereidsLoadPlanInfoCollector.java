@@ -99,33 +99,45 @@ import java.util.stream.Collectors;
 /**
  * visit logical plan tree and store required information in LoadPlanInfo
  */
+// 专门用于访问和解析数据导入作业（如 Broker Load、Stream Load 等）生成的导入逻辑计划树（LogicalPlan Tree），将其中的列映射关系、过滤条件（Pre-filter / Post-filter）、源/目标 Tuple 描述符以及 OlapTableSink 参数等完整收集并封装到 LoadPlanInfo 中，供底层的 FileLoadScanNode 和执行引擎使用。
+//
 public class NereidsLoadPlanInfoCollector extends DefaultPlanVisitor<Void, PlanTranslatorContext> {
 
     /**
      * store OlapTableSink and required information for FileLoadScanNode
      */
+    // 专门用来存储文件扫描参数（FileScanRangeParams）、数据写入器（OlapTableSink）及列映射/过滤表达式的载体类。
     public static class LoadPlanInfo {
         // the file source tuple's id, the tuple represents original columns reading from file
+        // 文件源数据的 Tuple ID，代表从文件中原始读取的列集合。
         private TupleId srcTupleId;
         // the file source tuple's slots
+        // 文件源数据的 Slot ID 列表。
         private List<SlotId> srcSlotIds;
         // FileLoadScanNode's output tuple, represents remapped columns
         // For multiple file groups in Broker load, this destTuple is shared across all file groups
+        // 文件扫描节点（FileLoadScanNode）的目标 Tuple 描述符，代表重映射（Remapped）后的列结构。在 Broker Load 存在多个文件组时，该 Tuple 可能会跨文件组共享。
         private TupleDescriptor destTuple;
         // the map of slots in destTuple and its mapping expression
+        // 目标 Slot ID 到其对应转换表达式（Expression）的映射。
         private Map<SlotId, Expr> destSlotIdToExprMap;
         // if the file source slot has a same name with dest table and no corresponding mapping expr,
         // it means the column data will be imported to dest table without any transformation.
         // we put the dest slot and src slot without transformation to destSlotIdToSrcSlotIdWithoutTrans
+        // 无需任何转换、直接原样从源 Slot 导入到目标 Slot 的映射关系。
         private Map<SlotId, SlotId> destSlotIdToSrcSlotIdWithoutTrans;
         // the file source slot without transformation must have default value,
         // the default value is its corresponding dest column's default value or null literal
+        // 源 Slot 对应的默认值表达式映射（当列无转换且需使用默认值或 Null 时生效）。
         private Map<SlotId, Expr> srcSlotIdToDefaultValueMap;
         // the filter before column transformation
+        // 列转换之前的过滤条件列表（Pre-filter）。
         private List<Expr> preFilterExprList;
         // the filter after column transformation
+        // 列转换之后的过滤条件列表（Post-filter）。
         private List<Expr> postFilterExprList;
         // OlapTableSink for dest table
+        // 向目标 Doris OLAP 表写入数据的 Sink 算子。
         private OlapTableSink olapTableSink;
 
         public TupleDescriptor getDestTuple() {
@@ -147,6 +159,7 @@ public class NereidsLoadPlanInfoCollector extends DefaultPlanVisitor<Void, PlanT
         /**
          * create a TFileScanRangeParams
          */
+        // 将收集到的所有逻辑计划信息（如源/目标 Tuple、Slot 映射、默认值、HDFS 参数、前后置过滤条件等）转化为后端（BE）所需的 TFileScanRangeParams Thrift 结构体，供底层文件扫描算子初始化使用。
         public TFileScanRangeParams toFileScanRangeParams(TUniqueId loadId, NereidsFileGroupInfo fileGroupInfo) {
             NereidsBrokerFileGroup fileGroup = fileGroupInfo.getFileGroup();
             TFileScanRangeParams params = new TFileScanRangeParams();
@@ -235,20 +248,31 @@ public class NereidsLoadPlanInfoCollector extends DefaultPlanVisitor<Void, PlanT
             return params;
         }
     }
-
+    // 当前正在收集的计划信息实例。
     private LoadPlanInfo loadPlanInfo;
+    // 导入的目标 OLAP 表对象。
     private OlapTable destTable;
+    // 导入任务的相关元数据信息。
     private NereidsLoadTaskInfo taskInfo;
+    // 当前导入任务的全局唯一标识。
     private TUniqueId loadId;
+    // 目标数据库 ID。
     private long dbId;
+    // 唯一键表的更新模式（如 UPSERT、UPDATE_FIXED_COLUMNS 等）。
     private TUniqueKeyUpdateMode uniquekeyUpdateMode;
+    // 部分更新中遇到新行的策略。
     private TPartialUpdateNewRowPolicy uniquekeyUpdateNewRowPolicy;
+    // 部分更新输入的列名集合。
     private HashSet<String> partialUpdateInputColumns;
+    // 列名到 Nereids 表达式的映射。
     private Map<String, Expression> exprMap;
-
+    // 待访问的逻辑计划树根节点。
     private LogicalPlan logicalPlan;
+    // 源表字段名到 Slot 描述符的大小写不敏感映射。
     private Map<String, SlotDescriptor> srcSlots = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+    // 涉及分区裁剪的 Slot 列表。
     private List<Slot> partitionSlots = Lists.newArrayList();
+    // 用于分区裁剪的过滤谓词。
     private Expression filterPredicate;
 
     /**

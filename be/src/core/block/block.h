@@ -246,7 +246,7 @@ public:
     Columns get_columns() const;
 	// 提取所有列指针，并将其中的常量列/稀疏列转换为标准完整列。
     Columns get_columns_and_convert();
-	// 克隆一个不包含物理列数据的 Schema 壳子 Block。
+    // 克隆一个不包含物理列数据的 Schema 壳子 Block。
     Block clone_without_columns(const std::vector<int>* column_offset = nullptr) const;
 
     /** Get empty columns with the same types as in block. */
@@ -499,7 +499,8 @@ using BlocksPtrs = std::shared_ptr<std::vector<BlocksPtr>>;
 
 // MutableBlock 是与不可变的 Block 相对立的可变数据块（Mutable Block）容器。
 // MutableBlock 的主要职责是作为高效构建、追加、合并与修改数据列的缓冲构建器（Block Builder）：
-// 解决不可变性带来的构建开销：Doris 中的标准 Block 主要持有不可变的列指针（ColumnPtr，即 CowPtr<IColumn>::wrapped_ptr），直接向其追加数据需要频繁触发写时复制（Copy-On-Write, COW）。MutableBlock 内部直接持有独占且可变的列指针（MutableColumns），允许直接在原列内存上做追加（insert）、扩展（resize）等修改操作。
+// 解决不可变性带来的构建开销：Doris 中的标准 Block 主要持有不可变的列指针（ColumnPtr，即 CowPtr<IColumn>::wrapped_ptr），直接向其追加数据需要频繁触发写时复制（Copy-On-Write, COW）。
+// MutableBlock 内部直接持有独占且可变的列指针（MutableColumns），允许直接在原列内存上做追加（insert）、扩展（resize）等修改操作。
 // 高效的行/块级追加与合并：常用于 Aggregation（聚合累加）、Join（连接结果拼装）、Sort（排序缓冲区构建）等需要流式组装数据的算子中。它提供了高效的 add_row、add_rows 和 merge 方法。
 // 安全地完成构建到不可变 Block 的转换：提供 to_block() 接口，通过移动语义（Move Semantics）将可变列指针瞬间转换为只读的 Block 并输出给下一级算子，实现零拷贝转换。
 class MutableBlock {

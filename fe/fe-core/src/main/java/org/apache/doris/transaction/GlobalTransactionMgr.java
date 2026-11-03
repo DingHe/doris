@@ -79,16 +79,24 @@ import java.util.stream.Collectors;
  * Attention: all api in txn manager should get db lock or load lock first, then get txn manager's lock,
  * or there will be dead lock
  */
+// 负责协调和管理整个 Doris 集群中所有数据库及其分布式事务的生命周期。
+// 根据类开头的注释规范：所有访问事务管理器的 API 操作，必须先获取数据库锁（Database Lock）或导入锁（Load Lock），然后再获取事务管理器的锁，否则会引发死锁。
+// 全局事务总控：作为集群级的事务总入口，维护所有数据库级别的事务管理器映射（DatabaseTransactionMgr）
+// 事务生命周期调度：统一调度事务的开启（Begin）、预提交（Pre-Commit）、提交（Commit）、发布（Publish）和中止（Abort）。
+// 分布式锁与并发安全协调：在处理两阶段提交（2PC）或提交发布时，自动对相关表施加写锁（Write Lock），保证元数据修改的一致性。
+// 异常与故障恢复：检查并清理超时或过期的事务，处理协调者节点（FE/BE）重启或下线导致的悬挂事务。
 public class GlobalTransactionMgr implements GlobalTransactionMgrIface {
     private static final Logger LOG = LogManager.getLogger(GlobalTransactionMgr.class);
-
+    // 数据库 ID 到数据库事务管理器的并发映射表（Concurrent Map），
+    // 负责将不同数据库的事务操作路由到对应的子管理器中。
     private Map<Long, DatabaseTransactionMgr> dbIdToDatabaseTransactionMgrs;
-
+    // 全局事务 ID 生成器，负责单调递增地生成全局唯一的事务 ID（Transaction ID）。
     private TransactionIdGenerator idGenerator;
+    // 事务状态变更回调工厂，用于注册和触发如 LoadJob 这样的回调逻辑。
     private TxnStateCallbackFactory callbackFactory;
-
+    // Doris 全局环境实例引用（Env），用于访问系统的 Catalog、SystemInfo、Frontends 等全局元数据
     private Env env;
-
+    // 自动分区缓存管理器，用于管理和清理动态/自动分区相关的事务信息。
     private final AutoPartitionCacheManager autoPartitionCacheManager;
 
     public GlobalTransactionMgr(Env env) {

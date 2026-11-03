@@ -52,6 +52,11 @@ using EqualFlags = std::vector<uint8_t>;
 using EqualRange = std::pair<int, int>;
 
 /// Declares interface to store columns in memory.
+// IColumn 是所有内存列数据存储的抽象基类
+// 整个 Doris 的列式内存计算、表达式求值、聚合运算、导入（Load）以及块（Block）管理，全部都是围绕 IColumn 接口展开的。
+// IColumn 定义了将一列数据（包含基本类型、复杂类型如 Array/Map/Struct、可空类型 Nullable、常量类型 Const 等）缓存在内存中的标准接口契约。
+// 多态与统一抽象：上层算子（如 Filter、Join、Aggregator）无需关心底层具体是整型、字符串还是复杂结构，只需通过 IColumn 的统一接口进行数据的读取、写入、过滤、排序和序列化。
+// 写时复制（COW）支持：由于继承自 COW<IColumn>，它天然支持不可变共享与独占修改，能够极大地减少高并发及多线程查询中的内存拷贝开销。
 class IColumn : public COW<IColumn> {
 private:
     friend class COW<IColumn>;

@@ -107,7 +107,11 @@ import java.util.stream.Collectors;
  * 3. do some transaction management, such as add/update/delete transaction.
  * Attention: all api in DatabaseTransactionMgr should be only invoked by GlobalTransactionMgr
  */
-
+// 每个数据库（Database）在内存中都对应一个独立的 DatabaseTransactionMgr 实例，负责精细化管理该库内部所有表、分区以及分布式事务的生命周期。
+// 数据库级并发控制：通过专用的读写锁（MonitoredReentrantReadWriteLock），为该数据库内的事务状态读写提供线程安全保障。
+// 事务状态机管理：精准维护运行中事务（idToRunningTransactionState）与终态事务（idToFinalStatusTransactionState）的生命周期转换、标签防重（labelToTxnIds）及子事务路由。
+// 分布式 Quorum 校验与预提交：在 2PC 预提交阶段（preCommitTransaction2PC），校验各个 Tablet 副本的写入成功数量是否满足多数派（Quorum）法定要求，处理 RESTORE 状态阻断及错误副本修复。
+// 悬挂与超时事务清理：通过双端队列（finalStatusTransactionStateDequeShort/Long）高效管理和清理过期、超时的历史事务。
 public class DatabaseTransactionMgr {
 
     private enum PublishResult {
@@ -119,19 +123,24 @@ public class DatabaseTransactionMgr {
     private static final Logger LOG = LogManager.getLogger(DatabaseTransactionMgr.class);
     // the max number of txn that can be remove per round.
     // set it to avoid holding lock too long when removing too many txns per round.
+    // 每轮循环最多清理的事务数量上限（10000），防止单轮清理持有锁时间过长。
     private static final int MAX_REMOVE_TXN_PER_ROUND = 10000;
-
+    // 当前数据库的唯一 ID。
     private final long dbId;
 
     // the lock is used to control the access to transaction states
     // no other locks should be inside this lock
+    // 专属于该数据库的监控型可重入读写锁（公平锁），用于控制对本库事务状态的安全访问。
     private final MonitoredReentrantReadWriteLock transactionLock = new MonitoredReentrantReadWriteLock(true);
 
     // transactionId -> running TransactionState
+    // 事务 ID 到运行中事务状态（TransactionState）的并发映射表。
     private final Map<Long, TransactionState> idToRunningTransactionState = Maps.newConcurrentMap();
 
     // transactionId -> final status TransactionState
+    // 事务 ID 到终态（如已完成/已中止）事务状态的映射表。
     private final Map<Long, TransactionState> idToFinalStatusTransactionState = Maps.newConcurrentMap();
+    // 子事务 ID 到主事务 ID 的映射表，用于子事务路由。
     private final Map<Long, Long> subTxnIdToTxnId = new ConcurrentHashMap<>();
 
     // The following 2 queues are to store transactionStates with final status
@@ -140,6 +149,7 @@ public class DatabaseTransactionMgr {
     // The "Short" queue is used to store the txns of the expire time
     // controlled by Config.streaming_label_keep_max_second.
     // The "Long" queue is used to store the txns of the expire time controlled by Config.label_keep_max_second.
+    // 终态事务的双端队列（短周期流式导入队列与长周期普通导入队列），用于加速过期事务的清理。
     private final ConcurrentLinkedDeque<TransactionState> finalStatusTransactionStateDequeShort
             = new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<TransactionState> finalStatusTransactionStateDequeLong
@@ -151,30 +161,33 @@ public class DatabaseTransactionMgr {
     // this member should be consistent with idToTransactionState,
     // which means if a txn exist in idToRunningTransactionState or idToFinalStatusTransactionState
     // it must exists in dbIdToTxnLabels, and vice versa
+    // 业务标签（Label）到事务 ID 集合的映射，用于防止 Label 被重复使用。
     private final Map<String, Set<Long>> labelToTxnIds = Maps.newHashMap();
-
+    // 表已提交的事务计数统计。
     private final Map<Long, Long> tableCommittedTxnCount = Maps.newConcurrentMap();
-
+    // 最近一次更新表提交事务计数的时间戳。
     private Long lastCommittedTxnCountUpdateTime = 0L;
 
     // count the number of running txns of database
+    // 当前数据库中运行中事务的原子计数器。
     private final AtomicInteger runningTxnNums = new AtomicInteger(0);
-
+    // 全局环境引用、编辑日志对象及全局事务 ID 生成器。
     private final Env env;
 
     private final EditLog editLog;
 
     private final TransactionIdGenerator idGenerator;
-
+    // 清理事务的任务列表。
     private final List<ClearTransactionTask> clearTransactionTasks = Lists.newArrayList();
 
     // not realtime usedQuota value to make a fast check for database data quota
+    // 数据库已使用的数据配额缓存（用于快速校验配额）
     private volatile long usedQuotaDataBytes = -1;
-
+    // 写锁持有时长监控相关变量
     private long lockWriteStart;
 
     private long lockReportingThresholdMs = Config.lock_reporting_threshold_ms;
-
+    // 获取/释放当前数据库事务管理器的读锁。
     private void readLock() {
         this.transactionLock.readLock().lock();
     }
@@ -182,7 +195,7 @@ public class DatabaseTransactionMgr {
     private void readUnlock() {
         this.transactionLock.readLock().unlock();
     }
-
+    // 获取/释放当前数据库事务管理器的写锁，并内置持锁时长监控。
     private void writeLock() {
         this.transactionLock.writeLock().lock();
         lockWriteStart = System.currentTimeMillis();
@@ -208,7 +221,8 @@ public class DatabaseTransactionMgr {
         return unprotectedGetTransactionState(transactionId);
 
     }
-    // 核心职责是：根据给定的事务 ID，依次检索内存中的运行中事务容器、终态事务容器以及子事务映射表，最终返回对应的 TransactionState（事务状态对象）。
+    // 核心职责是：根据给定的事务 ID，依次检索内存中的运行中事务容器、终态事务容器以及子事务映射表，
+    // 最终返回对应的 TransactionState（事务状态对象）。
     private TransactionState unprotectedGetTransactionState(Long transactionId) {
         // 1. 检索运行中的事务（Running Transactions）
         // 从内存字典 idToRunningTransactionState（记录所有处于 PREPARE、PREPARED、COMMITTED 等运行中/未完全结束状态的事务 Map）中查找该 transactionId。
@@ -326,30 +340,47 @@ public class DatabaseTransactionMgr {
         return infos;
     }
 
-
+    // 数据库级别事务管理的核心入口
+    // 每当有新的数据导入（如 Broker Load、Stream Load、Insert 等）向某个数据库发起写入时，都会调用该方法来正式申请、校验并开启一个分布式事务。
+    // List<Long> tableIdList 本次事务涉及的所有目标表 ID 列表。用于标记该事务会向哪些表写入数据，后续可用于做并发写冲突检测和表锁控制。
+    // String label 业务唯一标识标签（Label）。Doris 通过 Label 机制保证“At-Least-Once”或幂等语义，防止同一批次数据被重复导入。
+    // TUniqueId requestId 请求唯一 ID（可选，可为 null）。主要用于区分和识别内部重试请求：如果 Label 已经存在，但 requestId 相同，系统会认为这是一次重复的重试，从而安全地返回已存在的事务 ID。
+    // TransactionState.TxnCoordinator coordinator 事务协调者信息。记录该事务是由哪个节点（FE 还是 BE）、哪个 IP 及在什么时间发起的。
+    // TransactionState.LoadJobSourceType sourceType 导入作业的来源类型（例如 BATCH_LOAD_JOB、STREAMING 等）。
     public long beginTransaction(List<Long> tableIdList, String label, TUniqueId requestId,
             TransactionState.TxnCoordinator coordinator, TransactionState.LoadJobSourceType sourceType,
             long listenerId, long timeoutSecond)
             throws DuplicatedRequestException, LabelAlreadyUsedException, BeginTransactionException,
             AnalysisException, QuotaExceedException, MetaNotFoundException {
-
+        // 1. 主节点（Master）校验
+        // 确保当前的 FE 节点是 Master（主节点），因为分布式事务的开启和元数据变更必须由主节点统一协调和记录 EditLog。
+        // 如果不是 Master 且不在运行单元测试，则直接抛出 BeginTransactionException 异常拒绝。
         if (!Env.getCurrentEnv().isMaster() && !FeConstants.runningUnitTest) {
             throw new BeginTransactionException("FE is not master");
         }
-
+        // 2. 获取并检查目标数据库
+        // 根据当前管理器绑定的 dbId，从内建目录中获取对应的 Database 对象。若库不存在，抛出 MetaNotFoundException。
         Database db = env.getInternalCatalog().getDbOrMetaException(dbId);
+        // 3. 内部数据库访问权限检查
+        // 如果事务来源不是系统内部（isFromInternal == false），则通过 InternalDatabaseUtil 校验当前用户是否有权限访问该内部数据库。
         if (!coordinator.isFromInternal) {
             InternalDatabaseUtil.checkDatabase(db.getFullName(), ConnectContext.get());
         }
+        // 4. 物化视图（MTMV）修改校验
+        // 检查修改物化视图的数据是否合法或受限。
         MTMVUtil.checkModifyMTMVData(db, tableIdList, ConnectContext.get());
+        // 5. 数据配额（Quota）校验
+        // 检查当前数据库的已使用数据量是否已经超出了配置的配额（Data Quota），若超出则抛出 QuotaExceedException。
         checkDatabaseDataQuota();
         Preconditions.checkNotNull(coordinator);
         Preconditions.checkNotNull(label);
         FeNameFormat.checkLabel(label);
-
+        // 7. 初始化局部变量
         long tid = 0L;
         TransactionState transactionState = null;
         EditLog.EditLogItem logItem = null;
+        // 8. 获取写锁（Write Lock）
+        // 进入临界区，加数据库事务管理器的写锁，保护内存中的事务映射表（如 labelToTxnIds、idToRunningTransactionState）。
         writeLock();
         try {
             /*
@@ -359,20 +390,31 @@ public class DatabaseTransactionMgr {
              *    existing txn id.
              * 3. if there is a non-aborted transaction, throw label already used exception.
              */
+            /*
+             * 9. 标签防重与幂等重试核心校验逻辑：
+             * 步骤：
+             * 1. 获取所有使用该 label 的已有事务 ID 集合；
+             * 2. 如果存在 PREPARE 状态的事务，检查这是否是一次内部重试请求。如果是，则直接返回已存在的 txn id；
+             * 3. 如果存在其他非 ABORTED 状态的事务，抛出 LabelAlreadyUsedException 异常。
+             */
             Set<Long> existingTxnIds = unprotectedGetTxnIdsByLabel(label);
             if (existingTxnIds != null && !existingTxnIds.isEmpty()) {
                 List<TransactionState> notAbortedTxns = Lists.newArrayList();
                 for (long txnId : existingTxnIds) {
                     TransactionState txn = unprotectedGetTransactionState(txnId);
                     Preconditions.checkNotNull(txn);
+                    // 筛选出未被中止（非 ABORTED）的历史事务
                     if (txn.getTransactionStatus() != TransactionStatus.ABORTED) {
                         notAbortedTxns.add(txn);
                     }
                 }
                 // there should be at most 1 txn in PREPARE/PRECOMMITTED/COMMITTED/VISIBLE status
+                // 同一个 Label 在非中止状态下最多只能对应 1 个活跃事务
                 Preconditions.checkState(notAbortedTxns.size() <= 1, notAbortedTxns);
                 if (!notAbortedTxns.isEmpty()) {
                     TransactionState notAbortedTxn = notAbortedTxns.get(0);
+                    // 幂等重试判断：如果已有未中止事务处于 PREPARE 或 PRECOMMITTED 状态，且传入的 requestId 不为空且与已有事务的 requestId 完全相同，
+                    // 说明这是一次客户端的网络重试请求，直接抛出 DuplicatedRequestException 携带已有 tid 返回成功。
                     if (requestId != null && (notAbortedTxn.getTransactionStatus() == TransactionStatus.PREPARE
                             || notAbortedTxn.getTransactionStatus() == TransactionStatus.PRECOMMITTED)
                             && notAbortedTxn.getRequestId() != null && notAbortedTxn.getRequestId().equals(requestId)) {
@@ -380,30 +422,42 @@ public class DatabaseTransactionMgr {
                         throw new DuplicatedRequestException(DebugUtil.printId(requestId),
                                 notAbortedTxn.getTransactionId(), "");
                     }
+                    // 否则说明 Label 已经被其他正在进行的导入任务占用，抛出 LabelAlreadyUsedException 冲突异常。
                     throw new LabelAlreadyUsedException(notAbortedTxn);
                 }
             }
-
+            // 10. 检查运行中事务数量是否超限
+            // 防止当前数据库中同时运行的事务过多导致内存或元数据过载。
             checkRunningTxnExceedLimit(tableIdList);
-
+            // 12. 创建 TransactionState 对象
+            // 将超时时间转换为毫秒（timeoutSecond * 1000），实例化一个新的事务状态对象。
             tid = idGenerator.getNextTransactionId();
             transactionState = new TransactionState(dbId, tableIdList,
                     tid, label, requestId, sourceType, coordinator, listenerId, timeoutSecond * 1000);
             transactionState.setPrepareTime(System.currentTimeMillis());
+            // 13. 更新内存状态与 Label 映射
+            // 将新事务加入运行中字典（idToRunningTransactionState），并在 labelToTxnIds 中建立 Label 到 TID 的绑定
             unprotectUpdateInMemoryState(transactionState, false);
             updateTxnLabels(transactionState);
+            // 14. 持久化元数据日志 (EditLog)
+            // 根据配置（enable_txn_log_outside_lock）决定是将日志放入异步入队队列（返回 logItem 待刷盘）还是直接同步持久化写日志。
             if (Config.enable_txn_log_outside_lock) {
                 logItem = enqueueTransactionState(transactionState);
             } else {
                 persistTransactionState(transactionState);
             }
-
+            // 15. 统计埋点递增
+            // 若指标监控已初始化，则将“事务开启计数器”加 1。
             if (MetricRepo.isInit) {
                 MetricRepo.COUNTER_TXN_BEGIN.increase(1L);
             }
         } finally {
+            // 16. 释放写锁
+            // 无论执行成功还是抛出异常，在 finally 中安全释放数据库事务管理器的写锁。
             writeUnlock();
         }
+        // 17. 等待日志落盘同步
+        // 若启用了异步写日志，在此处阻塞等待对应的日志项刷盘完成（确保高可用时备节点或 BDBJE 多数派已落盘）。
         awaitTransactionState(logItem, transactionState);
         LOG.info("begin transaction: txn id {} with label {} from coordinator {}, listener id: {}",
                     tid, label, coordinator, listenerId);
@@ -427,7 +481,8 @@ public class DatabaseTransactionMgr {
         this.usedQuotaDataBytes = usedQuotaDataBytes;
     }
     // Apache Doris 中数据库级别的事务管理器（DatabaseTransactionMgr）中处理导入事务两阶段提交（2PC）预提交（Pre-Commit）阶段的核心方法
-    // 在完成了上层 FE/BE 的鉴权、数据库与表对象解析以及加锁之后，该方法在数据库维度执行事务状态校验、副本写入正确性检查（Quorum 校验）、更新事务状态为 PRECOMMITTED 以及元数据持久化（EditLog 持久化/异步入队）。
+    // 在完成了上层 FE/BE 的鉴权、数据库与表对象解析以及加锁之后，
+    // 该方法在数据库维度执行事务状态校验、副本写入正确性检查（Quorum 校验）、更新事务状态为 PRECOMMITTED 以及元数据持久化（EditLog 持久化/异步入队）。
     public void preCommitTransaction2PC(List<Table> tableList, long transactionId,
             List<TabletCommitInfo> tabletCommitInfos, TxnCommitAttachment txnCommitAttachment)
             throws UserException {
@@ -1925,9 +1980,23 @@ public class DatabaseTransactionMgr {
      *
      * @return an {@link EditLog.EditLogItem} handle to await completion, or null if persistence is skipped
      */
+    // 用于优化元数据编辑日志（EditLog）异步提交与刷盘的底层控制方法
+    // 必须在持有写锁（Write Lock）的上下文中调用，以确保通过 FIFO（先进先出）队列保持日志写入的先后顺序。它根据事务的状态和来源类型，决定是否将事务状态变更异步提交到 EditLog 队列中。
+    // TransactionState transactionState 目标事务状态对象（TransactionState）。包含了当前分布式事务的唯一 ID（TID）、业务标签（Label）、当前状态（TransactionStatus）、源类型（SourceType）、涉及的表和分区等完整的元数据信息。
+
     protected EditLog.EditLogItem enqueueTransactionState(TransactionState transactionState) {
+        // 1. 核心条件判断（过滤与路由策略）
+        // 判断条件包含两个部分（满足其一即可）：
+        // (1) transactionState.getTransactionStatus() != TransactionStatus.PREPARE
+        //     当前事务的状态不是 PREPARE（说明它可能是 PRECOMMITTED、COMMITTED、VISIBLE 或 ABORTED 等后续推进或终态的事务状态）。
+        // (2) || transactionState.getSourceType() == TransactionState.LoadJobSourceType.FRONTEND
+        //     或者该事务的来源类型是前端（FRONTEND，例如用户直接执行 INSERT 语句触发的事务）。
         if (transactionState.getTransactionStatus() != TransactionStatus.PREPARE
                 || transactionState.getSourceType() == TransactionState.LoadJobSourceType.FRONTEND) {
+            // 2. 提交异步编辑日志项
+            // 如果满足上述条件，调用 editLog.submitEdit(...)：
+            // 将操作类型指定为 OP_UPSERT_TRANSACTION_STATE（更新或插入事务状态），并将 transactionState 包装进 EditLog 队列中。
+            // 同时，返回一个 EditLog.EditLogItem 句柄（Handle），供上层调用方后续用来阻塞等待该日志项落盘完成。
             return editLog.submitEdit(OperationType.OP_UPSERT_TRANSACTION_STATE, transactionState);
         }
         return null;
