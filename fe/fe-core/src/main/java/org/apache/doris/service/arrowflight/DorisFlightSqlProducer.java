@@ -101,12 +101,21 @@ import java.util.concurrent.Executors;
  * All methods must catch all possible Exceptions, print and throw CallStatus,
  * otherwise error message will be discarded.
  */
+// Apache Doris 中实现 Apache Arrow Flight SQL 协议的核心服务类
+// 实现 Arrow Flight SQL 规范：负责全面响应客户端（如使用 ADBC、JDBC 或 Python Flight SQL 驱动的应用程序）发起的各项 Flight SQL 标准请求，包括查询执行（FlightInfo）、元数据获取（如 Catalogs、Schemas、Tables、SqlInfo 等）、预编译语句（PreparedStatement）的管理与执行。
+// 桥接 Doris 查询引擎与 Flight 协议：将客户端通过 Arrow 协议发送的查询请求通过 FlightSqlConnectProcessor 转发给 Doris 的底层执行引擎（StmtExecutor），并管理本地或来自后端 BE 节点的列式数据流（VectorSchemaRoot）。
+// 会话与线程管理：通过 FlightSessionsManager 追踪客户端连接上下文（ConnectContext），并利用内部线程池异步处理部分管理动作（如创建和关闭 PreparedStatement）。
 public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable {
     private static final Logger LOG = LogManager.getLogger(DorisFlightSqlProducer.class);
+    // 当前 Flight SQL 服务端的网络位置（Location），用于标识服务器监听的地址。
     private final Location location;
+    // Apache Arrow 的根内存分配器（RootAllocator），用于在分配和释放 off-heap（堆外）内存时管理向量数据。
     private final BufferAllocator rootAllocator = new RootAllocator();
+    // 用于构建和响应 Arrow Flight SQL 的服务元数据构建器（如服务器名称 "DorisFE"、版本、是否只读、标识符引号字符等）。
     private final SqlInfoBuilder sqlInfoBuilder;
+    // Flight 会话管理器，用于根据客户端的凭证或对端标识（peerIdentity）获取对应的 ConnectContext。
     private final FlightSessionsManager flightSessionsManager;
+    // 固定大小为 100 的线程池，用于异步处理诸如关闭预编译语句、创建预编译语句等操作，避免阻塞 gRPC 主线程。
     private final ExecutorService executorService = Executors.newFixedThreadPool(100);
 
     public DorisFlightSqlProducer(final Location location, FlightSessionsManager flightSessionsManager) {
@@ -119,7 +128,7 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                 .withSqlIdentifierCase(SqlSupportedCaseSensitivity.SQL_CASE_SENSITIVITY_CASE_INSENSITIVE)
                 .withSqlQuotedIdentifierCase(SqlSupportedCaseSensitivity.SQL_CASE_SENSITIVITY_CASE_INSENSITIVE);
     }
-
+    // 将 Arrow 的 Schema 序列化为字节缓冲区（ByteBuffer），用于在创建预编译语句时传输参数和结果集的元数据 Schema。
     private static ByteBuffer serializeMetadata(final Schema schema) {
         final ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
         try {
@@ -130,7 +139,9 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
             throw new RuntimeException("Failed to serialize arrow flight sql schema", e);
         }
     }
-
+    // 公共的数据流获取核心逻辑。
+    // 通过解析句柄（handle）拆分出对端标识和查询 ID，从会话中获取 ConnectContext，进而从结果通道中取出 VectorSchemaRoot，
+    // 通过 listener 推送给客户端，最后完成流并在 finally 块中清理缓存。若发生异常则调用 handleStreamException 处理。
     private void getStreamStatementResult(String handle, ServerStreamListener listener) {
         String[] handleParts = handle.split(":");
         String executedPeerIdentity = handleParts[0];
@@ -154,13 +165,13 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
             connectContext.getFlightSqlChannel().invalidate(queryId);
         }
     }
-
+    // 处理预编译查询语句的数据流请求。直接提取预编译句柄并调用内部的 getStreamStatementResult 响应数据。
     @Override
     public void getStreamPreparedStatement(final CommandPreparedStatementQuery command, final CallContext context,
             final ServerStreamListener listener) {
         getStreamStatementResult(command.getPreparedStatementHandle().toStringUtf8(), listener);
     }
-
+    // 处理普通查询语句的数据流请求（DoGet 阶段）。通过 Ticket 中的语句句柄获取查询结果流并返回给客户端。
     @Override
     public void getStreamStatement(final TicketStatementQuery ticketStatementQuery, final CallContext context,
             final ServerStreamListener listener) {
@@ -183,39 +194,53 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
             listener.onCompleted();
         });
     }
-
+    // 执行查询语句并生成 FlightInfo 的核心分发与调度方法
+    // String peerIdentity 客户端的对端身份标识（通常包含用户的认证凭证或连接标识符）。在 Arrow Flight SQL 的 GetFlightInfo 和后续 DoGet 阶段中，由于认证 Token 可能发生变化，系统会将该身份编码进 Ticket 句柄中，以便后续通过 getStreamStatement 精准恢复和识别对应的会话上下文。
+    // String query  客户端发送的要执行的原始 SQL 查询字符串（如 SELECT * FROM table 或 SET enable_profile = true）。
+    // final FlightDescriptor descriptor Apache Arrow Flight 协议中的描述符对象（FlightDescriptor），用来描述客户端所请求的 Flight 流或命令的元数据信息，最终会原封不动地传入返回的 FlightInfo 中。
     private FlightInfo executeQueryStatement(String peerIdentity, ConnectContext connectContext, String query,
             final FlightDescriptor descriptor) {
         try {
+            // 第一部分：前置校验与旧资源清理
+            // 确保会话上下文 connectContext 不为空，且传入的 SQL query 字符串不为空。
             Preconditions.checkState(null != connectContext);
             Preconditions.checkState(!query.isEmpty());
             // Finalize the previous query's coordinator on this connection whose close was
             // deferred (Arrow Flight keeps it alive across GetFlightInfo -> DoGet so the BE can
             // fetch external-table splits during DoGet). By now the previous DoGet is done. #62259
+            // 关闭并释放当前连接上上一轮查询中被延迟清理的协调器（Coordinator）执行器
             connectContext.closeFlightSqlDeferredExecutors();
             // After the previous query was executed, there was no getStreamStatement to take away the result.
+            // 重置 Flight SQL 通道，并清空上一次查询残留的端点位置列表（FlightSqlEndpointsLocations），为当前新查询做准备。
             connectContext.getFlightSqlChannel().reset();
             connectContext.clearFlightSqlEndpointsLocations();
+            // 第二部分：初始化处理器并执行查询
             try (FlightSqlConnectProcessor flightSQLConnectProcessor = new FlightSqlConnectProcessor(connectContext)) {
+                // 开始执行 SQL 查询（内部会经历解析、优化并交由 StmtExecutor 调度）。
                 flightSQLConnectProcessor.handleQuery(query);
                 if (connectContext.getState().getStateType() == MysqlStateType.ERR) {
                     throw new RuntimeException("after executeQueryStatement handleQuery");
                 }
-
+                // 第三部分：本地结果分支处理（如 SET、USE 或无结果集命令）
+                // 判断结果是否由 FE 本地直接返回（例如 SET、USE 等管理类命令）。
                 if (connectContext.isReturnResultFromLocal()) {
                     // set/use etc. stmt returns an OK result by default.
+                    // 如果结果集数量为 0：
                     if (connectContext.getFlightSqlChannel().resultNum() == 0) {
                         // a random query id and add empty results
+                        // 随机生成一个 queryId，并向 Flight SQL 通道中添加一个默认的 OK 结果。
                         String queryId = UUID.randomUUID().toString();
                         connectContext.getFlightSqlChannel().addOKResult(queryId, query);
 
                         final ByteString handle = ByteString.copyFromUtf8(peerIdentity + ":" + queryId);
                         TicketStatementQuery ticketStatement = TicketStatementQuery.newBuilder()
                                 .setStatementHandle(handle).build();
+                        // 利用默认 OK 结果的 Schema 构建并返回 FlightInfo。
                         return getFlightInfoForSchema(ticketStatement, descriptor,
                                 connectContext.getFlightSqlChannel().getResult(queryId).getVectorSchemaRoot()
                                         .getSchema());
                     } else {
+                        // 如果结果集数量不为 0（严格断言数量为 1）
                         // A Flight Sql request can only contain one statement that returns result,
                         // otherwise expected thrown exception during execution.
                         Preconditions.checkState(connectContext.getFlightSqlChannel().resultNum() == 1);
@@ -226,6 +251,7 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                         // queryId is used to find query results.
                         final ByteString handle = ByteString.copyFromUtf8(
                                 peerIdentity + ":" + DebugUtil.printId(connectContext.queryId()));
+                        // 构建票据对象，并提取对应结果集的 Arrow Schema，组装并返回 FlightInfo。
                         TicketStatementQuery ticketStatement = TicketStatementQuery.newBuilder()
                                 .setStatementHandle(handle).build();
                         return getFlightInfoForSchema(ticketStatement, descriptor, connectContext.getFlightSqlChannel()
@@ -233,7 +259,10 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                                 .getSchema());
                     }
                 } else {
+                    // 第四部分：远程 BE 结果分支处理（分布式 SQL 查询）
                     // Now only query stmt will pull results from BE.
+                    // 如果是正常的分布式 SELECT 查询，结果需要从后端 BE 节点拉取。
+                    // 调用 fetchArrowFlightSchema(5000) 在 5 秒超时内向 BE 抓取 Arrow Schema。
                     flightSQLConnectProcessor.fetchArrowFlightSchema(5000);
                     if (flightSQLConnectProcessor.getArrowSchema() == null) {
                         throw CallStatus.INTERNAL.withDescription("fetch arrow flight schema is null")
@@ -241,9 +270,12 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                     }
 
                     List<FlightEndpoint> endpoints = Lists.newArrayList();
+                    // 遍历每一个端点位置
                     for (FlightSqlEndpointsLocation endpointLoc : connectContext.getFlightSqlEndpointsLocations()) {
+                        // 获取片段实例 ID (tid)
                         TUniqueId tid = endpointLoc.getFinstId();
                         // Ticket contains the IP and Brpc Port of the Doris BE node where the query result is located.
+                        // 将片段 ID、BE 内部服务主机名、端口以及经过 Base64 编码的原始 SQL 查询语句拼接成句柄，构建 TicketStatementQuery 并打包成 Ticket。
                         final ByteString handle = ByteString.copyFromUtf8(
                                 DebugUtil.printId(tid) + "&" + endpointLoc.getResultInternalServiceAddr().hostname + "&"
                                         + endpointLoc.getResultInternalServiceAddr().port + "&"
@@ -252,6 +284,9 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                                 .setStatementHandle(handle).build();
                         Ticket ticket = new Ticket(Any.pack(ticketStatement).toByteArray());
                         Location location;
+                        // 计算客户端直连该端点的网络位置
+                        // 优先检查是否有配置公网访问地址（getResultPublicAccessAddr()，常用于 Nginx 反向代理等云端场景）。
+                        // 若设置了主机名和端口则使用配置值，若无端口则复用 Flight 服务端口。
                         if (endpointLoc.getResultPublicAccessAddr().isSetHostname()) {
                             // In a production environment, it is often inconvenient to expose Doris BE nodes
                             // to the external network.
@@ -280,6 +315,7 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                         endpoints.add(new FlightEndpoint(ticket, location));
                     }
                     // TODO Set in BE callback after query end, Client will not callback.
+                    // 构造并返回 FlightInfo 对象。
                     return new FlightInfo(flightSQLConnectProcessor.getArrowSchema(), descriptor, endpoints, -1, -1);
                 }
             }

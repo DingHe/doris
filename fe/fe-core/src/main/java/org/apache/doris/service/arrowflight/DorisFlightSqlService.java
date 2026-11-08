@@ -40,14 +40,26 @@ import java.util.function.Consumer;
 /**
  * flight sql protocol implementation based on nio.
  */
+// Apache Doris 中基于 NIO 和 gRPC 实现的 Arrow Flight SQL 服务端核心服务类。
+// 初始化并构建 Arrow Flight 服务端：基于 Apache Arrow Flight 框架与 gRPC，在指定的端口上启动高性能的列式数据传输服务，允许客户端（如使用 ADBC 驱动或 Arrow Flight 客户端）直接与 Doris FE 建立高性能连接。
+// 管理令牌与会话生命周期：内部初始化并管理 FlightTokenManager（Bearer 令牌管理器）与 FlightSessionsManager（会话管理器），通过 Token 机制在无状态的 Flight SQL 协议中维护和追踪用户的会话上下文（ConnectContext）。
+// 服务生命周期控制：提供标准的 start() 和 stop() 方法，用于安全地启动和关闭底层封装的 FlightServer。
 public class DorisFlightSqlService {
     private static final Logger LOG = LogManager.getLogger(DorisFlightSqlService.class);
+    // gRPC 构建器的消费者配置常量（值为 "grpc.builderConsumer"），用于在配置底层 gRPC transport hints 时标识拦截器或流追踪器的扩展。
     private static final String GRPC_BUILDER_CONSUMER = "grpc.builderConsumer";
+    // 底层的 Arrow Flight 服务端实例
+    // 基于 gRPC 运行，负责监听网络端口并处理实际的 Flight RPC 请求。
     private final FlightServer flightServer;
+    // Flight 令牌管理器（FlightTokenManager）。用于管理基于 Bearer Token 的认证凭证，结合最大连接数、缓存大小及存活时间配置，当 Token 从缓存中被驱逐时会自动注销对应的会话上下文。
     private final FlightTokenManager flightTokenManager;
+    // Flight 会话管理器（FlightSessionsManager）。用于管理与 Token 绑定的客户端会话状态。
     private final FlightSessionsManager flightSessionsManager;
+    // 服务运行状态标志。使用 volatile 修饰，用于多线程安全地指示当前 Arrow Flight SQL 服务是否正在运行。
     private volatile boolean running;
 
+
+    // 负责初始化整个 Arrow Flight SQL 服务的核心组件
     public DorisFlightSqlService(int port) {
         BufferAllocator allocator = new RootAllocator();
         // arrow flight sql is a stateless protocol, connection is usually not actively disconnected.
@@ -69,6 +81,7 @@ public class DorisFlightSqlService {
     }
 
     // start Arrow Flight SQL service, return true if success, otherwise false
+    // 启动 Arrow Flight SQL 服务的方法。
     public boolean start() {
         try {
             flightServer.start();
@@ -87,7 +100,7 @@ public class DorisFlightSqlService {
             try {
                 flightServer.close();
             } catch (InterruptedException e) {
-                LOG.warn("close Arrow Flight SQL server failed.", e);
+                LOG.warn("close Arrow ‘’light SQL server failed.", e);
             }
         }
     }
